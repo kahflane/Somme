@@ -38,7 +38,7 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 16px 15px 24px;
+  padding: 14px 15px 24px;
 }
 
 .flush {
@@ -72,4 +72,68 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 10px;
+  background: var(--x-surface);
+}
+
+.card + .card {
+  margin-top: 15px;
+}
+
+.select {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 52px;
+  padding: 0 16px 0 20px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--x-surface);
+  color: var(--x-text);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.select:hover {
+  background: var(--x-card-hover);
+}
+
+.selectLabel {
+  flex: 1;
+  min-width: 0;
+}
+
+.select + .card {
+  margin-top: 15px;
+}
+
+.primary {
+  height: 35px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--x-accent);
+  color: #ffffff;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.primary:hover {
+  background: var(--x-accent-hover);
+}
+
+.primary:disabled {
+  opacity: 0.6;
+  cursor: default;
 }

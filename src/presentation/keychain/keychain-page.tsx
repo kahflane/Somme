@@ -1,7 +1,7 @@
 import { CopyButton, Menu } from "@mantine/core";
 import {
   IconCopy,
-  IconFileImport,
+  IconKey,
   IconPencil,
   IconPencilFilled,
   IconTrash,
@@ -28,8 +28,9 @@ import {
   ToolButton,
   ViewToggle,
 } from "@/presentation/common/page";
+import pageClasses from "@/presentation/common/page.module.css";
 import { IdentityPanel } from "@/presentation/keychain/identity-panel";
-import { KeyPanel, type KeyPanelMode } from "@/presentation/keychain/key-panel";
+import { KeyPanel, type KeyDraft, type KeyPanelMode } from "@/presentation/keychain/key-panel";
 
 type Panel = { kind: "key"; mode: KeyPanelMode } | { kind: "identity"; identity: Identity | null } | null;
 type MenuTarget = { kind: "key"; key: SshKey } | { kind: "identity"; identity: Identity };
@@ -47,6 +48,7 @@ export function KeychainPage() {
   const [sort] = useSortOrder("keychain");
   const [query, setQuery] = useState("");
   const [panel, setPanel] = useState<Panel>(null);
+  const [draft, setDraft] = useState<KeyDraft | null>(null);
   const menu = useContextMenu<MenuTarget>();
 
   const visibleKeys = sortItems(keys, sort, (key) => key.label).filter(
@@ -73,8 +75,15 @@ export function KeychainPage() {
       setPanel(null);
     });
 
-  const empty = keys.length === 0 && identities.length === 0;
+  const empty = keys.length === 0 && identities.length === 0 && !draft;
   const editingKey = panel?.kind === "key" && panel.mode.kind === "edit" ? panel.mode.key.id : null;
+  // The panel keeps the key it opened with; show the latest copy after a rename.
+  const keyMode: KeyPanelMode | null =
+    panel?.kind !== "key"
+      ? null
+      : panel.mode.kind === "edit"
+        ? { kind: "edit", key: keys.find((key) => key.id === editingKey) ?? panel.mode.key }
+        : panel.mode;
   const editingIdentity = panel?.kind === "identity" ? panel.identity?.id : null;
 
   return (
@@ -85,13 +94,13 @@ export function KeychainPage() {
           <>
             <SplitButton
               label="New key"
-              onClick={() => setPanel({ kind: "key", mode: { kind: "generate" } })}
+              onClick={() => setPanel({ kind: "key", mode: { kind: "import" } })}
               menu={
                 <Menu.Item
-                  leftSection={<IconFileImport size={16} />}
-                  onClick={() => setPanel({ kind: "key", mode: { kind: "import" } })}
+                  leftSection={<IconKey size={16} />}
+                  onClick={() => setPanel({ kind: "key", mode: { kind: "generate" } })}
                 >
-                  Import key
+                  Generate key
                 </Menu.Item>
               }
             />
@@ -120,10 +129,20 @@ export function KeychainPage() {
         ) : (
           <>
             <PageSection title="Keys">
-              {visibleKeys.length === 0 ? (
+              {visibleKeys.length === 0 && !draft ? (
                 <Muted>{query ? "No keys match your search." : "No keys yet."}</Muted>
               ) : (
                 <CardGrid view={view}>
+                  {draft && (
+                    <EntityCard
+                      active
+                      icon={<KeyGlyph size={22} />}
+                      title={
+                        draft.label || <span className={pageClasses.cardPlaceholder}>Add a label...</span>
+                      }
+                      subtitle={`Type ${draft.type ?? "unknown"}`}
+                    />
+                  )}
                   {visibleKeys.map((key) => (
                     <EntityCard
                       key={key.id}
@@ -191,7 +210,9 @@ export function KeychainPage() {
         )}
       </ContextMenu>
       <KeyPanel
-        mode={panel?.kind === "key" ? panel.mode : null}
+        onMode={(mode) => setPanel({ kind: "key", mode })}
+        onDraft={setDraft}
+        mode={keyMode}
         onClose={() => setPanel(null)}
         onDelete={deleteKey}
       />

@@ -58,6 +58,7 @@ pub fn handler() -> impl Fn(Invoke) -> bool + Send + Sync + 'static {
         local_fs::local_mkdir,
         local_fs::local_rename,
         local_fs::local_remove,
+        local_fs::local_read_key,
         fonts::system_fonts,
         fonts::system_font_data,
         sync::sync_status,

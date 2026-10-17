@@ -10,6 +10,10 @@ export function isPlainName(name: string): boolean {
   return name !== "" && name !== "." && name !== ".." && !/[\\/\0]/.test(name);
 }
 
+export function baseName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
 export function pathStyleOf(path: string): PathStyle {
   return /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("\\\\") ? "windows" : "posix";
 }

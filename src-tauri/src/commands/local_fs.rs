@@ -13,6 +13,25 @@ pub fn local_home() -> ApiResult<String> {
         .ok_or_else(|| ApiError::io("no home directory"))
 }
 
+const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
+
+// Reads a private key file the user picked. It refuses anything that is not a
+// small text file holding a private key, so it can't be used to read other files.
+#[tauri::command]
+pub async fn local_read_key(path: String) -> ApiResult<String> {
+    let size = tokio::fs::metadata(&path).await?.len();
+    if size > MAX_KEY_FILE_BYTES {
+        return Err(ApiError::io("that file is too large to be a private key"));
+    }
+    let bytes = tokio::fs::read(&path).await?;
+    let text = String::from_utf8(bytes).map_err(|_| ApiError::io("that file is not a private key"))?;
+    if text.contains("PRIVATE KEY-----") || text.trim_start().starts_with("PuTTY-User-Key-File-") {
+        Ok(text)
+    } else {
+        Err(ApiError::io("that file is not a private key"))
+    }
+}
+
 #[tauri::command]
 pub async fn local_list(path: String) -> ApiResult<Vec<SftpEntryView>> {
     let mut reader = tokio::fs::read_dir(&path).await?;

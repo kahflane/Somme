@@ -1,7 +1,8 @@
 import { Menu } from "@mantine/core";
-import { IconArrowBarToRight, IconDots } from "@tabler/icons-react";
+import { IconArrowBarToRight, IconChevronDown, IconDots } from "@tabler/icons-react";
 import { createContext, useContext, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { VaultGlyph } from "@/presentation/common/glyphs";
 import { IconButton } from "@/presentation/common/page";
 import classes from "@/presentation/common/side-panel.module.css";
 
@@ -60,5 +61,42 @@ export function PanelSection({ title, children }: { title?: string; children: Re
       {title && <h3 className={classes.sectionTitle}>{title}</h3>}
       <div className={classes.sectionBody}>{children}</div>
     </section>
+  );
+}
+
+export function PanelCard({ children }: { children: ReactNode }) {
+  return <div className={classes.card}>{children}</div>;
+}
+
+// Somme keeps everything in one vault; the picker mirrors Termius and shows it.
+export function VaultPicker() {
+  return (
+    <Menu position="bottom" width="target">
+      <Menu.Target>
+        <button type="button" className={classes.select}>
+          <VaultGlyph size={18} />
+          <span className={classes.selectLabel}>Personal</span>
+          <IconChevronDown size={18} stroke={2.4} />
+        </button>
+      </Menu.Target>
+      <Menu.Dropdown>
+        <Menu.Item rightSection="✓">Personal</Menu.Item>
+      </Menu.Dropdown>
+    </Menu>
+  );
+}
+
+interface PrimaryProps {
+  onClick?: () => void;
+  disabled?: boolean;
+  type?: "button" | "submit";
+  children: ReactNode;
+}
+
+export function PanelPrimaryButton({ onClick, disabled, type = "button", children }: PrimaryProps) {
+  return (
+    <button type={type} className={classes.primary} disabled={disabled} onClick={onClick}>
+      {children}
+    </button>
   );
 }
