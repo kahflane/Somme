@@ -94,7 +94,7 @@ pub enum SessionEvent {
     PhaseChanged,
 }
 
-/// Command blocks for a local shell that runs SommeCLI's hooks.
+/// Command blocks for a local shell that runs Somme's hooks.
 #[derive(Default)]
 pub struct Blocks {
     pub list: Vec<Block>,

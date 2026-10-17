@@ -33,7 +33,7 @@ pub trait Terminal: Send + Sync {
 pub struct ShellOptions<'a> {
     /// The folder to start in. Unset or gone means the home folder.
     pub dir: Option<&'a Path>,
-    /// Load SommeCLI's shell hooks, which mark where each prompt and command
+    /// Load Somme's shell hooks, which mark where each prompt and command
     /// starts. Each mark carries this secret, so program output cannot fake one.
     pub marks: Option<&'a str>,
 }

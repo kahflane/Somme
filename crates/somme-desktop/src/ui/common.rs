@@ -15,7 +15,7 @@ pub use gpui_kit::assets::IconName as Lucide;
 use crate::ui::native;
 
 /// The name people see. Data folders and keychain entries keep their old names.
-pub const APP_NAME: &str = "SommeCLI";
+pub const APP_NAME: &str = "Somme";
 
 /// The app logo, drawn from the bundled SVG.
 pub fn logo(size: Pixels) -> Img {

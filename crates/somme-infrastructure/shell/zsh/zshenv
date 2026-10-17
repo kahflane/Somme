@@ -1,4 +1,4 @@
-# SommeCLI points ZDOTDIR here to load its shell hooks. Put the user's ZDOTDIR
+# Somme points ZDOTDIR here to load its shell hooks. Put the user's ZDOTDIR
 # back first, so zsh reads the rest of their config as usual.
 
 # The marks' secret stays in an unexported variable, so no program started

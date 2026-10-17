@@ -1,11 +1,11 @@
-# SommeCLI shell hooks. They print marks (OSC 6973) so SommeCLI can show each
+# Somme shell hooks. They print marks (OSC 6973) so Somme can show each
 # command as a block:
 #   A;<exit code>;<folder>   a prompt is about to show
 #   B                        the user accepted a line
 #   C;<command>              the command starts running
 #   P;<path>                 PATH changed, for completing command names
 # Text is percent-encoded so it cannot end a mark early. Each mark starts with
-# a secret SommeCLI picked for this shell, so program output cannot fake one.
+# a secret Somme picked for this shell, so program output cannot fake one.
 
 builtin unset SOMME_SHELL_HOOKS
 [[ -n "${_somme_loaded-}" ]] && builtin return 0
