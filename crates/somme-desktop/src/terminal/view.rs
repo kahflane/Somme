@@ -14,7 +14,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Styled
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, ScrollWheelEvent, Styled as _,
+    ParentElement as _, Pixels, Point, Render, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
     Subscription, UTF16Selection, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 
@@ -26,6 +26,7 @@ use crate::terminal::session::{SessionEvent, Status, TerminalSession};
 use crate::terminal::keys;
 
 mod blocks;
+mod links;
 mod picker;
 mod prompt;
 
@@ -162,6 +163,11 @@ pub struct TerminalView {
     selecting_block: Option<usize>,
     /// The block right-clicked last, for the menu's copy items.
     menu_block: Option<usize>,
+    /// The file or folder name under the mouse in a block's output.
+    link: Option<links::PathLink>,
+    link_probe: Option<links::Probe>,
+    /// The link pressed, opened if the mouse comes up on it without a drag.
+    link_press: Option<links::PathLink>,
     prompt: Option<Prompt>,
     /// The folder picker over the command editor.
     picker: Option<picker::Picker>,
@@ -208,6 +214,9 @@ impl TerminalView {
             blocks_total: px(0.),
             selecting_block: None,
             menu_block: None,
+            link: None,
+            link_probe: None,
+            link_press: None,
             prompt,
             picker: None,
             pending_insert: None,
@@ -367,7 +376,11 @@ impl TerminalView {
 
     fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         Settings::update(cx, |settings| {
-            settings.font_size = if delta == 0. { 14. } else { (settings.font_size + delta).clamp(8., 40.) };
+            settings.font_size = if delta == 0. {
+                Settings::default().font_size
+            } else {
+                (settings.font_size + delta).clamp(8., 40.)
+            };
         });
     }
 
@@ -470,9 +483,9 @@ impl TerminalView {
         });
     }
 
-    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.selecting_block.is_some() {
-            self.blocks_mouse_up(cx);
+            self.blocks_mouse_up(event, window, cx);
             return;
         }
         if let Some(button) = self.reported_button.take() {
@@ -869,7 +882,13 @@ impl Render for TerminalView {
             .when(blocks_mode, |surface| surface.flex_1().min_h_0().w_full())
             .when(!blocks_mode, |surface| surface.size_full())
             .relative()
-            .cursor_text()
+            .when(self.link.is_some(), |surface| surface.cursor_pointer())
+            .when(self.link.is_none(), |surface| surface.cursor_text())
+            .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                if !*hovered {
+                    view.clear_link(cx);
+                }
+            }))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))

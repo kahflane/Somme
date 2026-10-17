@@ -258,6 +258,7 @@ impl Element for BlocksElement {
         let mut y = bounds.origin.y + viewport - total + scroll;
 
         let search = self.view.read(cx).block_search_matches();
+        let link = self.view.read(cx).hovered_link().cloned();
         let mut geoms = Vec::with_capacity(list.len());
         let mut tints = Vec::new();
         let mut rects = Vec::new();
@@ -406,6 +407,20 @@ impl Element for BlocksElement {
                     ),
                     search_color(active),
                 ));
+            }
+            // An underline under the file or folder name the mouse is on.
+            if let Some(link) = link.as_ref().filter(|link| link.block == index) {
+                let row = link.line.0 - first.0;
+                let row_y = output_y + line_height * row as f32;
+                if row >= 0 && (row as usize) < rows && visible(row_y, line_height) {
+                    rects.push((
+                        Bounds::new(
+                            point(left + cell_width * link.columns.start as f32, row_y + line_height - px(2.)),
+                            size(cell_width * link.columns.len() as f32, px(1.)),
+                        ),
+                        foreground,
+                    ));
+                }
             }
             if let Some((origin, under)) = cursor_cell {
                 cursor = Some(CursorPaint::new(

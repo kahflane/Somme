@@ -113,6 +113,14 @@ fn unescape(word: &str) -> String {
     out
 }
 
+/// Backslashes can't make a newline or other control character safe in a
+/// shell word: it would end the command and start another. Names holding one
+/// are left out rather than escaped.
+pub fn can_escape(text: &str) -> bool {
+    !text.contains(char::is_control)
+}
+
+/// Only for text that passes [`can_escape`].
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -135,7 +143,7 @@ fn commands(prefix: &str, path_var: Option<&str>) -> Vec<Choice> {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let Ok(name) = entry.file_name().into_string() else { continue };
-            if name.starts_with(prefix) && !names.contains(&name) && is_executable(&entry.path()) {
+            if name.starts_with(prefix) && can_escape(&name) && !names.contains(&name) && is_executable(&entry.path()) {
                 names.insert(name);
             }
         }
@@ -188,7 +196,7 @@ fn paths(word: &str, cwd: &Path) -> Vec<Choice> {
         .flatten()
         .filter_map(|entry| {
             let file = entry.file_name().into_string().ok()?;
-            if !file.starts_with(&name) || (file.starts_with('.') && !name.starts_with('.')) {
+            if !file.starts_with(&name) || (file.starts_with('.') && !name.starts_with('.')) || !can_escape(&file) {
                 return None;
             }
             // Follows links, so a link to a folder counts as a folder.
@@ -231,6 +239,13 @@ mod tests {
         let done = complete("cd s", 4, dir.path(), None).unwrap();
         assert_eq!(done.range, 3..4);
         assert_eq!(done.common().as_deref(), Some("src/"));
+    }
+
+    #[test]
+    fn names_with_control_characters_cannot_be_escaped() {
+        assert!(can_escape("My Files"));
+        assert!(!can_escape("x\nevil"));
+        assert!(!can_escape("x\revil"));
     }
 
     #[test]
