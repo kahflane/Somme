@@ -1,10 +1,11 @@
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, MutexGuard, Notify};
 use turso::{Connection, Value};
 
 use crate::db::migrations::{DATA_TABLES, migrate};
@@ -102,10 +103,10 @@ impl Backend {
         Ok(count > 0)
     }
 
-    pub async fn copy_from(&self, source: &Backend) -> Result<u64, StoreError> {
+    pub async fn copy_from(&self, source: &Connection) -> Result<u64, StoreError> {
         let mut copied = 0;
         for table in DATA_TABLES {
-            let mut rows = source.conn.query(format!("SELECT * FROM {table}"), ()).await?;
+            let mut rows = source.query(format!("SELECT * FROM {table}"), ()).await?;
             let columns = rows.column_names();
             let placeholders = vec!["?"; columns.len()].join(", ");
             let sql = format!(
@@ -131,19 +132,41 @@ fn path_str(path: &Path) -> Result<String, StoreError> {
 
 pub struct Store {
     backend: ArcSwap<Backend>,
+    /// Turso fails a query with "concurrent use forbidden" when another task is
+    /// using the same connection, so queries take turns.
+    turn: Mutex<()>,
     changed: Notify,
+}
+
+/// The connection, held until this is dropped. Keep it alive while reading rows.
+pub struct Conn<'a> {
+    conn: Connection,
+    _turn: MutexGuard<'a, ()>,
+}
+
+impl Deref for Conn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 impl Store {
     pub fn new(backend: Backend) -> Self {
         Self {
             backend: ArcSwap::from_pointee(backend),
+            turn: Mutex::new(()),
             changed: Notify::new(),
         }
     }
 
-    pub fn conn(&self) -> Connection {
-        self.backend.load().conn.clone()
+    pub async fn conn(&self) -> Conn<'_> {
+        let turn = self.turn.lock().await;
+        Conn {
+            conn: self.backend.load().conn.clone(),
+            _turn: turn,
+        }
     }
 
     pub fn backend(&self) -> Arc<Backend> {

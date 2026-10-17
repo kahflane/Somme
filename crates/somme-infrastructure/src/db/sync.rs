@@ -163,7 +163,7 @@ impl SyncGateway for TursoSync {
             let outcome = if next.has_vault().await.map_err(gateway_error)? {
                 SyncOutcome::RemoteKept
             } else {
-                next.copy_from(&current).await.map_err(gateway_error)?;
+                next.copy_from(&*self.store.conn().await).await.map_err(gateway_error)?;
                 SyncOutcome::Merged
             };
             if let Some(db) = next.synced() {
