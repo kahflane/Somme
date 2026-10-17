@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigation } from "@/application/stores/navigation";
 import { SFTP_TAB_ID, VAULT_TAB_ID, useTabs } from "@/application/stores/tabs";
 import { SidePanelSlotContext, sidePanelSlotClass } from "@/presentation/common/side-panel";
@@ -44,6 +44,21 @@ export function MainShell() {
   const tabs = useTabs((state) => state.tabs);
   const activeId = useTabs((state) => state.activeId);
   const [panelSlot, setPanelSlot] = useState<HTMLDivElement | null>(null);
+
+  // Files dropped anywhere but a drop zone would otherwise open in the web view.
+  useEffect(() => {
+    const block = (event: DragEvent) => {
+      if (event.defaultPrevented || !event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "none";
+    };
+    window.addEventListener("dragover", block);
+    window.addEventListener("drop", block);
+    return () => {
+      window.removeEventListener("dragover", block);
+      window.removeEventListener("drop", block);
+    };
+  }, []);
 
   return (
     <div className={classes.root}>

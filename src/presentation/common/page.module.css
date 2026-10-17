@@ -103,9 +103,16 @@
   transition: background-color 0.15s ease;
 }
 
-.card:hover,
-.card[data-active] {
+.card:hover {
   background: var(--x-card-hover);
+}
+
+.card[data-active] {
+  box-shadow: 0 0 0 2px var(--x-focus);
+}
+
+.cardPlaceholder {
+  color: var(--x-text-secondary);
 }
 
 .card:focus-visible {

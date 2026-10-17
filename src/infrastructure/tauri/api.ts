@@ -114,6 +114,7 @@ export const api = {
     mkdir: (path: string) => invoke<void>("local_mkdir", { path }),
     rename: (from: string, to: string) => invoke<void>("local_rename", { from, to }),
     remove: (path: string, isDir: boolean) => invoke<void>("local_remove", { path, isDir }),
+    readKey: (path: string) => invoke<string>("local_read_key", { path }),
   },
   account: {
     status: () => invoke<AccountStatus>("account_status"),

@@ -31,7 +31,11 @@ export const useDeleteIdentity = () =>
 
 export const useKeys = () => useQuery({ queryKey: queryKeys.keys, queryFn: api.keys.list });
 export const useImportKey = () =>
-  useApiMutation(api.keys.importKey, { invalidate: [queryKeys.keys], success: "Key imported" });
+  useApiMutation(api.keys.importKey, {
+    invalidate: [queryKeys.keys],
+    success: "Key imported",
+    inlineErrors: true,
+  });
 export const useGenerateKey = () =>
   useApiMutation(api.keys.generate, { invalidate: [queryKeys.keys], success: "Key generated" });
 export const useRenameKey = () =>
