@@ -65,6 +65,23 @@ async fn run_step(line: &str, base: &Path, window: AnyWindowHandle, cx: &mut Asy
                 window.update(cx, |_, window, cx| window.dispatch_keystroke(keystroke, cx))?;
             }
         }
+        "move" => {
+            let mut parts = arg.split_whitespace().map(str::parse::<f32>);
+            let (Some(Ok(x)), Some(Ok(y))) = (parts.next(), parts.next()) else {
+                anyhow::bail!("expected: move X Y");
+            };
+            window.update(cx, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(x), px(y)),
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }),
+                    cx,
+                );
+            })?;
+        }
         "click" | "rclick" | "dclick" => {
             let mut parts = arg.split_whitespace().map(str::parse::<f32>);
             let (Some(Ok(x)), Some(Ok(y))) = (parts.next(), parts.next()) else {

@@ -4,7 +4,9 @@ use alacritty_terminal::grid::{Dimensions as _, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::RegexSearch;
-use gpui_kit::{ClipboardItem, Context, MouseButton, MouseDownEvent, MouseMoveEvent, ScrollWheelEvent, Window, px};
+use gpui_kit::{
+    ClipboardItem, Context, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Window, px,
+};
 
 use super::{SearchMatch, TerminalView};
 use crate::settings::Settings;
@@ -35,6 +37,10 @@ impl TerminalView {
             _ => SelectionType::Simple,
         };
         let extend = event.modifiers.shift;
+        // A plain click on a file or folder name opens it, unless it turns into a drag.
+        self.link_press = (hit.is_some() && event.click_count == 1 && !extend)
+            .then(|| self.link_at(event.position))
+            .flatten();
         self.session.update(cx, |session, cx| {
             let Some(blocks) = session.blocks.as_mut() else { return };
             if extend
@@ -57,6 +63,9 @@ impl TerminalView {
     }
 
     pub(super) fn blocks_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if event.pressed_button.is_none() {
+            self.hover_link(event.position, cx);
+        }
         let Some(index) = self.selecting_block else { return };
         if event.pressed_button != Some(MouseButton::Left) {
             return;
@@ -79,7 +88,8 @@ impl TerminalView {
         });
     }
 
-    pub(super) fn blocks_mouse_up(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn blocks_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let pressed = self.link_press.take();
         let Some(index) = self.selecting_block.take() else { return };
         let empty = self
             .session
@@ -96,6 +106,9 @@ impl TerminalView {
                 }
                 cx.notify();
             });
+            if let Some(link) = pressed.filter(|link| self.link_at(event.position).as_ref() == Some(link)) {
+                self.open_link(link, window, cx);
+            }
         } else if Settings::get(cx).copy_on_select
             && let Some(text) = self.blocks_selection_text(cx)
         {
@@ -105,6 +118,8 @@ impl TerminalView {
 
     pub(super) fn blocks_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let line_height = self.blocks_layout.as_ref().map_or(px(16.), |layout| layout.line_height);
+        // The text moves away from under the mouse.
+        self.clear_link(cx);
         self.blocks_scroll += event.delta.pixel_delta(line_height).y;
         self.blocks_scroll = self.blocks_scroll.max(px(0.));
         cx.notify();

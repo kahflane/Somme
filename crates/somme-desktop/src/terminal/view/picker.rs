@@ -91,7 +91,7 @@ impl Picker {
         let typed = self.search.read(cx).value().trim().to_owned();
         if let Some(ask) = self.asking {
             let ok = match ask {
-                Ask::Commit => !typed.is_empty(),
+                Ask::Commit => !typed.is_empty() && complete::can_escape(&typed),
                 Ask::Rename => valid_branch_name(&typed) && self.git.current.as_deref() != Some(typed.as_str()),
             };
             return if ok { vec![Row::Confirm(typed)] } else { Vec::new() };
@@ -306,19 +306,24 @@ impl TerminalView {
         }
         self.close_picker(window, cx);
         match action {
-            Pick::Run(command) => {
-                if !self.session.read(cx).at_prompt() {
-                    return;
-                }
-                self.session.update(cx, |session, cx| session.run_command(&command, cx));
-                self.blocks_scroll = px(0.);
-                self.awaiting_block = true;
-                window.focus(&self.focus_handle, cx);
-                cx.emit(TerminalViewEvent::Ran(command));
-            }
+            Pick::Run(command) => self.run_from_ui(command, window, cx),
             Pick::Open(path) => cx.emit(TerminalViewEvent::OpenFile(path)),
             Pick::Ask(_) | Pick::Nothing => {}
         }
+    }
+
+    /// Runs a command picked with the mouse or a menu, as if it was typed.
+    /// Only at the prompt, so it never goes to a program that is running.
+    pub(super) fn run_from_ui(&mut self, command: String, window: &mut Window, cx: &mut Context<Self>) {
+        // A control character, like a newline, would run a second command.
+        if !self.session.read(cx).at_prompt() || !complete::can_escape(&command) {
+            return;
+        }
+        self.session.update(cx, |session, cx| session.run_command(&command, cx));
+        self.blocks_scroll = px(0.);
+        self.awaiting_block = true;
+        window.focus(&self.focus_handle, cx);
+        cx.emit(TerminalViewEvent::Ran(command));
     }
 
     pub(super) fn render_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -473,7 +478,7 @@ fn valid_branch_name(name: &str) -> bool {
 }
 
 /// A folder name ready for `cd`: escaped, and kept from reading as an option or a home folder.
-fn cd_target(name: &str) -> String {
+pub(super) fn cd_target(name: &str) -> String {
     let escaped = complete::escape(name);
     if name.starts_with(['-', '~']) { format!("./{escaped}") } else { escaped }
 }
@@ -483,6 +488,7 @@ fn read_folder(dir: &Path) -> Vec<PickEntry> {
     let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut entries: Vec<(bool, String)> = read
         .filter_map(Result::ok)
+        .filter(|entry| complete::can_escape(&entry.file_name().to_string_lossy()))
         .take(MAX_ENTRIES)
         // Follows links, so a link to a folder counts as a folder.
         .map(|entry| (entry.path().is_dir(), entry.file_name().to_string_lossy().into_owned()))
@@ -528,6 +534,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".hidden-dir")).unwrap();
         std::fs::write(dir.join("a.txt"), "").unwrap();
         std::fs::write(dir.join(".env"), "").unwrap();
+        std::fs::create_dir_all(dir.join("x\nevil")).unwrap();
         let names: Vec<_> = read_folder(&dir).iter().map(|e| e.name().to_owned()).collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(names, ["b-dir", ".hidden-dir", "a.txt", ".env"]);
