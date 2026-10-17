@@ -1,10 +1,10 @@
-# SommeCLI
+# Somme
 
 An SSH client like Termius. Native Rust app built with GPUI. Data in Turso, synced through Somme Cloud.
 
 ## Run it
 
-- `crates/somme-desktop/macos-app.sh` builds `target/debug/SommeCLI.app` with the name and icon, then prints its path. Add `--release` for a release build.
+- `crates/somme-desktop/macos-app.sh` builds `target/debug/Somme.app` with the name and icon, then prints its path. Add `--release` for a release build.
 - `cargo run -p somme-desktop` runs it without the app bundle.
 
 The app uses the hosted Somme Cloud at `https://somme-cloud.fly.dev`. Set `SOMME_CLOUD_URL=http://127.0.0.1:8787` to use a local one instead.

@@ -1,4 +1,4 @@
-//! Finds the marks SommeCLI's shell hooks print (`ESC ] 6973 ; <secret> ; ... BEL`),
+//! Finds the marks Somme's shell hooks print (`ESC ] 6973 ; <secret> ; ... BEL`),
 //! so a local terminal knows where each prompt and command starts. A mark
 //! without this shell's secret came from program output and is dropped.
 
