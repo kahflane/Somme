@@ -32,7 +32,8 @@ impl SqlRepository {
         params: Vec<Value>,
     ) -> Result<Vec<T>, RepositoryError> {
         let sql = format!("SELECT {} FROM {} {clause}", T::COLUMNS.join(", "), T::TABLE);
-        let mut rows = self.store.conn().query(sql, params).await.map_err(storage)?;
+        let conn = self.store.conn().await;
+        let mut rows = conn.query(sql, params).await.map_err(storage)?;
         let mut items = Vec::new();
         while let Some(row) = rows.next().await.map_err(storage)? {
             items.push(T::from_row(&RowReader::new(T::TABLE, &row))?);
@@ -41,7 +42,7 @@ impl SqlRepository {
     }
 
     async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<(), RepositoryError> {
-        self.store.conn().execute(sql, params).await.map_err(storage)?;
+        self.store.conn().await.execute(sql, params).await.map_err(storage)?;
         self.store.mark_changed();
         Ok(())
     }
@@ -103,9 +104,8 @@ impl KnownHostRepository for SqlRepository {
 #[async_trait]
 impl VaultRepository for SqlRepository {
     async fn load(&self) -> Result<Option<VaultMeta>, RepositoryError> {
-        let mut rows = self
-            .store
-            .conn()
+        let conn = self.store.conn().await;
+        let mut rows = conn
             .query(
                 "SELECT salt, check_blob, created_at FROM vault_meta WHERE id = ?",
                 vec![Value::Text(VAULT_ROW_ID.into())],

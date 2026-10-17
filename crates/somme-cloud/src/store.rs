@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use tokio::sync::Mutex;
 use turso::{Connection, Value};
 use uuid::Uuid;
 
@@ -27,7 +28,9 @@ fn storage(err: impl std::fmt::Display) -> CloudError {
 }
 
 pub struct AccountStore {
-    conn: Connection,
+    /// Turso fails a query with "concurrent use forbidden" when another request is
+    /// using the same connection, so requests take turns.
+    conn: Mutex<Connection>,
     _db: turso::Database,
 }
 
@@ -55,11 +58,16 @@ impl AccountStore {
         let db = turso::Builder::new_local(path).build().await.map_err(storage)?;
         let conn = db.connect().map_err(storage)?;
         conn.execute_batch(SCHEMA).await.map_err(storage)?;
-        Ok(Self { conn, _db: db })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            _db: db,
+        })
     }
 
     pub async fn insert_account(&self, account: &Account) -> Result<(), CloudError> {
         self.conn
+            .lock()
+            .await
             .execute(
                 "INSERT INTO accounts (id, email, password_hash, database_name, database_host, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 vec![
@@ -83,7 +91,8 @@ impl AccountStore {
         let sql = format!(
             "SELECT id, email, password_hash, database_name, database_host, created_at FROM accounts WHERE {clause}"
         );
-        let mut rows = self.conn.query(sql, vec![Value::Text(param)]).await.map_err(storage)?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query(sql, vec![Value::Text(param)]).await.map_err(storage)?;
         let Some(row) = rows.next().await.map_err(storage)? else {
             return Ok(None);
         };
@@ -108,6 +117,8 @@ impl AccountStore {
 
     pub async fn set_database_host(&self, id: Uuid, host: &str) -> Result<(), CloudError> {
         self.conn
+            .lock()
+            .await
             .execute(
                 "UPDATE accounts SET database_host = ? WHERE id = ?",
                 vec![Value::Text(host.to_owned()), Value::Text(id.to_string())],
@@ -119,6 +130,8 @@ impl AccountStore {
 
     pub async fn insert_session(&self, token_hash: &str, account_id: Uuid, expires_at: i64, now: i64) -> Result<(), CloudError> {
         self.conn
+            .lock()
+            .await
             .execute(
                 "INSERT INTO sessions (token_hash, account_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
                 vec![
@@ -134,8 +147,8 @@ impl AccountStore {
     }
 
     pub async fn find_session(&self, token_hash: &str) -> Result<Option<(Uuid, i64)>, CloudError> {
-        let mut rows = self
-            .conn
+        let conn = self.conn.lock().await;
+        let mut rows = conn
             .query(
                 "SELECT account_id, expires_at FROM sessions WHERE token_hash = ?",
                 vec![Value::Text(token_hash.to_owned())],
@@ -151,6 +164,8 @@ impl AccountStore {
 
     pub async fn delete_session(&self, token_hash: &str) -> Result<(), CloudError> {
         self.conn
+            .lock()
+            .await
             .execute(
                 "DELETE FROM sessions WHERE token_hash = ?",
                 vec![Value::Text(token_hash.to_owned())],
@@ -158,5 +173,32 @@ impl AccountStore {
             .await
             .map_err(storage)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Requests run at the same time and all share one connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_requests_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(dir.path()).await.unwrap());
+        let tasks: Vec<_> = (0..32)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let token = format!("token-{i}");
+                    store.insert_session(&token, Uuid::new_v4(), 100, 1).await?;
+                    store.find_session(&token).await
+                })
+            })
+            .collect();
+        for task in tasks {
+            assert!(task.await.unwrap().unwrap().is_some());
+        }
     }
 }
