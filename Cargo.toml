@@ -5,6 +5,7 @@ members = [
     "crates/somme-application",
     "crates/somme-infrastructure",
     "crates/somme-cloud",
+    "crates/somme-desktop",
     "src-tauri",
 ]
 
