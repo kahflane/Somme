@@ -1,0 +1,100 @@
+.search {
+  display: flex;
+  align-items: center;
+  height: 36px;
+  padding: 0 6px 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--x-field);
+  transition: border-color 0.15s ease;
+}
+
+.search:focus-within {
+  border-color: color-mix(in srgb, var(--x-accent) 70%, transparent);
+}
+
+.searchInput {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--x-text);
+  font: inherit;
+  font-size: 15px;
+}
+
+.searchInput::placeholder {
+  color: var(--x-text-secondary);
+}
+
+.connect {
+  height: 24px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--x-field-muted);
+  color: var(--x-text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.connect:disabled {
+  color: var(--x-text-muted);
+  cursor: default;
+}
+
+.connect:not(:disabled):hover {
+  background: var(--x-control-hover);
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.crumb {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--x-text-secondary);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.crumb:hover {
+  color: var(--x-text);
+}
+
+.fieldLabel {
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--x-text-secondary);
+}
+
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.swatch {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 2px solid transparent;
+  border-radius: 7px;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.swatch[data-selected] {
+  border-color: var(--x-text);
+}

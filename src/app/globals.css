@@ -1,0 +1,50 @@
+:root {
+  --x-space-1: 4px;
+  --x-space-2: 8px;
+  --x-space-3: 12px;
+  --x-space-4: 16px;
+  --x-space-5: 20px;
+  --x-space-8: 32px;
+  --x-radius-pill: 9999px;
+  --x-radius-card: 10px;
+  --x-radius-input: 8px;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  background: var(--mantine-color-body);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+input,
+textarea,
+.xterm {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.xterm {
+  height: 100%;
+  padding: 8px 0 0 12px;
+}
+
+.xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: var(--x-field) transparent;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--x-accent) 35%, transparent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--x-field) transparent;
+}
