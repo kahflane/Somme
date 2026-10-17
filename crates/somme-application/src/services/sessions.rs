@@ -1,10 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use somme_domain::{Id, new_id};
 
 use crate::error::{AppError, AppResult};
-use crate::ports::{ConnectContext, OutputSink, PtyGateway, SshGateway, TermSize, Terminal};
+use crate::ports::{ConnectContext, OutputSink, PtyGateway, ShellOptions, SshGateway, TermSize, Terminal};
 use crate::services::{ConnectionPlanner, SnippetService};
 
 type Sessions = Arc<DashMap<Id, Arc<dyn Terminal>>>;
@@ -69,15 +70,20 @@ impl SessionService {
         Ok(id)
     }
 
-    pub fn open_local<F>(&self, size: TermSize, make_sink: F) -> AppResult<Id>
+    pub fn open_local<F>(&self, size: TermSize, options: ShellOptions<'_>, make_sink: F) -> AppResult<Id>
     where
         F: FnOnce(Id) -> Arc<dyn OutputSink>,
     {
         let id = new_id();
         let sink = self.track(id, make_sink(id));
-        let terminal = self.pty.spawn(size, sink)?;
+        let terminal = self.pty.spawn(size, options, sink)?;
         self.sessions.insert(id, terminal);
         Ok(id)
+    }
+
+    /// The folder a local shell is in now.
+    pub fn cwd(&self, id: Id) -> Option<PathBuf> {
+        self.sessions.get(&id)?.cwd()
     }
 
     pub async fn write(&self, id: Id, data: &[u8]) -> AppResult<()> {

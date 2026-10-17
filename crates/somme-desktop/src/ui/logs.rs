@@ -191,7 +191,7 @@ impl LogsPage {
     }
 }
 
-fn started(timestamp: i64) -> String {
+pub(crate) fn started(timestamp: i64) -> String {
     Local
         .timestamp_opt(timestamp, 0)
         .single()

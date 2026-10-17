@@ -1,27 +1,32 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::DropdownMenu as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::sidebar::{Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, TitleBar, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::{
     AnyElement, App, AppContext as _, Axis, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, KeyBinding, MouseButton, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    IntoElement, KeyBinding, MouseButton, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use somme_application::dto::{HostInput, HostView, SecretUpdate};
 use somme_domain::Id;
 
+use crate::changes::ChangesView;
 use crate::services::Services;
 use crate::settings::Settings;
 use crate::store::{Store, StoreEvent, mutate};
 use crate::terminal::SessionTarget;
-use crate::ui::common::{Lucide, notify_error, parse_color};
+use crate::ui::common::{APP_NAME, Lucide, logo, notify_error, parse_color};
+use crate::ui::native;
 use crate::ui::fields::host_input;
 use crate::ui::filter::parse_quick_connect;
 use crate::ui::forwards::ForwardsPage;
@@ -32,6 +37,7 @@ use crate::ui::known_hosts::KnownHostsPage;
 use crate::ui::logs::LogsPage;
 use crate::ui::palette::{CommandPalette, PaletteAction, PaletteEvent};
 use crate::ui::settings_page::SettingsPage;
+use crate::ui::side_panel::{SidePanel, SidePanelEvent};
 use crate::ui::sftp::SftpPage;
 use crate::ui::snippets::SnippetsPage;
 use crate::ui::terminal_tab::{TerminalTab, TerminalTabEvent};
@@ -53,6 +59,7 @@ actions!(
         LockVault,
         OpenSettings,
         TogglePalette,
+        ToggleSidePanel,
         Quit,
         SelectTab1,
         SelectTab2,
@@ -88,6 +95,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&format!("{m}-shift-h"), ShowHome, None),
         KeyBinding::new(&format!("{m}-,"), OpenSettings, None),
         KeyBinding::new(&format!("{m}-p"), TogglePalette, None),
+        KeyBinding::new(&format!("{m}-shift-s"), ToggleSidePanel, None),
         KeyBinding::new(&format!("{m}-q"), Quit, None),
         KeyBinding::new(&format!("{m}-1"), SelectTab1, None),
         KeyBinding::new(&format!("{m}-2"), SelectTab2, None),
@@ -154,12 +162,48 @@ impl Page {
 
 enum TabContent {
     Terminal(Entity<TerminalTab>),
+    Changes(Entity<ChangesView>),
 }
 
 struct Tab {
     id: usize,
     content: TabContent,
     _subscription: Subscription,
+}
+
+/// A tab whose new name is being typed.
+struct Renaming {
+    tab_id: usize,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+/// A tab being dragged to a new place. It also draws itself under the pointer.
+#[derive(Clone)]
+struct DraggedTab {
+    id: usize,
+    title: SharedString,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .h(px(26.))
+            .max_w(px(220.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .text_sm()
+            .text_color(theme.foreground)
+            .shadow_md()
+            .truncate()
+            .child(self.title.clone())
+    }
 }
 
 pub struct Workspace {
@@ -182,8 +226,13 @@ pub struct Workspace {
     sftp: Option<Entity<SftpPage>>,
     focus_handle: FocusHandle,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
+    /// Snippets and themes next to the terminal. Made the first time it shows.
+    side_panel: Option<(Entity<SidePanel>, Subscription)>,
     /// Last key press, click or scroll. Auto-lock counts idle time from here.
     last_activity: Instant,
+    /// Set after the first unlock, so the start-up terminal opens only once.
+    started: bool,
+    renaming: Option<Renaming>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -196,6 +245,11 @@ impl Workspace {
             cx.subscribe_in(&store, window, |workspace, store, event, window, cx| match event {
                 StoreEvent::VaultChanged => {
                     if store.read(cx).is_unlocked() {
+                        // The app starts on a local terminal.
+                        if !workspace.started && workspace.tabs.is_empty() {
+                            workspace.open_terminal(SessionTarget::Local, window, cx);
+                        }
+                        workspace.started = true;
                         workspace.focus_current(window, cx);
                     } else {
                         workspace.lock_screen.update(cx, |lock, cx| lock.focus_password(window, cx));
@@ -222,7 +276,10 @@ impl Workspace {
             sftp: None,
             focus_handle: cx.focus_handle(),
             palette: None,
+            side_panel: None,
             last_activity: Instant::now(),
+            started: false,
+            renaming: None,
             _subscriptions: subscriptions,
         }
     }
@@ -261,6 +318,10 @@ impl Workspace {
                 content: TabContent::Terminal(tab),
                 ..
             }) => window.focus(&tab.focus_handle(cx), cx),
+            Some(Tab {
+                content: TabContent::Changes(view),
+                ..
+            }) => window.focus(&view.focus_handle(cx), cx),
             None => window.focus(&self.focus_handle, cx),
         }
     }
@@ -269,12 +330,14 @@ impl Workspace {
 
     pub fn open_terminal(&mut self, target: SessionTarget, window: &mut Window, cx: &mut Context<Self>) {
         let services = self.services.clone();
-        let tab = cx.new(|cx| TerminalTab::new(target, services, window, cx));
+        let dir = matches!(target, SessionTarget::Local).then(|| self.previous_local_dir(cx)).flatten();
+        let tab = cx.new(|cx| TerminalTab::new(target, dir, services, window, cx));
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let subscription = cx.subscribe_in(&tab, window, move |workspace, _, event, window, cx| match event {
             TerminalTabEvent::Changed => cx.notify(),
             TerminalTabEvent::Empty => workspace.remove_tab(id, window, cx),
+            TerminalTabEvent::OpenChanges(dir) => workspace.open_changes(dir.clone(), window, cx),
         });
         self.tabs.push(Tab {
             id,
@@ -282,6 +345,44 @@ impl Workspace {
             _subscription: subscription,
         });
         self.activate(Some(self.tabs.len() - 1), window, cx);
+    }
+
+    /// Shows the git changes of the repo that holds `dir`, in its own tab.
+    fn open_changes(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.tabs.iter().position(|tab| match &tab.content {
+            TabContent::Changes(view) => view.read(cx).shows(&dir),
+            TabContent::Terminal(_) => false,
+        });
+        if let Some(ix) = open {
+            if let TabContent::Changes(view) = &self.tabs[ix].content {
+                view.update(cx, |view, cx| view.reload(cx));
+            }
+            self.activate(Some(ix), window, cx);
+            return;
+        }
+        let view = cx.new(|cx| ChangesView::new(dir, cx));
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let subscription = cx.observe(&view, |_, _, cx| cx.notify());
+        self.tabs.push(Tab {
+            id,
+            content: TabContent::Changes(view),
+            _subscription: subscription,
+        });
+        self.activate(Some(self.tabs.len() - 1), window, cx);
+    }
+
+    /// The folder of the local terminal used last: the focused pane of the open
+    /// tab when it is local, or else the newest local tab.
+    fn previous_local_dir(&self, cx: &App) -> Option<PathBuf> {
+        let open = self.active.and_then(|i| self.tabs.get(i));
+        open.into_iter().chain(self.tabs.iter().rev()).find_map(|tab| {
+            let TabContent::Terminal(term) = &tab.content else { return None };
+            let term = term.read(cx);
+            std::iter::once(term.active().clone())
+                .chain(term.panes())
+                .find_map(|pane| pane.read(cx).session.read(cx).current_dir())
+        })
     }
 
     /// Saves typed text like `user@host:port` as a host, then connects to it.
@@ -376,6 +477,45 @@ impl Workspace {
         }
     }
 
+    // ---- side panel ----
+
+    /// The panel only makes sense next to a live terminal, not a replayed log.
+    fn side_panel_fits(&self, cx: &App) -> bool {
+        self.active_terminal()
+            .is_some_and(|tab| !matches!(tab.read(cx).target, SessionTarget::Replay { .. }))
+    }
+
+    fn toggle_side_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.side_panel_fits(cx) {
+            return;
+        }
+        Settings::update(cx, |s| s.side_panel = !s.side_panel);
+        self.focus_current(window, cx);
+    }
+
+    fn side_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<SidePanel> {
+        if let Some((panel, _)) = &self.side_panel {
+            return panel.clone();
+        }
+        let panel = cx.new(|cx| SidePanel::new(window, cx));
+        let subscription = cx.subscribe_in(&panel, window, |workspace, _, event, window, cx| match event {
+            SidePanelEvent::Send { script, run } => workspace.send_snippet(script, *run, window, cx),
+            SidePanelEvent::ManageSnippets => workspace.show_page(Page::Snippets, window, cx),
+            SidePanelEvent::OpenLog(entry) => {
+                let target = SessionTarget::Replay {
+                    label: entry.label.clone(),
+                    file: entry.file.clone(),
+                };
+                workspace.open_terminal(target, window, cx);
+            }
+            SidePanelEvent::ShowAllLogs => workspace.show_page(Page::Logs, window, cx),
+            SidePanelEvent::FocusTerminal => workspace.focus_current(window, cx),
+            SidePanelEvent::Close => workspace.toggle_side_panel(window, cx),
+        });
+        self.side_panel = Some((panel.clone(), subscription));
+        panel
+    }
+
     pub fn connect_host(&mut self, host_id: Id, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = Store::global(cx).read(cx).host(host_id).cloned() else { return };
         let has_user = host.username.as_deref().is_some_and(|u| !u.trim().is_empty()) || host.identity_id.is_some();
@@ -459,17 +599,19 @@ impl Workspace {
 
     /// Sends a snippet to the terminal used last and shows it.
     pub fn send_snippet(&mut self, script: &str, run: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let is_terminal = |ix: &usize| matches!(self.tabs[*ix].content, TabContent::Terminal(_));
         let ix = self
             .active
+            .filter(is_terminal)
             .or_else(|| self.tabs.iter().position(|t| Some(t.id) == self.last_terminal))
-            .or_else(|| self.tabs.len().checked_sub(1));
+            .or_else(|| (0..self.tabs.len()).rev().find(is_terminal));
         let Some(ix) = ix else {
             notify_error(window, cx, "No terminal open", "Connect to a host or open a local terminal first.");
             return;
         };
         self.activate(Some(ix), window, cx);
-        match &self.tabs[ix].content {
-            TabContent::Terminal(tab) => tab.update(cx, |tab, cx| tab.send_snippet(script, run, cx)),
+        if let TabContent::Terminal(tab) = &self.tabs[ix].content {
+            tab.update(cx, |tab, cx| tab.send_snippet(script, run, cx));
         }
     }
 
@@ -494,7 +636,11 @@ impl Workspace {
     fn activate(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         self.active = index.filter(|ix| *ix < self.tabs.len());
         match self.active {
-            Some(ix) => self.last_terminal = Some(self.tabs[ix].id),
+            Some(ix) => {
+                if let TabContent::Terminal(_) = self.tabs[ix].content {
+                    self.last_terminal = Some(self.tabs[ix].id);
+                }
+            }
             None => self.reload_page(cx),
         }
         self.focus_current(window, cx);
@@ -518,38 +664,98 @@ impl Workspace {
         self.activate(next, window, cx);
     }
 
+    /// Moves the tab with `id` to position `to`, keeping the same tab in front.
+    fn move_tab(&mut self, id: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let to = to.min(self.tabs.len() - 1);
+        if from == to {
+            return;
+        }
+        let active_id = self.active.map(|ix| self.tabs[ix].id);
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = active_id.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+        cx.notify();
+    }
+
+    /// Puts a name box in place of the tab's title.
+    fn start_rename(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix) else { return };
+        let TabContent::Terminal(term) = &tab.content else { return };
+        let (tab_id, title) = (tab.id, term.read(cx).title(cx));
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        let subscription = cx.subscribe_in(&input, window, |workspace, _, event, window, cx| match event {
+            InputEvent::PressEnter { .. } | InputEvent::Blur => workspace.finish_rename(true, window, cx),
+            _ => {}
+        });
+        self.renaming = Some(Renaming {
+            tab_id,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Saves or drops the typed name. A blank name gives the tab its automatic name back.
+    fn finish_rename(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.take() else { return };
+        if save
+            && let Some(tab) = self.tabs.iter().find(|t| t.id == renaming.tab_id)
+            && let TabContent::Terminal(term) = &tab.content
+        {
+            let name = renaming.input.read(cx).value();
+            term.update(cx, |term, cx| term.rename(&name, cx));
+        }
+        self.focus_current(window, cx);
+        cx.notify();
+    }
+
     fn tab_is_running(&self, ix: usize, cx: &App) -> bool {
         match &self.tabs[ix].content {
             TabContent::Terminal(tab) => tab.read(cx).is_running(cx),
+            TabContent::Changes(_) => false,
         }
     }
 
     /// Closes a tab, asking first when sessions in it are still connected.
     fn request_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.tabs.get(ix).map(|t| t.id) else { return };
-        if !Settings::get(cx).confirm_close_tab || !self.tab_is_running(ix, cx) {
+        let Some(tab) = self.tabs.get(ix) else { return };
+        let unsaved = match &tab.content {
+            TabContent::Terminal(term) => term.read(cx).has_unsaved(cx),
+            TabContent::Changes(_) => false,
+        };
+        let id = tab.id;
+        let running = Settings::get(cx).confirm_close_tab && self.tab_is_running(ix, cx);
+        if !unsaved && !running {
             self.remove_tab(id, window, cx);
             return;
         }
+        let detail = if unsaved {
+            "Files open in this tab have unsaved changes. They will be lost."
+        } else {
+            "The sessions in this tab are still connected. They will be disconnected."
+        };
         let workspace = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let workspace = workspace.clone();
-            alert
-                .confirm()
-                .title("Close this tab?")
-                .description("The sessions in this tab are still connected. They will be disconnected.")
-                .ok_text("Close")
-                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
-                    let _ = workspace.update(cx, |workspace, cx| workspace.remove_tab(id, window, cx));
-                    true
-                })
-        });
+        native::confirm(
+            "Close this tab?",
+            detail,
+            "Close",
+            move |window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| workspace.remove_tab(id, window, cx));
+            },
+            window,
+            cx,
+        );
     }
 
     fn active_terminal(&self) -> Option<Entity<TerminalTab>> {
         match &self.tabs.get(self.active?)?.content {
             TabContent::Terminal(tab) => Some(tab.clone()),
+            TabContent::Changes(_) => None,
         }
     }
 
@@ -633,6 +839,12 @@ impl Workspace {
 
     fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        // Tabs sit on a light wash of the text colour, so they stand out on any theme.
+        let (tab_bg, tab_hover, tab_active) = (
+            theme.foreground.opacity(0.05),
+            theme.foreground.opacity(0.09),
+            theme.foreground.opacity(0.14),
+        );
         let home_active = self.active.is_none();
         let home = div()
             .id("tab-home")
@@ -642,17 +854,29 @@ impl Workspace {
             .items_center()
             .gap_1p5()
             .rounded_md()
+            .border_1()
             .text_sm()
             .cursor_pointer()
-            .when(home_active, |el| el.bg(theme.tab_active).text_color(theme.tab_active_foreground))
-            .when(!home_active, |el| el.text_color(theme.tab_foreground).hover(|el| el.bg(theme.muted)))
+            .when(home_active, |el| {
+                el.bg(tab_active).border_color(theme.border).text_color(theme.foreground)
+            })
+            .when(!home_active, |el| {
+                el.bg(tab_bg)
+                    .border_color(theme.transparent)
+                    .text_color(theme.tab_foreground)
+                    .hover(|el| el.bg(tab_hover))
+            })
             .child(Icon::new(Lucide::LayoutGrid).size(px(14.)))
             .child("Vault")
+            // Keeps a press here from moving the window, as the title bar behind would.
+            .block_mouse_except_scroll()
             .on_click(cx.listener(|workspace, _, window, cx| workspace.activate(None, window, cx)));
 
+        let workspace = cx.entity().downgrade();
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
             let selected = self.active == Some(ix);
-            let (title, color, broadcast, running) = match &tab.content {
+            let changes = matches!(tab.content, TabContent::Changes(_));
+            let (title, color, broadcast, running, renamed) = match &tab.content {
                 TabContent::Terminal(term) => {
                     let term = term.read(cx);
                     let color = match &term.target {
@@ -662,10 +886,26 @@ impl Workspace {
                             .and_then(|h| parse_color(h.color.as_deref())),
                         SessionTarget::Local | SessionTarget::Replay { .. } => None,
                     };
-                    (term.title(cx), color, term.broadcast, term.is_running(cx))
+                    (term.title(cx), color, term.broadcast, term.is_running(cx), term.custom_title.is_some())
                 }
+                TabContent::Changes(view) => (view.read(cx).title(), None, false, false, false),
             };
             let dot = color.unwrap_or(if running { theme.success } else { theme.muted_foreground });
+            let editing = self.renaming.as_ref().filter(|r| r.tab_id == tab.id).map(|r| r.input.clone());
+            let label = match editing {
+                Some(input) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .capture_action(cx.listener(|workspace, _: &Escape, window, cx| {
+                        workspace.finish_rename(false, window, cx);
+                    }))
+                    .child(Input::new(&input).xsmall().appearance(false))
+                    .into_any_element(),
+                None => div().flex_1().min_w_0().truncate().child(title.clone()).into_any_element(),
+            };
+            let dragged = DraggedTab { id: tab.id, title: title.clone() };
+            let tab_id = tab.id;
+            let menu_workspace = workspace.clone();
             div()
                 .id(("tab", tab.id))
                 .group("tab")
@@ -678,15 +918,24 @@ impl Workspace {
                 .items_center()
                 .gap_1p5()
                 .rounded_md()
+                .border_1()
                 .text_sm()
                 .cursor_pointer()
-                .when(selected, |el| el.bg(theme.tab_active).text_color(theme.tab_active_foreground))
-                .when(!selected, |el| el.text_color(theme.tab_foreground).hover(|el| el.bg(theme.muted)))
-                .child(div().flex_none().size(px(7.)).rounded_full().bg(dot))
+                .when(selected, |el| {
+                    el.bg(tab_active).border_color(theme.border).text_color(theme.foreground)
+                })
+                .when(!selected, |el| {
+                    el.bg(tab_bg)
+                        .border_color(theme.transparent)
+                        .text_color(theme.tab_foreground)
+                        .hover(|el| el.bg(tab_hover))
+                })
+                .when(changes, |el| el.child(Icon::new(Lucide::FileDiff).size(px(13.))))
+                .when(!changes, |el| el.child(div().flex_none().size(px(7.)).rounded_full().bg(dot)))
                 .when(broadcast, |el| {
                     el.child(Icon::new(Lucide::RadioTower).size(px(12.)).text_color(theme.warning))
                 })
-                .child(div().flex_1().min_w_0().truncate().child(title))
+                .child(label)
                 .child(
                     Button::new(("close-tab", tab.id))
                         .ghost()
@@ -698,11 +947,48 @@ impl Workspace {
                             workspace.request_close_tab(ix, window, cx);
                         })),
                 )
-                .on_click(cx.listener(move |workspace, _, window, cx| workspace.activate(Some(ix), window, cx)))
+                .on_click(cx.listener(move |workspace, event: &ClickEvent, window, cx| {
+                    if event.click_count() == 2 && !changes {
+                        workspace.start_rename(ix, window, cx);
+                    } else if workspace.renaming.as_ref().is_none_or(|r| r.tab_id != tab_id) {
+                        workspace.activate(Some(ix), window, cx);
+                    }
+                }))
+                .block_mouse_except_scroll()
                 .on_mouse_down(
                     MouseButton::Middle,
                     cx.listener(move |workspace, _, window, cx| workspace.request_close_tab(ix, window, cx)),
                 )
+                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                .drag_over::<DraggedTab>(|style, _, _, cx| style.border_color(cx.theme().primary))
+                .on_drop(cx.listener(move |workspace, dragged: &DraggedTab, _, cx| {
+                    workspace.move_tab(dragged.id, ix, cx);
+                }))
+                .context_menu(move |menu, _, _| {
+                    let (rename, reset, close) = (menu_workspace.clone(), menu_workspace.clone(), menu_workspace.clone());
+                    menu.when(!changes, |menu| {
+                        menu.item(PopupMenuItem::new("Rename…").icon(Icon::new(Lucide::Pencil)).on_click(
+                            move |_, window, cx| {
+                                let _ = rename.update(cx, |workspace, cx| workspace.start_rename(ix, window, cx));
+                            },
+                        ))
+                    })
+                    .when(renamed, |menu| {
+                        menu.item(PopupMenuItem::new("Use Automatic Name").icon(Icon::new(Lucide::RotateCcw)).on_click(
+                            move |_, _, cx| {
+                                let _ = reset.update(cx, |workspace, cx| {
+                                    if let Some(TabContent::Terminal(term)) = workspace.tabs.get(ix).map(|t| &t.content) {
+                                        term.update(cx, |term, cx| term.rename("", cx));
+                                    }
+                                });
+                            },
+                        ))
+                    })
+                    .when(!changes, |menu| menu.separator())
+                    .item(PopupMenuItem::new("Close Tab").icon(IconName::Close).on_click(move |_, window, cx| {
+                        let _ = close.update(cx, |workspace, cx| workspace.request_close_tab(ix, window, cx));
+                    }))
+                })
         });
 
         let new_tab = Button::new("new-tab")
@@ -729,35 +1015,49 @@ impl Workspace {
             .child(new_tab)
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let unlocked = Store::global(cx).read(cx).is_unlocked();
-        TitleBar::new().child(
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .pr_2()
-                .gap_2()
-                .when(unlocked, |bar| bar.child(self.render_tab_strip(cx)))
-                .when(!unlocked, |bar| bar.child(div().flex_1().text_sm().child("Somme")))
-                .when(unlocked, |bar| {
-                    bar.child(
-                        Button::new("palette")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Search)
-                            .tooltip("Search and connect (⌘P)")
-                            .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_palette(window, cx))),
-                    )
-                    .child(
-                        Button::new("lock")
-                            .ghost()
-                            .xsmall()
-                            .icon(Icon::new(Lucide::Lock))
-                            .tooltip("Lock vault")
-                            .on_click(cx.listener(|workspace, _, window, cx| workspace.on_lock(&LockVault, window, cx))),
-                    )
-                }),
-        )
+        TitleBar::new()
+            // The kit keeps room for the window buttons, which full screen hides.
+            .when(window.is_fullscreen(), |bar| bar.pl_0())
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .pr_2()
+                    .gap_2()
+                    .when(unlocked, |bar| bar.child(self.render_tab_strip(cx)))
+                    .when(!unlocked, |bar| bar.child(div().flex_1().text_sm().child(APP_NAME)))
+                    .when(unlocked && self.side_panel_fits(cx), |bar| {
+                        bar.child(
+                            Button::new("side-panel")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(Lucide::PanelRight))
+                                .selected(Settings::get(cx).side_panel)
+                                .tooltip("Snippets and themes (⌘⇧S)")
+                                .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_side_panel(window, cx))),
+                        )
+                    })
+                    .when(unlocked, |bar| {
+                        bar.child(
+                            Button::new("palette")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Search)
+                                .tooltip("Search and connect (⌘P)")
+                                .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_palette(window, cx))),
+                        )
+                        .child(
+                            Button::new("lock")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(Lucide::Lock))
+                                .tooltip("Lock vault")
+                                .on_click(cx.listener(|workspace, _, window, cx| workspace.on_lock(&LockVault, window, cx))),
+                        )
+                    }),
+            )
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -780,8 +1080,8 @@ impl Workspace {
                 SidebarHeader::new().child(
                     h_flex()
                         .gap_2()
-                        .child(Icon::new(Lucide::SquareTerminal).size(px(18.)))
-                        .child(div().font_semibold().child("Somme")),
+                        .child(logo(px(20.)))
+                        .child(div().font_semibold().child(APP_NAME)),
                 ),
             )
             .child(SidebarGroup::new("Vault").child(SidebarMenu::new().children(items)))
@@ -864,9 +1164,32 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let body: AnyElement = if !unlocked {
             self.lock_screen.clone().into_any_element()
-        } else if let Some(tab) = self.active.and_then(|ix| self.tabs.get(ix)) {
-            match &tab.content {
-                TabContent::Terminal(term) => term.clone().into_any_element(),
+        } else if let Some(Tab {
+            content: TabContent::Changes(view),
+            ..
+        }) = self.active.and_then(|ix| self.tabs.get(ix))
+        {
+            view.clone().into_any_element()
+        } else if let Some(Tab {
+            content: TabContent::Terminal(term),
+            ..
+        }) = self.active.and_then(|ix| self.tabs.get(ix))
+        {
+            let term = term.clone();
+            if Settings::get(cx).side_panel && self.side_panel_fits(cx) {
+                let log_host = match &term.read(cx).target {
+                    SessionTarget::Ssh { host_id, .. } => Some(host_id.to_string()),
+                    SessionTarget::Local | SessionTarget::Replay { .. } => None,
+                };
+                let panel = self.side_panel(window, cx);
+                panel.update(cx, |panel, cx| panel.set_log_host(log_host, cx));
+                h_flex()
+                    .size_full()
+                    .child(div().flex_1().min_w_0().h_full().child(term))
+                    .child(panel)
+                    .into_any_element()
+            } else {
+                term.into_any_element()
             }
         } else {
             h_flex()
@@ -913,6 +1236,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|w, _: &OpenSettings, window, cx| w.show_page(Page::Settings, window, cx)))
             .on_action(cx.listener(|w, _: &TogglePalette, window, cx| w.toggle_palette(window, cx)))
+            .on_action(cx.listener(|w, _: &ToggleSidePanel, window, cx| w.toggle_side_panel(window, cx)))
             .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|w, _: &SelectTab1, window, cx| w.activate(Some(0), window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab2, window, cx| w.activate(Some(1), window, cx)))
@@ -926,7 +1250,7 @@ impl Render for Workspace {
                 let last = w.tabs.len().checked_sub(1);
                 w.activate(last, window, cx)
             }))
-            .child(self.render_title_bar(cx))
+            .child(self.render_title_bar(window, cx))
             .child(div().flex_1().min_h_0().child(body))
             .when_some(self.palette.as_ref(), |root, (palette, _)| {
                 root.child(

@@ -2,11 +2,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use somme_application::ports::{EventPublisher, GatewayError, SyncGateway, SyncOutcome, SyncState};
+use somme_application::ports::{EventPublisher, GatewayError, SyncGateway, SyncOutcome, SyncState, VaultData};
 use somme_domain::now;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db::config::{DataPaths, SyncConfig};
+use crate::db::migrations::holds_vault_items;
+use crate::db::repository::SqlRepository;
 use crate::db::store::{Backend, Store, StoreError, TokenSource};
 const PULL_INTERVAL: Duration = Duration::from_secs(30);
 const PUSH_DEBOUNCE: Duration = Duration::from_millis(1500);
@@ -132,12 +134,15 @@ impl TursoSync {
         Ok(())
     }
 
-    fn current_url(&self) -> Option<String> {
+    fn config(&self) -> SyncConfig {
         self.config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .url
             .clone()
+    }
+
+    fn current_url(&self) -> Option<String> {
+        self.config().url
     }
 }
 
@@ -154,6 +159,7 @@ impl SyncGateway for TursoSync {
         let guard = self.running.lock().await;
         let current = self.store.backend();
         let same_target = current.synced().is_some() && self.current_url().as_deref() == Some(url);
+        let mut previous = self.config().previous;
         let outcome = if same_target {
             SyncOutcome::RemoteKept
         } else {
@@ -161,6 +167,9 @@ impl SyncGateway for TursoSync {
                 .await
                 .map_err(gateway_error)?;
             let outcome = if next.has_vault().await.map_err(gateway_error)? {
+                if holds_vault_items(&*self.store.conn().await).await.map_err(gateway_error)? {
+                    previous = Some(current.path().to_owned());
+                }
                 SyncOutcome::RemoteKept
             } else {
                 next.copy_from(&*self.store.conn().await).await.map_err(gateway_error)?;
@@ -175,6 +184,7 @@ impl SyncGateway for TursoSync {
         self.save_config(SyncConfig {
             url: Some(url.to_owned()),
             enabled: true,
+            previous,
         })?;
         self.update(|s| {
             s.enabled = true;
@@ -189,8 +199,8 @@ impl SyncGateway for TursoSync {
     async fn disconnect(&self) -> Result<(), GatewayError> {
         let _guard = self.running.lock().await;
         self.save_config(SyncConfig {
-            url: self.current_url(),
             enabled: false,
+            ..self.config()
         })?;
         self.update(|s| {
             s.enabled = false;
@@ -204,5 +214,20 @@ impl SyncGateway for TursoSync {
             return Err(GatewayError::Connection("sync is not enabled".into()));
         }
         self.run().await
+    }
+
+    async fn previous_data(&self) -> Result<Option<Arc<dyn VaultData>>, GatewayError> {
+        let Some(path) = self.config().previous.filter(|path| path.exists()) else {
+            return Ok(None);
+        };
+        let backend = Backend::open_local(&path).await.map_err(gateway_error)?;
+        Ok(Some(Arc::new(SqlRepository::new(Arc::new(Store::new(backend))))))
+    }
+
+    async fn forget_previous_data(&self) -> Result<(), GatewayError> {
+        self.save_config(SyncConfig {
+            previous: None,
+            ..self.config()
+        })
     }
 }

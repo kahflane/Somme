@@ -11,7 +11,7 @@ use somme_application::ports::{
 };
 use somme_application::services::{
     ConnectionPlanner, ForwardService, GroupService, HostService, IdentityService, ImportService, KeyService,
-    KnownHostService, KnownHostsVerifier, Links, SessionService, SftpService, SnippetService, SyncService,
+    KnownHostService, KnownHostsVerifier, Links, PreferenceService, SessionService, SftpService, SnippetService, SyncService,
     VaultService,
 };
 use somme_domain::Id;
@@ -24,7 +24,7 @@ use somme_infrastructure::pty::NativePtyGateway;
 use somme_infrastructure::ssh::RusshGateway;
 use somme_infrastructure::ssh_config::OpenSshConfigSource;
 
-/// Same folder the Tauri build used, so an existing vault keeps working.
+/// Kept from the first release, so an existing vault keeps working.
 const APP_IDENTIFIER: &str = "app.somme.desktop";
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -142,6 +142,7 @@ pub struct Services {
     pub sftp: Arc<SftpService>,
     pub sync: Arc<SyncService>,
     pub import: Arc<ImportService>,
+    pub preferences: Arc<PreferenceService>,
 }
 
 fn data_dir() -> anyhow::Result<PathBuf> {
@@ -236,6 +237,7 @@ impl Services {
             cloud_sessions,
             vault.clone(),
             publisher.clone(),
+            repo.clone(),
         ));
         sync_gateway.start(publisher);
 
@@ -243,6 +245,7 @@ impl Services {
             data_dir,
             groups: Arc::new(GroupService::new(repo.clone(), links.clone())),
             identities: Arc::new(IdentityService::new(repo.clone(), vault.clone(), links)),
+            preferences: Arc::new(PreferenceService::new(repo.clone())),
             known_hosts: Arc::new(KnownHostService::new(repo)),
             sftp: Arc::new(SftpService::new(planner, ssh, ctx)),
             vault,

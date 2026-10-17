@@ -1,11 +1,11 @@
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::setting::{
     NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Focusable as _, IntoElement, ParentElement as _, Render,
@@ -14,8 +14,9 @@ use gpui_kit::{
 
 use crate::settings::{Appearance, BellSetting, CursorShapeSetting, Settings};
 use crate::store::{Store, mutate_weak, report};
-use crate::terminal::colors::THEMES;
-use crate::ui::common::{Lucide, ago, form_dialog, labeled, notify_error, notify_ok};
+use crate::ui::common::{APP_NAME, Lucide, ago, form_dialog, labeled, notify_error, notify_ok};
+use crate::ui::native;
+use crate::ui::theme_picker::{self, section};
 
 /// App and terminal preferences, security, and the sync account.
 pub struct SettingsPage {
@@ -64,7 +65,7 @@ fn font_field(options: Vec<(SharedString, SharedString)>) -> SettingField<Shared
     }
 }
 
-fn monospace_fonts() -> Vec<SharedString> {
+pub(crate) fn monospace_fonts() -> Vec<SharedString> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     let mut names: Vec<String> = db
@@ -141,33 +142,74 @@ fn appearance_page(fonts: &[SharedString], cx: &App) -> SettingPage {
     if !fonts.contains(&current) {
         font_options.insert(0, (current.clone(), current));
     }
-    let themes = THEMES.iter().map(|t| (SharedString::from(t.name), SharedString::from(t.name))).collect();
     let defaults = Settings::default();
     SettingPage::new("Appearance")
         .icon(Icon::new(Lucide::Palette))
         .default_open(true)
         .group(
-            SettingGroup::new().title("Window").item(SettingItem::new(
-                "Theme",
-                // The UI colors switch too, not just the saved setting.
-                choice_then(APPEARANCES, |s| s.appearance, |s, v| s.appearance = v, crate::apply_appearance),
-            )),
+            SettingGroup::new()
+                .title("App")
+                .item(
+                    SettingItem::new(
+                        "Mode",
+                        // The UI colors switch too, not just the saved setting.
+                        choice_then(APPEARANCES, |s| s.appearance, |s, v| s.appearance = v, crate::apply_appearance),
+                    )
+                    .description("Each mode keeps its own theme."),
+                )
+                .item(
+                    SettingItem::render(|_, _, cx| section("Dark theme", theme_picker::app_themes(true, cx), cx))
+                        .keywords(["theme", "color", "dark"])
+                        .on_reset(
+                            |cx| Settings::get(cx).dark_theme != Settings::default().dark_theme,
+                            |_, cx| {
+                                Settings::update(cx, |s| s.dark_theme = Settings::default().dark_theme);
+                                crate::apply_appearance(cx);
+                            },
+                        ),
+                )
+                .item(
+                    SettingItem::render(|_, _, cx| section("Light theme", theme_picker::app_themes(false, cx), cx))
+                        .keywords(["theme", "color", "light"])
+                        .on_reset(
+                            |cx| Settings::get(cx).light_theme != Settings::default().light_theme,
+                            |_, cx| {
+                                Settings::update(cx, |s| s.light_theme = Settings::default().light_theme);
+                                crate::apply_appearance(cx);
+                            },
+                        ),
+                ),
         )
         .group(
             SettingGroup::new()
-                .title("Terminal")
+                .title("Terminal colors")
                 .item(
                     SettingItem::new(
-                        "Color scheme",
-                        SettingField::dropdown(
-                            themes,
-                            |cx| Settings::get(cx).terminal_theme.clone().into(),
-                            |name, cx| Settings::update(cx, |s| s.terminal_theme = name.to_string()),
-                        )
-                        .default_value(SharedString::from(defaults.terminal_theme.clone())),
+                        "Match app theme",
+                        switch(|s| s.terminal_matches_theme, |s, v| s.terminal_matches_theme = v),
                     )
-                    .description("Colors for text, background and the 16 ANSI colors."),
+                    .description("Terminals use the colors of the app theme. Pick a scheme below to use other colors."),
                 )
+                .item(
+                    SettingItem::render(|_, _, cx| section("Color scheme", theme_picker::terminal_schemes(cx), cx))
+                        .keywords(["theme", "color", "scheme", "ansi"])
+                        .on_reset(
+                            |cx| {
+                                let s = Settings::get(cx);
+                                !s.terminal_matches_theme || s.terminal_theme != Settings::default().terminal_theme
+                            },
+                            |_, cx| {
+                                Settings::update(cx, |s| {
+                                    s.terminal_theme = Settings::default().terminal_theme;
+                                    s.terminal_matches_theme = true;
+                                })
+                            },
+                        ),
+                ),
+        )
+        .group(
+            SettingGroup::new()
+                .title("Font")
                 .item(
                     SettingItem::new(
                         "Font",
@@ -175,8 +217,31 @@ fn appearance_page(fonts: &[SharedString], cx: &App) -> SettingPage {
                     )
                     .description("Only fixed-width fonts are listed."),
                 )
+                .item(
+                    SettingItem::new(
+                        "Use for the whole app",
+                        switch(|s| s.font_everywhere, |s, v| s.font_everywhere = v),
+                    )
+                    .description("When off, only terminals and code use this font."),
+                )
+                .item(
+                    SettingItem::new(
+                        "App font size",
+                        SettingField::number_input(
+                            NumberFieldOptions {
+                                min: 12.,
+                                max: 24.,
+                                step: 1.,
+                            },
+                            |cx| Settings::get(cx).ui_font_size as f64,
+                            |size, cx| Settings::update(cx, |s| s.ui_font_size = size.clamp(12., 24.) as f32),
+                        )
+                        .default_value(defaults.ui_font_size as f64),
+                    )
+                    .description("Menus, lists and forms. Terminals use their own size below."),
+                )
                 .item(SettingItem::new(
-                    "Font size",
+                    "Terminal font size",
                     SettingField::number_input(
                         NumberFieldOptions {
                             min: 8.,
@@ -231,6 +296,10 @@ fn terminal_page() -> SettingPage {
                 )
                 .description("How many lines you can scroll back. Applies to new terminals."),
             )
+            .item(
+                SettingItem::new("Command blocks", switch(|s| s.command_blocks, |s, v| s.command_blocks = v))
+                    .description("Local terminals show each command as a block, with an editor to type in. Applies to new terminals."),
+            )
             .item(SettingItem::new("Bell", choice(BELLS, |s| s.bell, |s, v| s.bell = v)))
             .item(
                 SettingItem::new("Copy on select", switch(|s| s.copy_on_select, |s, v| s.copy_on_select = v))
@@ -240,6 +309,13 @@ fn terminal_page() -> SettingPage {
                 "Paste on right-click",
                 switch(|s| s.paste_on_right_click, |s, v| s.paste_on_right_click = v),
             ))
+            .item(
+                SettingItem::new(
+                    "Let servers copy to clipboard",
+                    switch(|s| s.remote_clipboard_write, |s, v| s.remote_clipboard_write = v),
+                )
+                .description("For copying from tmux or vim over SSH. A server can then replace what you copied."),
+            )
             .items(cfg!(target_os = "macos").then(|| {
                 SettingItem::new("Use Option as Meta", switch(|s| s.option_as_meta, |s, v| s.option_as_meta = v))
                     .description("Needed for Alt shortcuts in Emacs, tmux and shells.")
@@ -262,7 +338,7 @@ fn security_page() -> SettingPage {
                     "Lock automatically",
                     choice(AUTO_LOCK, |s| s.auto_lock_minutes, |s, v| s.auto_lock_minutes = v),
                 )
-                .description("Locks the vault when you have not used Somme for a while."),
+                .description(format!("Locks the vault when you have not used {APP_NAME} for a while.")),
             )
             .item(SettingItem::render(|_, _, cx| {
                 h_flex()
@@ -297,7 +373,7 @@ fn account_page(page: WeakEntity<SettingsPage>) -> SettingPage {
     SettingPage::new("Account").icon(Icon::new(Lucide::CircleUser)).group(
         SettingGroup::new()
             .title("Sync")
-            .description("Sign in to keep hosts, keys and snippets in sync across your devices. Data is encrypted with your master password before it leaves this device.")
+            .description("Sign in to keep hosts, keys, snippets and themes in sync across your devices. Passwords and keys are encrypted with your master password before they leave this device.")
             .item(SettingItem::render(move |_, window, cx| account_panel(page.clone(), window, cx))),
     )
 }
@@ -386,28 +462,25 @@ fn account_panel(page: WeakEntity<SettingsPage>, _: &mut Window, cx: &mut App) -
 }
 
 fn sign_out(page: WeakEntity<SettingsPage>, window: &mut Window, cx: &mut App) {
-    window.open_alert_dialog(cx, move |alert, _, _| {
-        let page = page.clone();
-        alert
-            .confirm()
-            .title("Sign out?")
-            .description("Sync stops on this device. Your data stays here and in the cloud.")
-            .ok_text("Sign Out")
-            .ok_variant(ButtonVariant::Danger)
-            .on_ok(move |_, window, cx| {
-                mutate_weak(
-                    &page,
-                    window,
-                    cx,
-                    |services| async move { services.sync.logout().await },
-                    |_, result, window, cx| match result {
-                        Ok(_) => Store::global(cx).update(cx, |store, cx| store.refresh_account(cx)),
-                        Err(err) => notify_error(window, cx, "Could not sign out", err),
-                    },
-                );
-                true
-            })
-    });
+    native::confirm(
+        "Sign out?",
+        "Sync stops on this device. Your data stays here and in the cloud.",
+        "Sign Out",
+        move |window, cx| {
+            mutate_weak(
+                &page,
+                window,
+                cx,
+                |services| async move { services.sync.logout().await },
+                |_, result, window, cx| match result {
+                    Ok(_) => Store::global(cx).update(cx, |store, cx| store.refresh_account(cx)),
+                    Err(err) => notify_error(window, cx, "Could not sign out", err),
+                },
+            );
+        },
+        window,
+        cx,
+    );
 }
 
 fn open_auth(page: WeakEntity<SettingsPage>, register: bool, window: &mut Window, cx: &mut App) {
@@ -458,8 +531,13 @@ fn open_auth(page: WeakEntity<SettingsPage>, register: bool, window: &mut Window
                 },
                 move |_, result, window, cx| match result {
                     Ok(account) => {
-                        Store::global(cx).update(cx, |store, cx| store.refresh_account(cx));
-                        notify_ok(window, cx, format!("Signed in as {}", account.email.unwrap_or_default()));
+                        // Joining an account that already has a vault locks this one until its
+                        // master password is entered.
+                        Store::global(cx).update(cx, |store, cx| {
+                            store.refresh_account(cx);
+                            store.check_vault(cx);
+                        });
+                        notify_ok(cx, format!("Signed in as {}", account.email.unwrap_or_default()));
                     }
                     Err(err) => notify_error(
                         window,

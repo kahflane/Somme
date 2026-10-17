@@ -1,6 +1,36 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use somme_domain::{
+    Group, Host, Identity, KnownHostRepository, PortForward, Repository, Snippet, SshKey, VaultRepository,
+};
 
 use crate::ports::GatewayError;
+
+pub trait VaultData:
+    Repository<Group>
+    + Repository<SshKey>
+    + Repository<Identity>
+    + Repository<Snippet>
+    + Repository<Host>
+    + Repository<PortForward>
+    + KnownHostRepository
+    + VaultRepository
+{
+}
+
+impl<T> VaultData for T where
+    T: Repository<Group>
+        + Repository<SshKey>
+        + Repository<Identity>
+        + Repository<Snippet>
+        + Repository<Host>
+        + Repository<PortForward>
+        + KnownHostRepository
+        + VaultRepository
+        + ?Sized
+{
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncState {
@@ -23,4 +53,6 @@ pub trait SyncGateway: Send + Sync {
     async fn connect(&self, url: &str) -> Result<SyncOutcome, GatewayError>;
     async fn disconnect(&self) -> Result<(), GatewayError>;
     async fn sync_now(&self) -> Result<(), GatewayError>;
+    async fn previous_data(&self) -> Result<Option<Arc<dyn VaultData>>, GatewayError>;
+    async fn forget_previous_data(&self) -> Result<(), GatewayError>;
 }

@@ -1,0 +1,35 @@
+# Somme Cloud on Fly.io. Deploy from the repo root: fly deploy --ha=false
+# Secrets (set with `fly secrets`): TURSO_API, TURSO_ORG, optional TURSO_GROUP.
+app = "somme-cloud"
+primary_region = "sin"
+
+[build]
+  dockerfile = "crates/somme-cloud/Dockerfile"
+
+[env]
+  # Fly's proxy overwrites this header, so it is safe to trust here.
+  SOMME_CLOUD_CLIENT_IP_HEADER = "Fly-Client-IP"
+
+# Accounts live in a SQLite file, so keep one machine with one volume.
+[mounts]
+  source = "somme_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  memory = "256mb"
+  cpus = 1
+  cpu_kind = "shared"

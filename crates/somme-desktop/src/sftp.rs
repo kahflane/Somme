@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::time::UNIX_EPOCH;
 
 use somme_application::dto::SftpEntryView;
-use somme_domain::{Id, new_id};
+use somme_domain::Id;
 
 use crate::services::Services;
 
@@ -164,16 +164,11 @@ async fn copy_file(
             .map_err(text),
         (Endpoint::Remote(source), Endpoint::Remote(target)) => {
             // The two servers cannot reach each other, so the file passes through this computer.
-            let dir = std::env::temp_dir().join(format!("somme-transfer-{}", new_id()));
-            tokio::fs::create_dir_all(&dir).await.map_err(text)?;
-            let local = dir.join(&entry.name);
-            let result = async {
-                services.sftp.download(source, &entry.path, &local).await.map_err(text)?;
-                services.sftp.upload(target, &local, dest_dir).await.map(|_| ()).map_err(text)
-            }
-            .await;
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-            result
+            // The folder is private to this user and is deleted when `dir` drops, even on error.
+            let dir = tempfile::Builder::new().prefix("somme-transfer-").tempdir().map_err(text)?;
+            let local = dir.path().join(&entry.name);
+            services.sftp.download(source, &entry.path, &local).await.map_err(text)?;
+            services.sftp.upload(target, &local, dest_dir).await.map(|_| ()).map_err(text)
         }
     }
 }
@@ -266,6 +261,8 @@ fn permissions(_meta: &Metadata, _is_symlink: bool) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use somme_domain::new_id;
+
     use super::*;
 
     #[test]

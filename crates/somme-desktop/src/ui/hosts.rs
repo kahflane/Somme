@@ -1,4 +1,4 @@
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -16,7 +16,9 @@ use somme_application::dto::{GroupInput, GroupView, HostView};
 use somme_domain::Id;
 
 use crate::store::{Store, mutate};
-use crate::ui::common::{Lucide, card, empty_state, host_badge, notify_error, notify_ok, page_header, subtle};
+use crate::ui::common::{
+    Lucide, card, confirm_delete, empty_state, host_badge, notify_error, notify_ok, page_header, subtle,
+};
 use crate::ui::fields::{choice_select, group_choices, selected};
 use crate::ui::filter::{host_matches, parse_quick_connect};
 use crate::ui::host_editor::HostEditor;
@@ -133,8 +135,8 @@ impl HostsPage {
             cx,
             |services| async move { services.import.import_ssh_config().await },
             |_, result, window, cx| match result {
-                Ok(0) => notify_ok(window, cx, "No new hosts found in ~/.ssh/config"),
-                Ok(n) => notify_ok(window, cx, format!("Imported {n} hosts from ~/.ssh/config")),
+                Ok(0) => notify_ok(cx, "No new hosts found in ~/.ssh/config"),
+                Ok(n) => notify_ok(cx, format!("Imported {n} hosts from ~/.ssh/config")),
                 Err(err) => notify_error(window, cx, "Import failed", err),
             },
         );
@@ -142,31 +144,27 @@ impl HostsPage {
 
     fn delete_host(&mut self, host: HostView, window: &mut Window, cx: &mut Context<Self>) {
         let page = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let page = page.clone();
-            let id = host.id;
-            alert
-                .confirm()
-                .title(format!("Delete {}?", host.label))
-                .description("Its port forwarding rules are deleted too. This cannot be undone.")
-                .ok_text("Delete")
-                .ok_variant(ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
-                    let _ = page.update(cx, |_, cx| {
-                        mutate(
-                            window,
-                            cx,
-                            move |services| async move { services.hosts.delete(id).await },
-                            |_, result, window, cx| {
-                                if let Err(err) = result {
-                                    notify_error(window, cx, "Could not delete host", err);
-                                }
-                            },
-                        );
-                    });
-                    true
-                })
-        });
+        let id = host.id;
+        confirm_delete(
+            format!("Delete {}?", host.label),
+            "Its port forwarding rules are deleted too. This cannot be undone.",
+            move |window, cx| {
+                let _ = page.update(cx, |_, cx| {
+                    mutate(
+                        window,
+                        cx,
+                        move |services| async move { services.hosts.delete(id).await },
+                        |_, result, window, cx| {
+                            if let Err(err) = result {
+                                notify_error(window, cx, "Could not delete host", err);
+                            }
+                        },
+                    );
+                });
+            },
+            window,
+            cx,
+        );
     }
 
     fn edit_group(&mut self, group: Option<GroupView>, window: &mut Window, cx: &mut Context<Self>) {
@@ -248,34 +246,30 @@ impl HostsPage {
 
     fn delete_group(&mut self, group: GroupView, window: &mut Window, cx: &mut Context<Self>) {
         let page = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let page = page.clone();
-            let id = group.id;
-            alert
-                .confirm()
-                .title(format!("Delete group {}?", group.name))
-                .description("Hosts inside it are kept and moved out of the group.")
-                .ok_text("Delete")
-                .ok_variant(ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
-                    let _ = page.update(cx, |page, cx| {
-                        if page.group == Some(id) {
-                            page.group = None;
-                        }
-                        mutate(
-                            window,
-                            cx,
-                            move |services| async move { services.groups.delete(id).await },
-                            |_, result, window, cx| {
-                                if let Err(err) = result {
-                                    notify_error(window, cx, "Could not delete group", err);
-                                }
-                            },
-                        );
-                    });
-                    true
-                })
-        });
+        let id = group.id;
+        confirm_delete(
+            format!("Delete group {}?", group.name),
+            "Hosts inside it are kept and moved out of the group.",
+            move |window, cx| {
+                let _ = page.update(cx, |page, cx| {
+                    if page.group == Some(id) {
+                        page.group = None;
+                    }
+                    mutate(
+                        window,
+                        cx,
+                        move |services| async move { services.groups.delete(id).await },
+                        |_, result, window, cx| {
+                            if let Err(err) = result {
+                                notify_error(window, cx, "Could not delete group", err);
+                            }
+                        },
+                    );
+                });
+            },
+            window,
+            cx,
+        );
     }
 
     // ---- rendering ----

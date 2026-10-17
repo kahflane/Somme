@@ -564,7 +564,7 @@ impl FilePane {
                 .item(
                     PopupMenuItem::new("Copy Path")
                         .icon(IconName::Copy)
-                        .on_click(move |_, window, cx| copy_text(path.clone(), "Path copied", window, cx)),
+                        .on_click(move |_, _, cx| copy_text(path.clone(), cx)),
                 )
             })
             .separator()

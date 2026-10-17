@@ -16,7 +16,7 @@ use somme_domain::Id;
 
 use crate::store::{Store, mutate, mutate_weak, report};
 use crate::ui::common::{
-    Lucide, card, confirm_delete, copy_text, empty_state, form_dialog, host_badge, labeled, notify_ok, page_header,
+    Lucide, card, confirm_delete, copy_text, empty_state, form_dialog, host_badge, labeled, page_header,
     subtle,
 };
 use crate::ui::workspace::Workspace;
@@ -160,8 +160,8 @@ impl SnippetsPage {
                                         }
                                     },
                                 ))
-                                .item(PopupMenuItem::new("Copy").icon(IconName::Copy).on_click(move |_, window, cx| {
-                                    copy_text(copy.clone(), "Snippet copied", window, cx)
+                                .item(PopupMenuItem::new("Copy").icon(IconName::Copy).on_click(move |_, _, cx| {
+                                    copy_text(copy.clone(), cx)
                                 }))
                                 .separator()
                                 .item(PopupMenuItem::new("Delete").icon(IconName::Delete).on_click(
@@ -339,10 +339,7 @@ impl SnippetEditor {
             move |services| async move { services.snippets.save(input).await },
             |editor, result, window, cx| {
                 match result {
-                    Ok(snippet) => {
-                        window.close_sheet(cx);
-                        notify_ok(window, cx, format!("Saved {}", snippet.label));
-                    }
+                    Ok(_) => window.close_sheet(cx),
                     Err(err) => editor.error = Some(err.to_string()),
                 }
                 cx.notify();

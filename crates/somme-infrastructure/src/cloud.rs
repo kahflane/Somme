@@ -17,7 +17,8 @@ use crate::keystore::KeyringStore;
 const SESSION_USER: &str = "cloud-session";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
-pub const DEFAULT_CLOUD_URL: &str = "http://127.0.0.1:8787";
+/// The hosted Somme Cloud. Set `SOMME_CLOUD_URL` to use a local one.
+pub const DEFAULT_CLOUD_URL: &str = "https://somme-cloud.fly.dev";
 
 #[derive(Serialize)]
 struct AuthBody<'a> {

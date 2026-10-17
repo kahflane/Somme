@@ -102,8 +102,8 @@ impl KnownHostsPage {
                             .xsmall()
                             .icon(IconName::Copy)
                             .tooltip("Copy fingerprint")
-                            .on_click(move |_: &ClickEvent, window, cx| {
-                                copy_text(fingerprint.clone(), "Fingerprint copied", window, cx);
+                            .on_click(move |_: &ClickEvent, _, cx| {
+                                copy_text(fingerprint.clone(), cx);
                             }),
                     )
                     .child(

@@ -25,6 +25,7 @@ russh-sftp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ssh2-config.workspace = true
+sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

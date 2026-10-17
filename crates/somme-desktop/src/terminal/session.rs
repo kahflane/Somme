@@ -1,5 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -11,15 +12,20 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::{App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, SharedString};
 use parking_lot::Mutex;
-use somme_application::ports::{OutputSink, TermSize};
+use somme_application::ports::{OutputSink, ShellOptions, TermSize};
 use somme_domain::Id;
 use tokio::sync::mpsc as io_mpsc;
 
 use crate::runtime;
 use crate::services::Services;
 use crate::settings::Settings;
+use crate::terminal::blocks::{self, Block, BlockState, GitInfo};
 use crate::terminal::colors;
 use crate::terminal::log::{self, SessionLog};
+use crate::terminal::marks::{Mark, MarkScanner, Piece};
+
+/// How long a new local terminal waits for the shell hooks before showing a classic screen.
+pub const HOOKS_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug)]
 pub struct GridSize {
@@ -84,6 +90,33 @@ pub enum SessionEvent {
     TitleChanged,
     Bell,
     StatusChanged,
+    /// A command started, or the shell is back at its prompt.
+    PhaseChanged,
+}
+
+/// Command blocks for a local shell that runs SommeCLI's hooks.
+#[derive(Default)]
+pub struct Blocks {
+    pub list: Vec<Block>,
+    /// Set once the shell's first prompt mark arrives.
+    pub ready: bool,
+    /// The shell's folder at its last prompt.
+    pub cwd: Option<PathBuf>,
+    pub git: Option<GitInfo>,
+    /// The shell's PATH, for completing command names.
+    pub path: Option<String>,
+    /// The command sent from the editor, until the shell starts it.
+    pending: Option<String>,
+}
+
+impl Blocks {
+    pub fn live(&self) -> Option<&Block> {
+        self.list.last().filter(|block| block.is_live())
+    }
+
+    fn live_mut(&mut self) -> Option<&mut Block> {
+        self.list.last_mut().filter(|block| block.is_live())
+    }
 }
 
 enum Output {
@@ -111,6 +144,8 @@ impl OutputSink for UiSink {
 /// One terminal: the emulator state plus the live connection behind it.
 pub struct TerminalSession {
     pub target: SessionTarget,
+    /// Where a local shell starts. Unset means the home folder.
+    start_dir: Option<PathBuf>,
     pub status: Status,
     pub started_at: Instant,
     title: Option<String>,
@@ -125,12 +160,15 @@ pub struct TerminalSession {
     /// Bytes typed since the last newline, used to record shell history.
     line_buffer: String,
     pub history: Vec<String>,
+    scanner: MarkScanner,
+    /// Set for local shells started with the hooks.
+    pub blocks: Option<Blocks>,
 }
 
 impl EventEmitter<SessionEvent> for TerminalSession {}
 
 impl TerminalSession {
-    pub fn new(target: SessionTarget, services: Arc<Services>, cx: &mut App) -> Entity<Self> {
+    pub fn new(target: SessionTarget, start_dir: Option<PathBuf>, services: Arc<Services>, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let settings = Settings::get(cx);
             let replay = matches!(target, SessionTarget::Replay { .. });
@@ -144,8 +182,10 @@ impl TerminalSession {
                 .flatten();
             let listener = Listener::default();
             let size = GridSize::default();
+            let blocks = (matches!(target, SessionTarget::Local) && settings.command_blocks).then(Blocks::default);
             let mut session = Self {
                 target,
+                start_dir,
                 status: Status::Connecting,
                 started_at: Instant::now(),
                 title: None,
@@ -159,6 +199,8 @@ impl TerminalSession {
                 log,
                 line_buffer: String::new(),
                 history: Vec::new(),
+                scanner: MarkScanner::default(),
+                blocks,
             };
             session.connect(cx);
             session
@@ -168,6 +210,12 @@ impl TerminalSession {
     pub fn title(&self) -> SharedString {
         if let SessionTarget::Replay { label, .. } = &self.target {
             return format!("Log: {label}").into();
+        }
+        // A local shell's folder says more than the title it sets.
+        if let SessionTarget::Local = self.target
+            && let Some(cwd) = self.blocks.as_ref().and_then(|blocks| blocks.cwd.as_deref())
+        {
+            return blocks::short_path(cwd).into();
         }
         if let Some(title) = self.title.as_ref().filter(|t| !t.trim().is_empty()) {
             return title.clone().into();
@@ -182,12 +230,34 @@ impl TerminalSession {
         }
     }
 
+    /// The screen output goes to now: the running block's, or the main one.
     pub fn term(&self) -> &Term<Listener> {
-        &self.term
+        match self.blocks.as_ref().and_then(Blocks::live) {
+            Some(block) => &block.term,
+            None => &self.term,
+        }
     }
 
     pub fn term_mut(&mut self) -> &mut Term<Listener> {
-        &mut self.term
+        match self.blocks.as_mut().and_then(Blocks::live_mut) {
+            Some(block) => &mut block.term,
+            None => &mut self.term,
+        }
+    }
+
+    /// Whether the view shows command blocks instead of one screen. Full-screen
+    /// programs like vim still get the whole screen.
+    pub fn shows_blocks(&self) -> bool {
+        match &self.blocks {
+            None => false,
+            Some(blocks) if blocks.ready => !self.term().mode().contains(TermMode::ALT_SCREEN),
+            Some(_) => self.is_running() && self.started_at.elapsed() < HOOKS_WAIT,
+        }
+    }
+
+    /// The shell waits at its prompt, so the editor can take a command.
+    pub fn at_prompt(&self) -> bool {
+        self.is_running() && self.blocks.as_ref().is_some_and(|b| b.ready && b.live().is_none())
     }
 
     pub fn size(&self) -> GridSize {
@@ -195,11 +265,19 @@ impl TerminalSession {
     }
 
     pub fn mode(&self) -> TermMode {
-        *self.term.mode()
+        *self.term().mode()
     }
 
     pub fn is_running(&self) -> bool {
         matches!(self.status, Status::Connecting | Status::Connected)
+    }
+
+    /// The folder a live local shell is in now.
+    pub fn current_dir(&self) -> Option<PathBuf> {
+        match (&self.target, self.session_id) {
+            (SessionTarget::Local, Some(id)) if self.is_running() => self.services.sessions.cwd(id),
+            _ => None,
+        }
     }
 
     pub fn is_replay(&self) -> bool {
@@ -218,6 +296,22 @@ impl TerminalSession {
         self.session_id = None;
         self.status = Status::Connecting;
         self.started_at = Instant::now();
+        // A new secret for each shell, so output from programs cannot fake marks.
+        let token = self.blocks.is_some().then(|| uuid::Uuid::new_v4().simple().to_string());
+        self.scanner = token.as_deref().map(MarkScanner::new).unwrap_or_default();
+        let size = self.size;
+        if let Some(blocks) = self.blocks.as_mut() {
+            if let Some(block) = blocks.live_mut() {
+                block.finish(-1, size);
+            }
+            blocks.ready = false;
+            // Show the classic screen once the wait is over, if the hooks never report in.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(HOOKS_WAIT).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
         cx.emit(SessionEvent::StatusChanged);
 
         cx.spawn(async move |this, cx| {
@@ -242,6 +336,7 @@ impl TerminalSession {
 
         let services = self.services.clone();
         let target = self.target.clone();
+        let start_dir = self.start_dir.clone();
         let size = TermSize {
             cols: self.size.columns as u16,
             rows: self.size.lines as u16,
@@ -251,7 +346,13 @@ impl TerminalSession {
             let sessions = services.sessions.clone();
             let opened = runtime::io(async move {
                 match target {
-                    SessionTarget::Local => sessions.open_local(size, move |_| sink),
+                    SessionTarget::Local => {
+                        let options = ShellOptions {
+                            dir: start_dir.as_deref(),
+                            marks: token.as_deref(),
+                        };
+                        sessions.open_local(size, options, move |_| sink)
+                    }
                     SessionTarget::Ssh { host_id, .. } => sessions.open_ssh(host_id, size, move |_| sink).await,
                     SessionTarget::Replay { .. } => unreachable!("replays never connect"),
                 }
@@ -327,18 +428,175 @@ impl TerminalSession {
                 if let Some(log) = self.log.as_mut() {
                     log.write(&bytes);
                 }
-                self.parser.advance(&mut self.term, &bytes);
+                if self.blocks.is_some() {
+                    let mut scanner = std::mem::take(&mut self.scanner);
+                    scanner.scan(&bytes, |piece| match piece {
+                        Piece::Output(bytes) => self.feed(bytes),
+                        Piece::Mark(mark) => self.on_mark(mark, cx),
+                    });
+                    self.scanner = scanner;
+                } else {
+                    self.parser.advance(&mut self.term, &bytes);
+                }
                 self.drain_term_events(cx);
             }
             Output::Closed(reason) => {
                 self.io = None;
                 self.session_id = None;
+                let size = self.size;
+                if let Some(block) = self.blocks.as_mut().and_then(Blocks::live_mut) {
+                    block.finish(0, size);
+                }
                 if let Some(log) = self.log.as_mut() {
                     log.note(reason.as_deref().unwrap_or("Session closed"));
                 }
                 self.status = Status::Closed(reason);
                 cx.emit(SessionEvent::StatusChanged);
             }
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        let term = match self.blocks.as_mut().and_then(Blocks::live_mut) {
+            Some(block) => &mut block.term,
+            None => &mut self.term,
+        };
+        self.parser.advance(term, bytes);
+    }
+
+    fn new_block_term(&self, cx: &App) -> Term<Listener> {
+        let config = TermConfig {
+            scrolling_history: Settings::get(cx).scrollback_lines,
+            ..TermConfig::default()
+        };
+        Term::new(config, &self.size, self.listener.clone())
+    }
+
+    fn on_mark(&mut self, mark: Mark, cx: &mut Context<Self>) {
+        let size = self.size;
+        let fresh = self.new_block_term(cx);
+        let Some(blocks) = self.blocks.as_mut() else { return };
+        match mark {
+            Mark::Prompt { exit, cwd } => {
+                if !blocks.ready {
+                    blocks.ready = true;
+                    // The main screen now only holds hidden prompts, so it needs no history.
+                    self.term.set_options(TermConfig {
+                        scrolling_history: 0,
+                        ..TermConfig::default()
+                    });
+                }
+                if let Some(block) = blocks.live_mut() {
+                    block.finish(exit, size);
+                    if blocks::clears_screen(&block.command) {
+                        blocks.list.clear();
+                    }
+                }
+                blocks.pending = None;
+                let moved = blocks.cwd != cwd;
+                blocks.cwd = cwd;
+                if moved {
+                    blocks.git = None;
+                    // The tab names the folder, so it changes too.
+                    cx.emit(SessionEvent::TitleChanged);
+                }
+                self.refresh_git(cx);
+            }
+            Mark::Accepted => {
+                if blocks.live().is_some() {
+                    // The shell asked for more of the line and got it.
+                    return;
+                }
+                let command = blocks.pending.take().unwrap_or_default();
+                let branch = blocks.git.as_ref().map(|git| git.branch.clone());
+                blocks.list.push(Block::new(command, blocks.cwd.clone(), branch, BlockState::Accepted, fresh));
+            }
+            Mark::Path(path) => {
+                blocks.path = Some(path);
+                return;
+            }
+            Mark::Command(command) => {
+                match blocks.live_mut() {
+                    Some(block) if block.state == BlockState::Accepted => {
+                        // Drop the shell's redraw of the line; the block shows the command itself.
+                        block.term = fresh;
+                        block.state = BlockState::Running;
+                        block.started = Instant::now();
+                        if !command.is_empty() {
+                            block.command = command.clone();
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        let branch = blocks.git.as_ref().map(|git| git.branch.clone());
+                        let block = Block::new(command.clone(), blocks.cwd.clone(), branch, BlockState::Running, fresh);
+                        blocks.list.push(block);
+                    }
+                }
+                if Settings::get(cx).keep_history
+                    && !command.trim().is_empty()
+                    && self.history.last() != Some(&command)
+                {
+                    self.history.push(command);
+                }
+            }
+        }
+        cx.emit(SessionEvent::PhaseChanged);
+    }
+
+    /// Looks up the branch and changes for the shell's folder in the background.
+    fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.blocks.as_ref().and_then(|b| b.cwd.clone()) else { return };
+        cx.spawn(async move |this, cx| {
+            let lookup = dir.clone();
+            let git = cx.background_spawn(async move { blocks::git_info(&lookup) }).await;
+            let _ = this.update(cx, |session, cx| {
+                if let Some(blocks) = session.blocks.as_mut()
+                    && blocks.cwd.as_ref() == Some(&dir)
+                {
+                    blocks.git = git;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Runs a command typed in the editor. Returns the bytes sent.
+    pub fn run_command(&mut self, command: &str, cx: &mut Context<Self>) -> Vec<u8> {
+        if let Some(blocks) = self.blocks.as_mut() {
+            blocks.pending = Some(command.to_owned());
+        }
+        // Ctrl-U first drops anything stray in the shell's own line.
+        let bytes = if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+            format!("\x15\x1b[200~{}\x1b[201~\r", command.replace('\x1b', ""))
+        } else {
+            format!("\x15{}\r", command.replace("\r\n", "\r").replace('\n', "\r"))
+        };
+        let bytes = bytes.into_bytes();
+        self.send(bytes.clone());
+        cx.notify();
+        bytes
+    }
+
+    /// Runs a line: through the editor path at a blocks prompt, typed otherwise.
+    pub fn run(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.at_prompt() {
+            self.run_command(text.trim_end_matches(['\r', '\n']), cx);
+            return;
+        }
+        let mut bytes = text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
+        if bytes.last() != Some(&b'\r') {
+            bytes.push(b'\r');
+        }
+        self.input(bytes, cx);
+    }
+
+    /// Removes finished blocks.
+    pub fn clear_blocks(&mut self, cx: &mut Context<Self>) {
+        if let Some(blocks) = self.blocks.as_mut() {
+            blocks.list.retain(Block::is_live);
+            cx.notify();
         }
     }
 
@@ -356,19 +614,24 @@ impl TerminalSession {
                     cx.emit(SessionEvent::TitleChanged);
                 }
                 TermEvent::Bell => cx.emit(SessionEvent::Bell),
-                TermEvent::ClipboardStore(_, text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+                // Old logs never touch the clipboard; live servers only when allowed.
+                TermEvent::ClipboardStore(_, text) => {
+                    if !self.is_replay() && Settings::get(cx).remote_clipboard_write {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                }
                 // A server may copy into the clipboard but never read it: it could hold a password.
                 TermEvent::ClipboardLoad(..) => {}
                 TermEvent::ColorRequest(index, format) => {
-                    let theme = colors::theme_named(&Settings::get(cx).terminal_theme);
-                    let color = self.term.colors()[index].unwrap_or_else(|| match index {
+                    let theme = colors::active_theme(cx);
+                    let color = self.term().colors()[index].unwrap_or_else(|| match index {
                         256 => theme.foreground,
                         257 => theme.background,
                         258 => theme.cursor,
                         i if i < 16 => theme.ansi[i],
                         i => colors::resolve(
                             alacritty_terminal::vte::ansi::Color::Indexed(i as u8),
-                            self.term.colors(),
+                            self.term().colors(),
                             theme,
                         ),
                     });
@@ -400,20 +663,22 @@ impl TerminalSession {
         if !self.is_running() {
             return;
         }
-        if Settings::get(cx).keep_history {
+        // With blocks, the shell reports each command itself.
+        if Settings::get(cx).keep_history && self.blocks.is_none() {
             self.track_history(&bytes);
         }
-        if self.term.grid().display_offset() != 0 {
-            self.term.scroll_display(Scroll::Bottom);
+        let term = self.term_mut();
+        if term.grid().display_offset() != 0 {
+            term.scroll_display(Scroll::Bottom);
         }
-        self.term.selection = None;
+        term.selection = None;
         self.send(bytes);
         cx.notify();
     }
 
     pub fn paste(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
-        let bytes = if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+        let bytes = if self.term().mode().contains(TermMode::BRACKETED_PASTE) {
             let clean = text.replace('\x1b', "");
             format!("\x1b[200~{clean}\x1b[201~").into_bytes()
         } else {
@@ -423,7 +688,7 @@ impl TerminalSession {
     }
 
     fn track_history(&mut self, bytes: &[u8]) {
-        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+        if self.term().mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
         for &byte in bytes {
@@ -459,6 +724,11 @@ impl TerminalSession {
             return;
         }
         self.term.resize(size);
+        if let Some(blocks) = self.blocks.as_mut() {
+            for block in &mut blocks.list {
+                block.resize(size);
+            }
+        }
         if let Some(log) = self.log.as_mut() {
             log.resize(size.columns, size.lines);
         }
@@ -471,52 +741,57 @@ impl TerminalSession {
     }
 
     pub fn scroll(&mut self, lines: i32, cx: &mut Context<Self>) {
-        self.term.scroll_display(Scroll::Delta(lines));
+        self.term_mut().scroll_display(Scroll::Delta(lines));
         cx.notify();
     }
 
     pub fn scroll_to(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
-        self.term.scroll_display(scroll);
+        self.term_mut().scroll_display(scroll);
         cx.notify();
     }
 
     pub fn clear_scrollback(&mut self, cx: &mut Context<Self>) {
-        self.term.grid_mut().clear_history();
+        if self.shows_blocks() {
+            self.clear_blocks(cx);
+            return;
+        }
+        self.term_mut().grid_mut().clear_history();
         // Ask the shell to redraw its prompt on a clean screen.
         self.send(b"\x0c".to_vec());
         cx.notify();
     }
 
     pub fn start_selection(&mut self, kind: SelectionType, point: GridPoint, side: alacritty_terminal::index::Side) {
-        self.term.selection = Some(Selection::new(kind, point, side));
+        self.term_mut().selection = Some(Selection::new(kind, point, side));
     }
 
     pub fn update_selection(&mut self, point: GridPoint, side: alacritty_terminal::index::Side) {
-        if let Some(selection) = self.term.selection.as_mut() {
+        if let Some(selection) = self.term_mut().selection.as_mut() {
             selection.update(point, side);
         }
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
-        let start = GridPoint::new(self.term.topmost_line(), Column(0));
-        let end = GridPoint::new(self.term.bottommost_line(), self.term.last_column());
+        let term = self.term_mut();
+        let start = GridPoint::new(term.topmost_line(), Column(0));
+        let end = GridPoint::new(term.bottommost_line(), term.last_column());
         let mut selection = Selection::new(SelectionType::Simple, start, alacritty_terminal::index::Side::Left);
         selection.update(end, alacritty_terminal::index::Side::Right);
-        self.term.selection = Some(selection);
+        term.selection = Some(selection);
         cx.notify();
     }
 
     pub fn clear_selection(&mut self) {
-        self.term.selection = None;
+        self.term_mut().selection = None;
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string().filter(|text| !text.is_empty())
+        self.term().selection_to_string().filter(|text| !text.is_empty())
     }
 
     /// The visible text, used for search and tests.
     pub fn visible_text(&self) -> String {
-        let grid = self.term.grid();
+        let grid = self.term().grid();
         let mut out = String::new();
         for line in 0..self.size.lines as i32 {
             let row = &grid[Line(line - grid.display_offset() as i32)];

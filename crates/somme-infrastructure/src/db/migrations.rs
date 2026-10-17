@@ -9,6 +9,17 @@ pub const DATA_TABLES: &[&str] = &[
     "hosts",
     "port_forwards",
     "known_hosts",
+    "preferences",
+];
+
+const VAULT_TABLES: &[&str] = &[
+    "groups",
+    "ssh_keys",
+    "identities",
+    "snippets",
+    "hosts",
+    "port_forwards",
+    "known_hosts",
 ];
 
 const SCHEMA: &str = r"
@@ -90,8 +101,23 @@ CREATE TABLE IF NOT EXISTS known_hosts (
     public_key TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS preferences (
+    id TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 ";
 
 pub async fn migrate(conn: &Connection) -> turso::Result<()> {
     conn.execute_batch(SCHEMA).await
+}
+
+pub async fn holds_vault_items(conn: &Connection) -> turso::Result<bool> {
+    for table in VAULT_TABLES {
+        let mut rows = conn.query(format!("SELECT 1 FROM {table} LIMIT 1"), ()).await?;
+        if rows.next().await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

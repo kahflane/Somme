@@ -129,6 +129,24 @@ impl VaultService {
         Ok(self.crypto.open(&key, sealed)?)
     }
 
+    pub(crate) fn key(&self) -> Option<MasterKey> {
+        self.current_key()
+    }
+
+    pub(crate) fn opens(&self, key: &MasterKey, meta: &VaultMeta) -> bool {
+        self.opens_check(key, meta)
+    }
+
+    pub(crate) fn key_for(&self, meta: &VaultMeta, password: &str) -> Option<MasterKey> {
+        let key = self.crypto.derive_key(password, &meta.salt).ok()?;
+        self.opens_check(&key, meta).then_some(key)
+    }
+
+    pub(crate) fn reseal(&self, from: &MasterKey, sealed: &Sealed) -> AppResult<Sealed> {
+        let plain = self.crypto.open(from, sealed)?;
+        self.seal(&plain)
+    }
+
     fn opens_check(&self, key: &MasterKey, meta: &VaultMeta) -> bool {
         self.crypto
             .open(key, &meta.check)

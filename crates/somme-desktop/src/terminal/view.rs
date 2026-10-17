@@ -19,10 +19,17 @@ use gpui_kit::{
 };
 
 use crate::settings::{BellSetting, Settings};
+use crate::terminal::blocks_element::{ACCEPTED_HIDE, BlocksElement, BlocksLayout};
 use crate::terminal::element::{TerminalElement, grid_point};
 use crate::terminal::mouse::{self, ReportButton, ReportKind};
 use crate::terminal::session::{SessionEvent, Status, TerminalSession};
 use crate::terminal::keys;
+
+mod blocks;
+mod picker;
+mod prompt;
+
+use prompt::Prompt;
 
 actions!(
     terminal,
@@ -43,6 +50,8 @@ actions!(
         ScrollToTop,
         ScrollToBottom,
         Reconnect,
+        CopyCommand,
+        CopyOutput,
     ]
 );
 
@@ -91,6 +100,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-end", ScrollToBottom, ctx),
     ]);
     cx.bind_keys([KeyBinding::new("escape", CloseFind, Some("TerminalSearch"))]);
+    prompt::init(cx);
 }
 
 /// Where the grid sits on screen, filled in each frame by the element.
@@ -103,9 +113,16 @@ pub struct TermLayout {
     pub lines: usize,
 }
 
+struct SearchMatch {
+    /// The block it is in, when the view shows blocks.
+    block: Option<usize>,
+    start: GridPoint,
+    end: GridPoint,
+}
+
 struct Search {
     input: Entity<InputState>,
-    matches: Vec<(GridPoint, GridPoint)>,
+    matches: Vec<SearchMatch>,
     active: Option<usize>,
     _subscription: Subscription,
 }
@@ -114,9 +131,15 @@ struct Search {
 pub enum TerminalViewEvent {
     Typed(Vec<u8>),
     Pasted(String),
+    /// A command was run from the editor.
+    Ran(String),
     Focused,
     TitleChanged,
     StatusChanged,
+    /// A file was picked to open in the editor.
+    OpenFile(std::path::PathBuf),
+    /// Show the uncommitted git changes of the repo that holds this folder.
+    OpenChanges(std::path::PathBuf),
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
@@ -132,6 +155,20 @@ pub struct TerminalView {
     cursor_visible: bool,
     blink_generation: usize,
     bell_until: Option<Instant>,
+    /// The blocks as drawn last frame, and how far they are scrolled up from the bottom.
+    pub blocks_layout: Option<BlocksLayout>,
+    pub blocks_scroll: Pixels,
+    pub blocks_total: Pixels,
+    selecting_block: Option<usize>,
+    /// The block right-clicked last, for the menu's copy items.
+    menu_block: Option<usize>,
+    prompt: Option<Prompt>,
+    /// The folder picker over the command editor.
+    picker: Option<picker::Picker>,
+    /// Text pasted from outside the window, put in the editor at the next frame.
+    pending_insert: Option<String>,
+    /// A command was sent and the shell has not started it yet.
+    awaiting_block: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -144,12 +181,17 @@ impl TerminalView {
                 SessionEvent::Bell => view.ring_bell(window, cx),
                 SessionEvent::TitleChanged => cx.emit(TerminalViewEvent::TitleChanged),
                 SessionEvent::StatusChanged => cx.emit(TerminalViewEvent::StatusChanged),
+                SessionEvent::PhaseChanged => view.phase_changed(window, cx),
             }),
-            cx.on_focus(&focus_handle, window, |view, _, cx| {
+            cx.on_focus(&focus_handle, window, |view, window, cx| {
                 view.reset_blink(cx);
+                if view.wants_prompt(cx) {
+                    view.focus_prompt(window, cx);
+                }
                 cx.emit(TerminalViewEvent::Focused);
             }),
         ];
+        let prompt = session.read(cx).blocks.is_some().then(|| Prompt::new(window, cx));
         let mut view = Self {
             session,
             focus_handle,
@@ -161,10 +203,44 @@ impl TerminalView {
             cursor_visible: true,
             blink_generation: 0,
             bell_until: None,
+            blocks_layout: None,
+            blocks_scroll: px(0.),
+            blocks_total: px(0.),
+            selecting_block: None,
+            menu_block: None,
+            prompt,
+            picker: None,
+            pending_insert: None,
+            awaiting_block: false,
             _subscriptions: subscriptions,
         };
         view.reset_blink(cx);
         view
+    }
+
+    /// Whether keys belong in the command editor rather than the shell.
+    fn wants_prompt(&self, cx: &App) -> bool {
+        let session = self.session.read(cx);
+        !self.awaiting_block && session.at_prompt() && session.shows_blocks()
+    }
+
+    /// The shell started a command or came back to its prompt: move focus to match.
+    fn phase_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.awaiting_block = false;
+        if self.focus_handle.is_focused(window) || self.prompt_focused(window, cx) {
+            if self.wants_prompt(cx) {
+                self.focus_prompt(window, cx);
+            } else if !self.focus_handle.is_focused(window) {
+                window.focus(&self.focus_handle, cx);
+            }
+        }
+        // Accepted lines show their output after a moment; draw again then.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ACCEPTED_HIDE + Duration::from_millis(10)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        cx.notify();
     }
 
     fn ring_bell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -219,12 +295,26 @@ impl TerminalView {
 
     /// Types text into the terminal as if pasted, e.g. from a snippet.
     pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.session.update(cx, |session, cx| session.paste(text, cx));
+        if self.wants_prompt(cx) && self.prompt.is_some() {
+            self.pending_insert = Some(text.to_owned());
+            cx.notify();
+        } else {
+            self.session.update(cx, |session, cx| session.paste(text, cx));
+        }
         cx.emit(TerminalViewEvent::Pasted(text.to_owned()));
     }
 
     /// Sends text followed by Enter, used to run snippets.
     pub fn run_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.session.read(cx).at_prompt() {
+            let text = text.trim_end_matches(['\r', '\n']).to_owned();
+            self.session.update(cx, |session, cx| {
+                session.run_command(&text, cx);
+            });
+            self.blocks_scroll = px(0.);
+            cx.emit(TerminalViewEvent::Ran(text));
+            return;
+        }
         let mut bytes = text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
         if bytes.last() != Some(&b'\r') {
             bytes.push(b'\r');
@@ -232,7 +322,12 @@ impl TerminalView {
         self.write(bytes, cx);
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wants_prompt(cx) {
+            // Typing over the blocks goes to the editor.
+            self.focus_prompt(window, cx);
+            return;
+        }
         let mode = self.session.read(cx).mode();
         let option_as_meta = Settings::get(cx).option_as_meta;
         if let Some(bytes) = keys::to_esc_str(&event.keystroke, &mode, option_as_meta) {
@@ -242,7 +337,12 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.session.read(cx).selection_text() {
+        let text = if self.session.read(cx).shows_blocks() {
+            self.blocks_selection_text(cx)
+        } else {
+            self.session.read(cx).selection_text()
+        };
+        if let Some(text) = text {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -254,7 +354,11 @@ impl TerminalView {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.session.update(cx, |session, cx| session.select_all(cx));
+        if self.session.read(cx).shows_blocks() {
+            self.blocks_select_all(cx);
+        } else {
+            self.session.update(cx, |session, cx| session.select_all(cx));
+        }
     }
 
     fn clear(&mut self, _: &Clear, _: &mut Window, cx: &mut Context<Self>) {
@@ -268,7 +372,11 @@ impl TerminalView {
     }
 
     fn scroll_lines(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
-        self.session.update(cx, |session, cx| session.scroll_to(scroll, cx));
+        if self.session.read(cx).shows_blocks() {
+            self.blocks_scroll_to(scroll, cx);
+        } else {
+            self.session.update(cx, |session, cx| session.scroll_to(scroll, cx));
+        }
     }
 
     fn reconnect(&mut self, _: &Reconnect, window: &mut Window, cx: &mut Context<Self>) {
@@ -283,6 +391,10 @@ impl TerminalView {
     // ---- mouse ----
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.read(cx).shows_blocks() {
+            self.blocks_mouse_down(event, window, cx);
+            return;
+        }
         window.focus(&self.focus_handle, cx);
         let Some(layout) = self.layout else { return };
         let mode = self.session.read(cx).mode();
@@ -321,6 +433,10 @@ impl TerminalView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.session.read(cx).shows_blocks() {
+            self.blocks_mouse_move(event, cx);
+            return;
+        }
         let Some(layout) = self.layout else { return };
         if let Some(button) = self.reported_button {
             if let Some(bytes) = self.report(event.position, ReportKind::Motion, button, &event.modifiers, cx) {
@@ -355,6 +471,10 @@ impl TerminalView {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selecting_block.is_some() {
+            self.blocks_mouse_up(cx);
+            return;
+        }
         if let Some(button) = self.reported_button.take() {
             if let Some(bytes) = self.report(event.position, ReportKind::Release, button, &event.modifiers, cx) {
                 self.session.update(cx, |session, _| session.send(bytes));
@@ -380,6 +500,10 @@ impl TerminalView {
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.session.read(cx).shows_blocks() {
+            self.blocks_scroll_wheel(event, cx);
+            return;
+        }
         let Some(layout) = self.layout else { return };
         let delta = event.delta.pixel_delta(layout.line_height).y;
         self.scroll_remainder += delta / layout.line_height;
@@ -468,32 +592,21 @@ impl TerminalView {
     }
 
     fn run_search(&mut self, query: &str, cx: &mut Context<Self>) {
-        let Some(search) = self.search.as_mut() else { return };
-        search.matches.clear();
-        search.active = None;
-        if !query.is_empty() {
-            let pattern = regex_escape(query);
-            if let Ok(mut regex) = RegexSearch::new(&format!("(?i){pattern}")) {
-                let session = self.session.read(cx);
-                let term = session.term();
-                let mut origin = GridPoint::new(term.topmost_line(), Column(0));
-                let end = GridPoint::new(term.bottommost_line(), term.last_column());
-                while let Some(found) = term.regex_search_right(&mut regex, origin, end) {
-                    let (start, stop) = (*found.start(), *found.end());
-                    search.matches.push((start, stop));
-                    if search.matches.len() >= 2000 {
-                        break;
-                    }
-                    let next = stop.add(term, alacritty_terminal::index::Boundary::None, 1);
-                    if next <= stop {
-                        break;
-                    }
-                    origin = next;
-                }
-            }
+        if self.search.is_none() {
+            return;
         }
-        if !search.matches.is_empty() {
-            search.active = Some(search.matches.len() - 1);
+        let regex = (!query.is_empty())
+            .then(|| RegexSearch::new(&format!("(?i){}", regex_escape(query))).ok())
+            .flatten();
+        let matches = match regex {
+            None => Vec::new(),
+            Some(mut regex) if self.session.read(cx).shows_blocks() => self.search_blocks(&mut regex, cx),
+            Some(mut regex) => search_screen(self.session.read(cx).term(), &mut regex),
+        };
+        let Some(search) = self.search.as_mut() else { return };
+        search.active = matches.len().checked_sub(1);
+        search.matches = matches;
+        if search.active.is_some() {
             self.reveal_active(cx);
         }
         cx.notify();
@@ -515,9 +628,17 @@ impl TerminalView {
     }
 
     fn reveal_active(&mut self, cx: &mut Context<Self>) {
-        let Some((start, _)) = self.search.as_ref().and_then(|s| s.active.map(|i| s.matches[i])) else {
+        let Some((block, start)) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.active.and_then(|i| s.matches.get(i)).map(|m| (m.block, m.start)))
+        else {
             return;
         };
+        if let Some(block) = block {
+            self.reveal_block_line(block, start.line, cx);
+            return;
+        }
         self.session.update(cx, |session, cx| {
             session.term_mut().scroll_to_point(start);
             cx.notify();
@@ -539,7 +660,19 @@ impl TerminalView {
             .matches
             .iter()
             .enumerate()
-            .map(|(i, (start, end))| (*start, *end, search.active == Some(i)))
+            .filter(|(_, m)| m.block.is_none())
+            .map(|(i, m)| (m.start, m.end, search.active == Some(i)))
+            .collect()
+    }
+
+    /// Matches inside blocks, as (block, start, end, is_active).
+    pub fn block_search_matches(&self) -> Vec<(usize, GridPoint, GridPoint, bool)> {
+        let Some(search) = &self.search else { return Vec::new() };
+        search
+            .matches
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| Some((m.block?, m.start, m.end, search.active == Some(i))))
             .collect()
     }
 
@@ -667,6 +800,30 @@ impl TerminalView {
     }
 }
 
+/// Every match on the screen and in its history, up to a limit.
+fn search_screen(term: &alacritty_terminal::Term<crate::terminal::session::Listener>, regex: &mut RegexSearch) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+    let mut origin = GridPoint::new(term.topmost_line(), Column(0));
+    let end = GridPoint::new(term.bottommost_line(), term.last_column());
+    while let Some(found) = term.regex_search_right(regex, origin, end) {
+        let (start, stop) = (*found.start(), *found.end());
+        matches.push(SearchMatch {
+            block: None,
+            start,
+            end: stop,
+        });
+        if matches.len() >= 2000 {
+            break;
+        }
+        let next = stop.add(term, alacritty_terminal::index::Boundary::None, 1);
+        if next <= stop {
+            break;
+        }
+        origin = next;
+    }
+    matches
+}
+
 fn regex_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -686,17 +843,31 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(text) = self.pending_insert.take() {
+            self.insert_in_prompt(&text, window, cx);
+        }
+        let blocks_mode = self.session.read(cx).shows_blocks();
         let focused = self.focus_handle.is_focused(window);
         let flashing = self.bell_until.is_some_and(|until| Instant::now() < until);
-        let has_selection = self.session.read(cx).term().selection.is_some();
+        let has_selection = if blocks_mode {
+            self.blocks_selection_text(cx).is_some()
+        } else {
+            self.session.read(cx).term().selection.is_some()
+        };
         let paste_on_right_click = Settings::get(cx).paste_on_right_click;
-        let element = TerminalElement::new(cx.entity(), self.session.clone(), focused, self.cursor_visible);
+        let element = if blocks_mode {
+            BlocksElement::new(cx.entity(), self.session.clone(), focused, self.cursor_visible).into_any_element()
+        } else {
+            self.blocks_layout = None;
+            TerminalElement::new(cx.entity(), self.session.clone(), focused, self.cursor_visible).into_any_element()
+        };
 
         let surface = div()
             .id("terminal")
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
-            .size_full()
+            .when(blocks_mode, |surface| surface.flex_1().min_h_0().w_full())
+            .when(!blocks_mode, |surface| surface.size_full())
             .relative()
             .cursor_text()
             .on_action(cx.listener(Self::copy))
@@ -707,6 +878,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
             .on_action(cx.listener(Self::reconnect))
+            .on_action(cx.listener(|view, _: &CopyCommand, _, cx| view.copy_block(false, cx)))
+            .on_action(cx.listener(|view, _: &CopyOutput, _, cx| view.copy_block(true, cx)))
             .on_action(cx.listener(|view, _: &ZoomIn, _, cx| view.zoom(1., cx)))
             .on_action(cx.listener(|view, _: &ZoomOut, _, cx| view.zoom(-1., cx)))
             .on_action(cx.listener(|view, _: &ZoomReset, _, cx| view.zoom(0., cx)))
@@ -720,6 +893,14 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                    if blocks_mode {
+                        view.menu_block = view.blocks_layout.as_ref().and_then(|layout| layout.block_at(event.position.y));
+                        if paste_on_right_click {
+                            view.paste(&Paste, window, cx);
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
                     let mode = view.session.read(cx).mode();
                     if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
                         view.mouse_down(event, window, cx);
@@ -744,16 +925,32 @@ impl Render for TerminalView {
             .children(self.render_status(cx));
 
         let focus = self.focus_handle.clone();
-        surface.context_menu(move |menu, _, _| {
+        let view = cx.entity().downgrade();
+        let surface = surface.context_menu(move |menu, _, cx| {
+            let on_block = blocks_mode && view.upgrade().is_some_and(|view| view.read(cx).menu_block.is_some());
             menu.action_context(focus.clone())
                 .menu_with_disabled("Copy", Box::new(Copy), !has_selection)
                 .menu("Paste", Box::new(Paste))
+                .when(on_block, |menu| {
+                    menu.separator()
+                        .menu("Copy Command", Box::new(CopyCommand))
+                        .menu("Copy Output", Box::new(CopyOutput))
+                })
                 .separator()
                 .menu("Select All", Box::new(SelectAll))
                 .menu("Find…", Box::new(Find))
                 .separator()
                 .menu("Clear", Box::new(Clear))
-        })
+        });
+        if blocks_mode {
+            v_flex()
+                .size_full()
+                .child(surface)
+                .child(self.render_prompt(cx))
+                .into_any_element()
+        } else {
+            surface.into_any_element()
+        }
     }
 }
 
@@ -790,9 +987,13 @@ impl EntityInputHandler for TerminalView {
         &mut self,
         _range: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !text.is_empty() && self.wants_prompt(cx) {
+            self.insert_in_prompt(text, window, cx);
+            return;
+        }
         if !text.is_empty() {
             self.write(text.as_bytes().to_vec(), cx);
         }
@@ -816,6 +1017,17 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         // Puts the input method's candidate window next to the cursor.
+        if let Some(blocks) = &self.blocks_layout {
+            let session = self.session.read(cx);
+            let index = session.blocks.as_ref()?.list.len().checked_sub(1)?;
+            let geom = blocks.blocks.get(index)?;
+            let cursor = session.term().grid().cursor.point;
+            let origin = gpui_kit::point(
+                geom.output_origin.x + blocks.cell_width * cursor.column.0 as f32,
+                geom.output_origin.y + blocks.line_height * (cursor.line.0 - geom.first_line.0) as f32,
+            );
+            return Some(Bounds::new(origin, gpui_kit::size(blocks.cell_width, blocks.line_height)));
+        }
         let layout = self.layout?;
         let session = self.session.read(cx);
         let cursor = session.term().grid().cursor.point;

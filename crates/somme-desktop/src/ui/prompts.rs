@@ -5,11 +5,15 @@ use futures::channel::oneshot;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, StyledExt as _, WindowExt as _, h_flex, v_flex};
-use gpui_kit::{App, AppContext as _, Entity, Focusable as _, ParentElement as _, Styled as _, Window, div, px};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
+use gpui_kit::{
+    App, AppContext as _, Entity, Focusable as _, ParentElement as _, PromptButton, PromptLevel, Styled as _, Window,
+    div, px,
+};
 use somme_application::ports::{PromptAnswer, PromptKind};
 
 use crate::services::PromptRequest;
+use crate::ui::native;
 
 type Answer = Rc<RefCell<Option<oneshot::Sender<PromptAnswer>>>>;
 
@@ -56,7 +60,7 @@ pub fn show(request: PromptRequest, window: &mut Window, cx: &mut App) {
             key_type,
             fingerprint,
             previous_fingerprint,
-        } => ask_host_key(title, host, port, key_type, fingerprint, previous_fingerprint, answer, window, cx),
+        } => ask_host_key(host, port, key_type, fingerprint, previous_fingerprint, answer, window, cx),
     }
 }
 
@@ -138,9 +142,9 @@ fn ask_inputs(
     });
 }
 
+/// Asks whether to trust a server's key, in the system's alert.
 #[allow(clippy::too_many_arguments)]
 fn ask_host_key(
-    title: String,
     host: String,
     port: u16,
     key_type: String,
@@ -150,85 +154,39 @@ fn ask_host_key(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let address = if port == 22 { host } else { format!("{host}:{port}") };
     let changed = previous.is_some();
-    window.open_dialog(cx, move |dialog, _, cx| {
-        let theme = cx.theme();
-        let address = if port == 22 { host.clone() } else { format!("{host}:{port}") };
-        let (headline, detail, color) = if changed {
-            (
-                "The host key has changed",
-                format!(
-                    "{address} sent a different key than last time. This can mean someone is intercepting the \
-                     connection. Only continue if you know the server was reinstalled or its key was replaced."
-                ),
-                theme.danger,
-            )
-        } else {
-            (
-                "New host",
-                format!("This is the first connection to {address}. Check the fingerprint before you trust it."),
-                theme.warning,
-            )
-        };
-        let fingerprint_row = |label: &str, value: &str| {
-            v_flex()
-                .gap_0p5()
-                .child(div().text_xs().text_color(theme.muted_foreground).child(label.to_owned()))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_family(theme.mono_font_family.clone())
-                        .p_2()
-                        .rounded_md()
-                        .bg(theme.muted)
-                        .child(value.to_owned()),
-                )
-        };
-        let mut body = v_flex()
-            .gap_3()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(Icon::new(IconName::TriangleAlert).text_color(color))
-                    .child(div().font_semibold().child(headline)),
-            )
-            .child(div().text_sm().text_color(theme.muted_foreground).child(detail))
-            .child(fingerprint_row(&format!("{key_type} fingerprint"), &fingerprint));
-        if let Some(previous) = &previous {
-            body = body.child(fingerprint_row("Previous fingerprint", previous));
-        }
-        let accept = {
-            let answer = answer.clone();
-            move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                reply(&answer, PromptAnswer::Accept);
-                window.close_dialog(cx);
-            }
-        };
-        let cancel = {
-            let answer = answer.clone();
-            move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                reply(&answer, PromptAnswer::Cancel);
-                window.close_dialog(cx);
-            }
-        };
-        let on_close = {
-            let answer = answer.clone();
-            move |_: &gpui_kit::ClickEvent, _: &mut Window, _: &mut App| reply(&answer, PromptAnswer::Cancel)
-        };
-        let accept_button = Button::new("hostkey-accept").label(if changed { "Trust New Key" } else { "Trust and Connect" });
-        let accept_button = if changed { accept_button.danger() } else { accept_button.primary() };
-        dialog
-            .title(title.clone())
-            .w(px(500.))
-            .overlay_closable(false)
-            .child(body)
-            .on_close(on_close)
-            .footer(
-                DialogFooter::new()
-                    .child(Button::new("hostkey-cancel").label("Cancel").on_click(cancel))
-                    .child(accept_button.on_click(accept)),
-            )
-    });
+    let (level, headline, detail, trust) = match previous {
+        Some(previous) => (
+            PromptLevel::Critical,
+            "The host key has changed",
+            format!(
+                "{address} sent a different key than last time. This can mean someone is intercepting the \
+                 connection. Only continue if you know the server was reinstalled or its key was replaced.\n\n\
+                 {key_type} fingerprint:\n{fingerprint}\n\nPrevious fingerprint:\n{previous}"
+            ),
+            "Trust New Key",
+        ),
+        None => (
+            PromptLevel::Warning,
+            "New host",
+            format!(
+                "This is the first connection to {address}. Check the fingerprint before you trust it.\n\n\
+                 {key_type} fingerprint:\n{fingerprint}"
+            ),
+            "Trust and Connect",
+        ),
+    };
+    // A changed key keeps Cancel first, so Return does not trust it by accident.
+    let cancel = PromptButton::cancel("Cancel");
+    let trust = PromptButton::ok(trust);
+    let (buttons, trust_ix) = if changed { ([cancel, trust], 1) } else { ([trust, cancel], 0) };
+    let picked = native::ask(level, headline, Some(&detail), &buttons, window, cx);
+    cx.spawn(async move |_| {
+        let accepted = picked.await == Ok(trust_ix);
+        reply(&answer, if accepted { PromptAnswer::Accept } else { PromptAnswer::Cancel });
+    })
+    .detach();
 }
 
 trait WhenText: gpui_kit::ParentElement + Sized {
