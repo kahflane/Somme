@@ -14,6 +14,12 @@ fn transfer(err: impl std::fmt::Display) -> GatewayError {
     GatewayError::Transfer(err.to_string())
 }
 
+// Entry names come from the server. A hostile server could send "../x" or a
+// whole path, which would escape the folder once joined, so such names are dropped.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
 fn join(dir: &str, name: &str) -> String {
     if dir.ends_with('/') {
         format!("{dir}{name}")
@@ -65,10 +71,7 @@ impl RemoteFs for SftpFs {
     async fn list(&self, path: &str) -> Result<Vec<RemoteEntry>, GatewayError> {
         let entries = self.sftp.read_dir(path).await.map_err(transfer)?;
         Ok(entries
-            .filter(|e| {
-                let name = e.file_name();
-                name != "." && name != ".."
-            })
+            .filter(|e| is_plain_name(&e.file_name()))
             .map(|e| {
                 let meta = e.metadata();
                 let file_type = e.file_type();
@@ -119,5 +122,24 @@ impl RemoteFs for SftpFs {
     async fn close(&self) {
         let _ = self.sftp.close().await;
         self.conn.disconnect().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_plain_name;
+
+    #[test]
+    fn accepts_normal_names() {
+        for name in ["notes.txt", ".bashrc", "backup 12:00.tar", "..hidden"] {
+            assert!(is_plain_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn rejects_names_that_escape_the_folder() {
+        for name in ["", ".", "..", "../x", "a/b", "/etc/passwd", "..\\x", "a\\b", "a\0b"] {
+            assert!(!is_plain_name(name), "{name:?}");
+        }
     }
 }

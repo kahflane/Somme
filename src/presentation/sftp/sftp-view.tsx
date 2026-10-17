@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { errorMessage, notifyError } from "@/application/errors";
 import { hostDetail } from "@/application/format";
 import { useHosts, useIdentities } from "@/application/hooks/entities";
-import { joinPath, pathStyleOf } from "@/application/paths";
+import { isPlainName, joinPath, pathStyleOf } from "@/application/paths";
 import { queryKeys } from "@/application/query-keys";
 import { useSftp } from "@/application/stores/sftp";
 import type { Host, Id, SftpEntry } from "@/domain/types";
@@ -159,7 +159,7 @@ export function SftpView() {
   const transfer = (from: PaneSide, entries: SftpEntry[]) => {
     setDragging(null);
     if (!sftpId || !remoteSource || !localPath || !remotePath) return;
-    const files = entries.filter((entry) => !entry.isDir);
+    const files = entries.filter((entry) => !entry.isDir && isPlainName(entry.name));
     if (files.length === 0) {
       notifications.show({
         color: "orange",
@@ -181,7 +181,7 @@ export function SftpView() {
           if (toRemote) await api.sftp.upload(sftpId, file.path, remotePath);
           else await api.sftp.download(sftpId, file.path, joinPath(localPath, file.name, target.style));
         }
-        const note = skipped > 0 ? ` (${plural(skipped, "folder")} skipped)` : "";
+        const note = skipped > 0 ? ` (${plural(skipped, "item")} skipped)` : "";
         notifications.show({
           color: "blue",
           message: `Copied ${plural(files.length, "file")} to ${toRemote ? (host?.label ?? "host") : "Local"}${note}`,
