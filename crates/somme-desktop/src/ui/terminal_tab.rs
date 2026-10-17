@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui_kit::component::{ActiveTheme as _, h_resizable, resizable_panel, v_resizable};
@@ -6,6 +7,7 @@ use gpui_kit::{
     IntoElement, ParentElement as _, Render, SharedString, Subscription, Window, div,
 };
 
+use crate::editor::{EditorPane, EditorPaneEvent};
 use crate::services::Services;
 use crate::terminal::session::Status;
 use crate::terminal::view::TerminalViewEvent;
@@ -71,6 +73,8 @@ impl PaneNode {
 pub enum TerminalTabEvent {
     Changed,
     Empty,
+    /// Show the git changes of the repo that holds this folder.
+    OpenChanges(PathBuf),
 }
 
 /// One tab of terminals: a tree of split panes with an optional broadcast mode.
@@ -79,25 +83,37 @@ pub struct TerminalTab {
     active: Entity<TerminalView>,
     pub broadcast: bool,
     pub target: SessionTarget,
+    /// A name the user gave the tab. Without one the tab names the folder or the shell's title.
+    pub custom_title: Option<SharedString>,
     /// A snippet to run as soon as the first pane connects.
     pending_run: Option<String>,
     services: Arc<Services>,
     subscriptions: Vec<(EntityId, Subscription)>,
+    /// Files opened from the terminal, shown on the right.
+    editor: Option<(Entity<EditorPane>, Subscription)>,
 }
 
 impl EventEmitter<TerminalTabEvent> for TerminalTab {}
 
 impl TerminalTab {
-    pub fn new(target: SessionTarget, services: Arc<Services>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let view = Self::new_view(&target, &services, window, cx);
+    pub fn new(
+        target: SessionTarget,
+        start_dir: Option<PathBuf>,
+        services: Arc<Services>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let view = Self::new_view(&target, start_dir, &services, window, cx);
         let mut tab = Self {
             root: PaneNode::Leaf(view.clone()),
             active: view.clone(),
             broadcast: false,
             target,
+            custom_title: None,
             pending_run: None,
             services,
             subscriptions: Vec::new(),
+            editor: None,
         };
         tab.watch(&view, window, cx);
         tab
@@ -105,16 +121,17 @@ impl TerminalTab {
 
     fn new_view(
         target: &SessionTarget,
+        start_dir: Option<PathBuf>,
         services: &Arc<Services>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalView> {
-        let session = TerminalSession::new(target.clone(), services.clone(), cx);
+        let session = TerminalSession::new(target.clone(), start_dir, services.clone(), cx);
         cx.new(|cx| TerminalView::new(session, window, cx))
     }
 
     fn watch(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
-        let subscription = cx.subscribe_in(view, window, |tab, view, event, _, cx| match event {
+        let subscription = cx.subscribe_in(view, window, |tab, view, event, window, cx| match event {
             TerminalViewEvent::Focused => {
                 tab.active = view.clone();
                 cx.emit(TerminalTabEvent::Changed);
@@ -132,6 +149,8 @@ impl TerminalTab {
                 cx.emit(TerminalTabEvent::Changed);
                 cx.notify();
             }
+            TerminalViewEvent::OpenFile(path) => tab.open_file(path.clone(), window, cx),
+            TerminalViewEvent::OpenChanges(dir) => cx.emit(TerminalTabEvent::OpenChanges(dir.clone())),
             TerminalViewEvent::Typed(bytes) if tab.broadcast => {
                 for other in tab.panes() {
                     if other != *view {
@@ -147,9 +166,39 @@ impl TerminalTab {
                     }
                 }
             }
+            TerminalViewEvent::Ran(text) if tab.broadcast => {
+                for other in tab.panes() {
+                    if other != *view {
+                        other.update(cx, |other, cx| other.session.update(cx, |s, cx| s.run(text, cx)));
+                    }
+                }
+            }
             _ => {}
         });
         self.subscriptions.push((view.entity_id(), subscription));
+    }
+
+    /// Opens a file in the editor beside the terminals.
+    pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // Language servers are looked for on the shell's PATH.
+        let shell_path = self.active.read(cx).session.read(cx).blocks.as_ref().and_then(|b| b.path.clone());
+        let pane = match &self.editor {
+            Some((pane, _)) => pane.clone(),
+            None => {
+                let pane = cx.new(EditorPane::new);
+                let subscription = cx.subscribe_in(&pane, window, |tab, _, event, window, cx| match event {
+                    EditorPaneEvent::Empty => {
+                        tab.editor = None;
+                        window.focus(&tab.active.focus_handle(cx), cx);
+                        cx.notify();
+                    }
+                });
+                self.editor = Some((pane.clone(), subscription));
+                pane
+            }
+        };
+        pane.update(cx, |pane, cx| pane.open(path, shell_path.as_deref(), window, cx));
+        cx.notify();
     }
 
     pub fn panes(&self) -> Vec<Entity<TerminalView>> {
@@ -163,7 +212,23 @@ impl TerminalTab {
     }
 
     pub fn title(&self, cx: &App) -> SharedString {
-        self.active.read(cx).session.read(cx).title()
+        match &self.custom_title {
+            Some(title) => title.clone(),
+            None => self.active.read(cx).session.read(cx).title(),
+        }
+    }
+
+    /// Names the tab. A blank name goes back to the automatic one.
+    pub fn rename(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        self.custom_title = (!name.is_empty()).then(|| SharedString::from(name.to_owned()));
+        cx.emit(TerminalTabEvent::Changed);
+        cx.notify();
+    }
+
+    /// Whether a file open in the editor has unsaved changes.
+    pub fn has_unsaved(&self, cx: &App) -> bool {
+        self.editor.as_ref().is_some_and(|(editor, _)| editor.read(cx).has_changes())
     }
 
     pub fn is_running(&self, cx: &App) -> bool {
@@ -171,8 +236,10 @@ impl TerminalTab {
     }
 
     pub fn split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self.active.read(cx).session.read(cx).target.clone();
-        let view = Self::new_view(&target, &self.services, window, cx);
+        // A local split opens in the folder of the pane it splits from.
+        let session = self.active.read(cx).session.read(cx);
+        let (target, dir) = (session.target.clone(), session.current_dir());
+        let view = Self::new_view(&target, dir, &self.services, window, cx);
         self.root.split(self.active.entity_id(), view.clone(), axis);
         self.watch(&view, window, cx);
         self.active = view.clone();
@@ -282,9 +349,14 @@ impl Focusable for TerminalTab {
 impl Render for TerminalTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        div()
-            .size_full()
-            .bg(theme.background)
-            .child(self.render_node(&self.root, "0".into(), cx))
+        let terminals = self.render_node(&self.root, "0".into(), cx);
+        let body = match &self.editor {
+            Some((editor, _)) => h_resizable("editor-split")
+                .child(resizable_panel().child(terminals))
+                .child(resizable_panel().child(editor.clone()))
+                .into_any_element(),
+            None => terminals,
+        };
+        div().size_full().bg(theme.background).child(body)
     }
 }

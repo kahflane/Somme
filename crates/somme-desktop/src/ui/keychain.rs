@@ -16,7 +16,7 @@ use somme_domain::Id;
 
 use crate::store::{Store, mutate, mutate_weak, report};
 use crate::ui::common::{
-    Lucide, card, confirm_delete, copy_text, empty_state, form_dialog, host_badge, labeled, notify_error, notify_ok,
+    Lucide, card, confirm_delete, copy_text, empty_state, form_dialog, host_badge, labeled, notify_error,
     page_header, subtle,
 };
 use crate::ui::fields::{Choice, ChoiceState, choice_select, key_choices, selected};
@@ -97,9 +97,10 @@ impl KeychainPage {
                     window,
                     cx,
                     move |services| async move { services.keys.generate(input).await },
-                    |_, result, window, cx| match result {
-                        Ok(key) => notify_ok(window, cx, format!("Generated {}", key.label)),
-                        Err(err) => notify_error(window, cx, "Could not generate key", err),
+                    |_, result, window, cx| {
+                        if let Err(err) = result {
+                            notify_error(window, cx, "Could not generate key", err);
+                        }
                     },
                 );
                 true
@@ -255,8 +256,8 @@ impl KeychainPage {
                             .xsmall()
                             .icon(IconName::Copy)
                             .tooltip("Copy public key")
-                            .on_click(move |_: &ClickEvent, window, cx| {
-                                copy_text(public_key.clone(), "Public key copied", window, cx);
+                            .on_click(move |_: &ClickEvent, _, cx| {
+                                copy_text(public_key.clone(), cx);
                             }),
                     )
                     .child(
@@ -269,7 +270,7 @@ impl KeychainPage {
                                 let rename = (page.clone(), menu_key.clone());
                                 let delete = (page.clone(), menu_key.clone());
                                 menu.item(PopupMenuItem::new("Copy Public Key").icon(IconName::Copy).on_click(
-                                    move |_, window, cx| copy_text(copy.clone(), "Public key copied", window, cx),
+                                    move |_, _, cx| copy_text(copy.clone(), cx),
                                 ))
                                 .item(PopupMenuItem::new("Rename").icon(Icon::new(Lucide::Pencil)).on_click(
                                     move |_, window, cx| {
@@ -598,10 +599,7 @@ impl KeyImport {
             |editor, result, window, cx| {
                 editor.saving = false;
                 match result {
-                    Ok(key) => {
-                        window.close_sheet(cx);
-                        notify_ok(window, cx, format!("Imported {}", key.label));
-                    }
+                    Ok(_) => window.close_sheet(cx),
                     Err(err) => editor.error = Some(err.to_string()),
                 }
                 cx.notify();

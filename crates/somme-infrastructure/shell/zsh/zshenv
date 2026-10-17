@@ -1,0 +1,22 @@
+# SommeCLI points ZDOTDIR here to load its shell hooks. Put the user's ZDOTDIR
+# back first, so zsh reads the rest of their config as usual.
+
+# The marks' secret stays in an unexported variable, so no program started
+# from this shell can read it and print fake marks.
+typeset -g _somme_token="${SOMME_MARK_TOKEN-}"
+builtin unset SOMME_MARK_TOKEN
+
+if [[ -n "${SOMME_USER_ZDOTDIR+x}" ]]; then
+  builtin export ZDOTDIR="$SOMME_USER_ZDOTDIR"
+else
+  builtin unset ZDOTDIR
+fi
+builtin unset SOMME_USER_ZDOTDIR
+
+if [[ -r "${ZDOTDIR-$HOME}/.zshenv" ]]; then
+  builtin source "${ZDOTDIR-$HOME}/.zshenv"
+fi
+
+if [[ -o interactive && -n "${SOMME_SHELL_HOOKS-}" ]]; then
+  builtin source "$SOMME_SHELL_HOOKS/somme.zsh"
+fi

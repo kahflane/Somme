@@ -1,6 +1,9 @@
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
-use gpui_kit::{Hsla, Rgba};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::{App, Hsla, Rgba};
+
+use crate::settings::Settings;
 
 /// A terminal color scheme: 16 ANSI colors plus the default text, background,
 /// cursor and selection colors.
@@ -22,6 +25,25 @@ const fn rgb(hex: u32) -> Rgb {
     }
 }
 
+/// Colors in order: text, background, cursor, selection, then the 16 ANSI colors.
+const fn scheme(name: &'static str, colors: [u32; 20]) -> TerminalTheme {
+    let mut ansi = [rgb(0); 16];
+    let mut ix = 0;
+    while ix < 16 {
+        ansi[ix] = rgb(colors[ix + 4]);
+        ix += 1;
+    }
+    TerminalTheme {
+        name,
+        foreground: rgb(colors[0]),
+        background: rgb(colors[1]),
+        cursor: rgb(colors[2]),
+        selection: rgb(colors[3]),
+        ansi,
+    }
+}
+
+#[rustfmt::skip]
 pub const THEMES: &[TerminalTheme] = &[
     TerminalTheme {
         name: "Somme Dark",
@@ -174,7 +196,7 @@ pub const THEMES: &[TerminalTheme] = &[
         ],
     },
     TerminalTheme {
-        name: "Light",
+        name: "GitHub Light",
         foreground: rgb(0x24292f),
         background: rgb(0xffffff),
         cursor: rgb(0x0969da),
@@ -198,10 +220,35 @@ pub const THEMES: &[TerminalTheme] = &[
             rgb(0x8c959f),
         ],
     },
+    scheme("One Dark", [0xabb2bf, 0x282c34, 0x528bff, 0x3e4451, 0x3f4451, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, 0x5c6370, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff]),
+    scheme("Tokyo Night", [0xc0caf5, 0x1a1b26, 0xc0caf5, 0x33467c, 0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6, 0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5]),
+    scheme("Gruvbox Dark", [0xebdbb2, 0x282828, 0xebdbb2, 0x504945, 0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984, 0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2]),
+    scheme("Catppuccin Mocha", [0xcdd6f4, 0x1e1e2e, 0xf5e0dc, 0x585b70, 0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xbac2de, 0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8]),
+    scheme("Catppuccin Latte", [0x4c4f69, 0xeff1f5, 0xdc8a78, 0xacb0be, 0x5c5f77, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x179299, 0xacb0be, 0x6c6f85, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x179299, 0xbcc0cc]),
+    scheme("Default Dark", [0xfafafa, 0x0a0a0a, 0xfafafa, 0x404040, 0x262626, 0xf87171, 0x4ade80, 0xfacc15, 0x60a5fa, 0xc084fc, 0x22d3ee, 0xd4d4d4, 0x525252, 0xfca5a5, 0x86efac, 0xfde047, 0x93c5fd, 0xd8b4fe, 0x67e8f9, 0xfafafa]),
+    scheme("Default Light", [0x0a0a0a, 0xffffff, 0x171717, 0xd4d4d4, 0x171717, 0xdc2626, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2, 0xa3a3a3, 0x525252, 0xef4444, 0x22c55e, 0xeab308, 0x3b82f6, 0xa855f7, 0x06b6d4, 0xe5e5e5]),
+    scheme("Somme Light", [0x1c1f26, 0xffffff, 0x2f6fed, 0xc9daf8, 0x1c1f26, 0xd93843, 0x1f9d55, 0xb7791f, 0x2f6fed, 0x9b51e0, 0x0e9aa7, 0xa0a4ad, 0x666b78, 0xe5535d, 0x2bb46a, 0xd08d2a, 0x4f86f0, 0xae6ce6, 0x1cb3c1, 0xe2e4e9]),
+    scheme("Solarized Light", [0x657b83, 0xfdf6e3, 0x586e75, 0xe3dcc6, 0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5, 0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3]),
 ];
 
+fn find(name: &str) -> Option<&'static TerminalTheme> {
+    THEMES.iter().find(|theme| theme.name == name)
+}
+
 pub fn theme_named(name: &str) -> &'static TerminalTheme {
-    THEMES.iter().find(|theme| theme.name == name).unwrap_or(&THEMES[0])
+    // Older settings saved the GitHub scheme as "Light".
+    let name = if name == "Light" { "GitHub Light" } else { name };
+    find(name).unwrap_or(&THEMES[0])
+}
+
+/// The colors terminals use now: the app theme's own, unless the user picked others.
+pub fn active_theme(cx: &App) -> &'static TerminalTheme {
+    let settings = Settings::get(cx);
+    if !settings.terminal_matches_theme {
+        return theme_named(&settings.terminal_theme);
+    }
+    let theme = cx.theme();
+    find(theme.theme_name()).unwrap_or_else(|| theme_named(if theme.is_dark() { "Somme Dark" } else { "Somme Light" }))
 }
 
 pub fn to_hsla(color: Rgb) -> Hsla {

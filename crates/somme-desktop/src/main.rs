@@ -1,5 +1,8 @@
 #[cfg(feature = "snapshot")]
 mod automation;
+mod changes;
+mod editor;
+mod look;
 mod runtime;
 mod services;
 mod settings;
@@ -12,6 +15,7 @@ use std::sync::Arc;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
+use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
@@ -21,11 +25,23 @@ use crate::store::Store;
 use crate::ui::workspace::Workspace;
 
 pub(crate) fn apply_appearance(cx: &mut App) {
+    ui::themes::install(cx);
     match Settings::get(cx).appearance {
         Appearance::Dark => Theme::change(ThemeMode::Dark, None, cx),
         Appearance::Light => Theme::change(ThemeMode::Light, None, cx),
         Appearance::System => Theme::sync_system_appearance(None, cx),
     }
+    // The library's own themes keep the code colours of the last mode; match them up.
+    let theme = Theme::global_mut(cx);
+    if theme.highlight_theme.appearance.is_dark() != theme.mode.is_dark() {
+        theme.highlight_theme = if theme.mode.is_dark() {
+            HighlightTheme::default_dark()
+        } else {
+            HighlightTheme::default_light()
+        };
+    }
+    // A theme change can reset fonts, so put the chosen ones back.
+    ui::themes::apply_font(cx);
 }
 
 /// Passes backend events (data changes, prompts, stopped forwards) to the UI.
@@ -35,7 +51,10 @@ fn pump_events(mut events: mpsc::UnboundedReceiver<BackendEvent>, window: AnyWin
             let _ = cx.update(|cx| {
                 let store = Store::global(cx);
                 match event {
-                    BackendEvent::DataChanged => store.update(cx, |store, cx| store.refresh(cx)),
+                    BackendEvent::DataChanged => {
+                        store.update(cx, |store, cx| store.refresh(cx));
+                        look::pull(cx);
+                    }
                     BackendEvent::SyncStatus(state) => store.update(cx, |store, cx| {
                         store.sync = state.into();
                         cx.notify();
@@ -49,10 +68,9 @@ fn pump_events(mut events: mpsc::UnboundedReceiver<BackendEvent>, window: AnyWin
                             .find(|f| f.id == rule_id)
                             .map(|f| f.label.clone())
                             .unwrap_or_else(|| "Port forward".into());
-                        let _ = window.update(cx, |_, window, cx| {
-                            let reason = reason.unwrap_or_else(|| "It stopped.".into());
-                            ui::common::notify_error(window, cx, &format!("{label} stopped"), reason);
-                        });
+                        // It can stop while the user is elsewhere, so tell the notification center.
+                        let reason = reason.unwrap_or_else(|| "It stopped.".into());
+                        ui::native::notify(&format!("{label} stopped"), &reason, cx);
                     }
                     BackendEvent::Prompt(request) => {
                         let _ = window.update(cx, |_, window, cx| ui::prompts::show(request, window, cx));
@@ -73,17 +91,28 @@ fn main() -> anyhow::Result<()> {
     let services = Arc::new(runtime::block_on(Services::build(events_tx))?);
 
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+        // Windows and Linux name the app in notifications by this.
+        cx.set_app_identity("app.somme.desktop", ui::common::APP_NAME);
         gpui_kit::init(cx);
+        ui::themes::register(cx);
         terminal::view::init(cx);
+        editor::pane::init(cx);
         ui::workspace::init(cx);
         cx.set_global(Settings::load(&services.data_dir));
         cx.set_global(SettingsFile(services.data_dir.clone()));
         apply_appearance(cx);
+        ui::themes::apply_font(cx);
+        cx.observe_global::<Settings>(ui::themes::apply_font).detach();
         Store::init(services.clone(), cx);
+        look::init(services.clone(), cx);
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1200.), px(780.)), cx)),
             window_min_size: Some(size(px(720.), px(480.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some(ui::common::APP_NAME.into()),
+                ..TitleBar::title_bar_options()
+            }),
             ..TitleBar::window_options()
         };
         let quit_services = services.clone();

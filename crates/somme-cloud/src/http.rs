@@ -1,12 +1,14 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderName, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::json;
-use tower_governor::GovernorLayer;
+use tower_governor::key_extractor::KeyExtractor;
+use tower_governor::{GovernorError, GovernorLayer};
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -77,12 +79,34 @@ pub fn routes(svc: Shared) -> Router {
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT))
 }
 
-pub fn router(svc: Shared) -> Router {
+/// Rate limits by client IP. Behind a proxy every peer is the proxy, so the IP
+/// comes from the proxy's header when one is set.
+#[derive(Clone)]
+struct ClientIp(Option<HeaderName>);
+
+impl KeyExtractor for ClientIp {
+    type Key = IpAddr;
+
+    fn extract<T>(&self, req: &Request<T>) -> Result<IpAddr, GovernorError> {
+        match &self.0 {
+            Some(name) => req
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok()),
+            None => req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.ip()),
+        }
+        .ok_or(GovernorError::UnableToExtractKey)
+    }
+}
+
+pub fn router(svc: Shared, client_ip_header: Option<HeaderName>) -> Router {
     let limits = GovernorConfigBuilder::default()
+        .key_extractor(ClientIp(client_ip_header))
         .per_second(2)
         .burst_size(10)
         .finish()
-        .unwrap_or_default();
+        .expect("rate limits are not zero");
     Router::new()
         .merge(routes(svc).layer(GovernorLayer::new(limits)))
         .route("/healthz", get(health))
@@ -132,5 +156,13 @@ mod tests {
         assert!(body["expiresAt"].as_i64().unwrap() > 0);
         let (status, _) = call(&app, Request::post("/v1/sync/credentials").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn rate_limit_key_trusts_the_proxy_header_only_when_set() {
+        let req = Request::get("/").header("fly-client-ip", "203.0.113.7").body(()).unwrap();
+        let behind_proxy = ClientIp(Some(HeaderName::from_static("fly-client-ip")));
+        assert_eq!(behind_proxy.extract(&req).ok(), "203.0.113.7".parse().ok());
+        assert!(ClientIp(None).extract(&req).is_err());
     }
 }

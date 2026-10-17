@@ -2,7 +2,8 @@
 //! without a person at the keyboard. Only built with `--features snapshot`.
 //!
 //! Run with `SOMME_SCRIPT=steps.txt`. One step per line:
-//! `wait 500`, `key cmd-t`, `type hello`, `click 120 40`, `move 120 40`, `drag 10 10 200 10`, `action workspace::NewTab`,
+//! `wait 500`, `key cmd-t`, `type hello`, `click 120 40`, `move 120 40`, `drag 10 10 200 10`, `scroll 120 40 -300`,
+//! `action workspace::NewTab`, `bench X Y N` (scrolls N times and prints the average frame time),
 //! `shot out.png`, `quit`. Lines starting with `#` are skipped.
 
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use gpui_kit::{
     AnyWindowHandle, App, AsyncApp, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
-    point, px,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 
 pub fn start(window: AnyWindowHandle, cx: &mut App) {
@@ -178,6 +179,49 @@ async fn run_step(line: &str, base: &Path, window: AnyWindowHandle, cx: &mut Asy
                 cx,
             )?;
             cx.background_executor().timer(pause).await;
+        }
+        "scroll" => {
+            let mut parts = arg.split_whitespace().map(str::parse::<f32>);
+            let (Some(Ok(x)), Some(Ok(y)), Some(Ok(dy))) = (parts.next(), parts.next(), parts.next()) else {
+                anyhow::bail!("expected: scroll X Y DY");
+            };
+            window.update(cx, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.dispatch_event(
+                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: point(px(x), px(y)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }),
+                    cx,
+                );
+            })?;
+        }
+        "bench" => {
+            let mut parts = arg.split_whitespace().map(str::parse::<f32>);
+            let (Some(Ok(x)), Some(Ok(y)), Some(Ok(n))) = (parts.next(), parts.next(), parts.next()) else {
+                anyhow::bail!("expected: bench X Y N");
+            };
+            let mut total = Duration::ZERO;
+            for i in 0..n as usize {
+                let dy = if (i / 20) % 2 == 0 { -40. } else { 40. };
+                total += window.update(cx, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: point(px(x), px(y)),
+                            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                            modifiers: Modifiers::default(),
+                            touch_phase: TouchPhase::Moved,
+                        }),
+                        cx,
+                    );
+                    let start = std::time::Instant::now();
+                    window.draw(cx).clear(cx);
+                    start.elapsed()
+                })?;
+            }
+            println!("bench: {:.2} ms per frame over {n} frames", total.as_secs_f64() * 1000. / f64::from(n));
         }
         "move" => {
             let mut parts = arg.split_whitespace().map(str::parse::<f32>);

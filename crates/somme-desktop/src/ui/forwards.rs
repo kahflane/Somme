@@ -20,7 +20,7 @@ use somme_domain::Id;
 use crate::runtime;
 use crate::store::{Store, mutate, mutate_weak, report};
 use crate::ui::common::{
-    Lucide, card, confirm_delete, empty_state, host_badge, labeled, notify_error, notify_ok, page_header, subtle,
+    Lucide, card, confirm_delete, empty_state, host_badge, labeled, notify_error, page_header, subtle,
 };
 use crate::ui::fields::{Choice, ChoiceState, choice_select, selected};
 
@@ -96,9 +96,8 @@ impl ForwardsPage {
             let _ = this.update_in(cx, |page, window, cx| {
                 page.starting.remove(&id);
                 Store::global(cx).update(cx, |store, cx| store.refresh_forwards(cx));
-                match result {
-                    Ok(()) => notify_ok(window, cx, format!("{label} is on")),
-                    Err(err) => notify_error(window, cx, &format!("Could not start {label}"), err),
+                if let Err(err) = result {
+                    notify_error(window, cx, &format!("Could not start {label}"), err);
                 }
                 cx.notify();
             });
@@ -467,10 +466,7 @@ impl ForwardEditor {
             move |services| async move { services.forwards.save(input).await },
             |editor, result, window, cx| {
                 match result {
-                    Ok(rule) => {
-                        window.close_sheet(cx);
-                        notify_ok(window, cx, format!("Saved {}", rule.label));
-                    }
+                    Ok(_) => window.close_sheet(cx),
                     Err(err) => editor.error = Some(err.to_string()),
                 }
                 cx.notify();

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use somme_domain::{
-    Id, KnownHost, KnownHostRepository, Repository, RepositoryError, Sealed, VaultMeta,
-    VaultRepository,
+    Id, KnownHost, KnownHostRepository, PreferenceRepository, Repository, RepositoryError, Sealed,
+    VaultMeta, VaultRepository, now,
 };
 use turso::Value;
 
@@ -98,6 +98,30 @@ impl KnownHostRepository for SqlRepository {
             .await?
             .into_iter()
             .next())
+    }
+}
+
+#[async_trait]
+impl PreferenceRepository for SqlRepository {
+    async fn preference(&self, key: &str) -> Result<Option<String>, RepositoryError> {
+        let conn = self.store.conn().await;
+        let mut rows = conn
+            .query("SELECT value FROM preferences WHERE id = ?", vec![Value::Text(key.into())])
+            .await
+            .map_err(storage)?;
+        match rows.next().await.map_err(storage)? {
+            Some(row) => Ok(Some(RowReader::new("preferences", &row).text(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn set_preference(&self, key: &str, value: &str) -> Result<(), RepositoryError> {
+        self.execute(
+            "INSERT INTO preferences (id, value, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            vec![Value::Text(key.into()), Value::Text(value.into()), Value::Integer(now())],
+        )
+        .await
     }
 }
 

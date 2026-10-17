@@ -18,6 +18,12 @@ pub trait KnownHostRepository: Repository<KnownHost> {
 }
 
 #[async_trait]
+pub trait PreferenceRepository: Send + Sync {
+    async fn preference(&self, key: &str) -> Result<Option<String>, RepositoryError>;
+    async fn set_preference(&self, key: &str, value: &str) -> Result<(), RepositoryError>;
+}
+
+#[async_trait]
 pub trait VaultRepository: Send + Sync {
     async fn load(&self) -> Result<Option<VaultMeta>, RepositoryError>;
     async fn store(&self, meta: &VaultMeta) -> Result<(), RepositoryError>;

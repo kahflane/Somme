@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +42,7 @@ impl TokenSource for StaticToken {
 }
 
 pub struct Backend {
+    path: PathBuf,
     conn: Connection,
     synced: Option<turso::sync::Database>,
     _local: Option<turso::Database>,
@@ -49,11 +50,12 @@ pub struct Backend {
 
 impl Backend {
     pub async fn open_local(path: &Path) -> Result<Self, StoreError> {
-        let path = path_str(path)?;
-        let db = turso::Builder::new_local(&path).build().await?;
+        let file = path_str(path)?;
+        let db = turso::Builder::new_local(&file).build().await?;
         let conn = db.connect()?;
         migrate(&conn).await?;
         Ok(Self {
+            path: path.to_owned(),
             conn,
             synced: None,
             _local: Some(db),
@@ -61,8 +63,8 @@ impl Backend {
     }
 
     pub async fn open_synced(path: &Path, url: &str, tokens: Arc<dyn TokenSource>) -> Result<Self, StoreError> {
-        let path = path_str(path)?;
-        let builder = turso::sync::Builder::new_remote(&path)
+        let file = path_str(path)?;
+        let builder = turso::sync::Builder::new_remote(&file)
             .with_remote_url(url)
             .with_client_name("somme")
             .with_auth_token_fn(move || {
@@ -80,6 +82,7 @@ impl Backend {
         let conn = db.connect().await?;
         migrate(&conn).await?;
         Ok(Self {
+            path: path.to_owned(),
             conn,
             synced: Some(db),
             _local: None,
@@ -88,6 +91,10 @@ impl Backend {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn synced(&self) -> Option<&turso::sync::Database> {

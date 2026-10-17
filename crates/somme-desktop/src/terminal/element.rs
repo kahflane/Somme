@@ -1,6 +1,7 @@
 use alacritty_terminal::index::Point as GridPoint;
 use alacritty_terminal::term::TermMode;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui_kit::{
     App, BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, Font, FontFallbacks, FontFeatures,
@@ -56,7 +57,7 @@ pub fn cell_metrics(settings: &Settings, window: &Window) -> (Font, Pixels, Pixe
 }
 
 #[derive(Clone, PartialEq)]
-struct CellStyle {
+pub struct CellStyle {
     fg: Rgb,
     bold: bool,
     italic: bool,
@@ -66,8 +67,9 @@ struct CellStyle {
 }
 
 struct Batch {
-    line: usize,
-    column: usize,
+    /// Tells rows apart, so a batch never spans two of them.
+    row: usize,
+    origin: Point<Pixels>,
     /// The column right after the last cell in this batch.
     end: usize,
     text: String,
@@ -75,12 +77,230 @@ struct Batch {
     wide: bool,
 }
 
-struct CursorPaint {
+/// A background run on one row: row, where it starts, first column, end column, color.
+type RectRun = (usize, Point<Pixels>, usize, usize, Rgb);
+
+/// Turns grid cells into background rectangles and shaped runs of text.
+pub struct CellPainter<'a> {
+    overrides: &'a Colors,
+    theme: &'a TerminalTheme,
+    pub default_bg: Rgb,
+    cell_width: Pixels,
+    line_height: Pixels,
+    rects: Vec<(Bounds<Pixels>, Hsla)>,
+    batches: Vec<Batch>,
+    current: Option<Batch>,
+    last_rect: Option<RectRun>,
+}
+
+/// What a painted cell looks like, kept for drawing the cursor over it.
+#[derive(Clone)]
+pub struct PaintedCell {
+    pub c: char,
+    pub style: CellStyle,
+    pub wide: bool,
+}
+
+impl<'a> CellPainter<'a> {
+    pub fn new(overrides: &'a Colors, theme: &'a TerminalTheme, cell_width: Pixels, line_height: Pixels) -> Self {
+        Self {
+            overrides,
+            theme,
+            default_bg: colors::resolve(Color::Named(NamedColor::Background), overrides, theme),
+            cell_width,
+            line_height,
+            rects: Vec::new(),
+            batches: Vec::new(),
+            current: None,
+            last_rect: None,
+        }
+    }
+
+    fn flush_rect(&mut self) {
+        if let Some((_, origin, start, end, color)) = self.last_rect.take() {
+            self.rects.push((
+                Bounds::new(
+                    point(origin.x + self.cell_width * start as f32, origin.y),
+                    size(self.cell_width * (end - start) as f32, self.line_height),
+                ),
+                to_hsla(color),
+            ));
+        }
+    }
+
+    /// Adds one cell. `row` tells rows apart and `row_origin` is where the row's first column sits.
+    pub fn cell(&mut self, row: usize, row_origin: Point<Pixels>, column: usize, cell: &Cell, selected: Option<Rgb>) -> Option<PaintedCell> {
+        if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            return None;
+        }
+        let wide = cell.flags.contains(Flags::WIDE_CHAR);
+        let width = if wide { 2 } else { 1 };
+        let (fg, mut bg) = cell_colors(cell.fg, cell.bg, cell.flags, self.overrides, self.theme);
+        if let Some(selection) = selected {
+            bg = selection;
+        }
+
+        if bg != self.default_bg {
+            match self.last_rect.as_mut() {
+                Some((r, _, _, end, color)) if *r == row && *end == column && *color == bg => *end = column + width,
+                _ => {
+                    self.flush_rect();
+                    self.last_rect = Some((row, row_origin, column, column + width, bg));
+                }
+            }
+        }
+
+        let style = cell_style(fg, cell.flags);
+        let painted = PaintedCell {
+            c: cell.c,
+            style: style.clone(),
+            wide,
+        };
+        let blank = cell.c == ' ' || cell.c == '\0' || cell.c == '\t';
+        let decorated = style.underline || style.undercurl || style.strike;
+        let continues = self.current.as_ref().is_some_and(|batch| {
+            !batch.wide && !wide && batch.row == row && batch.style == style && batch.end == column
+        });
+        if blank && !decorated && !continues {
+            if let Some(batch) = self.current.take() {
+                self.batches.push(batch);
+            }
+            return Some(painted);
+        }
+        if !continues && let Some(batch) = self.current.take() {
+            self.batches.push(batch);
+        }
+        let cell_width = self.cell_width;
+        let batch = self.current.get_or_insert_with(|| Batch {
+            row,
+            origin: point(row_origin.x + cell_width * column as f32, row_origin.y),
+            end: column,
+            text: String::new(),
+            style,
+            wide,
+        });
+        batch.text.push(if blank { ' ' } else { cell.c });
+        batch.end = column + width;
+        if let Some(extra) = cell.zerowidth() {
+            batch.text.extend(extra.iter().copied());
+        }
+        if wide {
+            self.batches.push(self.current.take().expect("batch was just created"));
+        }
+        Some(painted)
+    }
+
+    /// Shapes the collected text. Returns the background rectangles and the text runs.
+    pub fn finish(mut self, font: &Font, font_size: Pixels, window: &Window) -> (Vec<(Bounds<Pixels>, Hsla)>, Vec<(Point<Pixels>, ShapedLine)>) {
+        if let Some(batch) = self.current.take() {
+            self.batches.push(batch);
+        }
+        self.flush_rect();
+        let text_system = window.text_system().clone();
+        let cell_width = self.cell_width;
+        let lines = self
+            .batches
+            .into_iter()
+            .filter_map(|batch| {
+                let decorated = batch.style.underline || batch.style.undercurl || batch.style.strike;
+                let text = if decorated { batch.text } else { batch.text.trim_end().to_owned() };
+                if text.is_empty() {
+                    return None;
+                }
+                let run = text_run(text.len(), font, &batch.style);
+                let force = if batch.wide { cell_width * 2. } else { cell_width };
+                let shaped = text_system.shape_line(text.into(), font_size, &[run], Some(force));
+                Some((batch.origin, shaped))
+            })
+            .collect();
+        (self.rects, lines)
+    }
+}
+
+pub struct CursorPaint {
     bounds: Bounds<Pixels>,
     color: Hsla,
     shape: CursorShapeSetting,
     hollow: bool,
     glyph: Option<(Point<Pixels>, ShapedLine)>,
+}
+
+impl CursorPaint {
+    /// The cursor over `under`, the cell it sits on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        origin: Point<Pixels>,
+        under: Option<PaintedCell>,
+        shape: CursorShapeSetting,
+        color: Rgb,
+        background: Rgb,
+        focused: bool,
+        metrics: (&Font, Pixels, Pixels, Pixels),
+        window: &Window,
+    ) -> Self {
+        let (font, font_size, cell_width, line_height) = metrics;
+        let wide = under.as_ref().is_some_and(|cell| cell.wide);
+        let width = if wide { cell_width * 2. } else { cell_width };
+        let glyph = under
+            .filter(|cell| shape == CursorShapeSetting::Block && focused && cell.c != ' ' && cell.c != '\0')
+            .map(|cell| {
+                let inverted = CellStyle {
+                    fg: background,
+                    ..cell.style
+                };
+                let text = cell.c.to_string();
+                let run = text_run(text.len(), font, &inverted);
+                let shaped = window.text_system().shape_line(text.into(), font_size, &[run], Some(width));
+                (origin, shaped)
+            });
+        Self {
+            bounds: Bounds::new(origin, size(width, line_height)),
+            color: to_hsla(color),
+            shape,
+            hollow: !focused,
+            glyph,
+        }
+    }
+
+    /// Paints the part that goes under the text.
+    pub fn paint_under(&self, window: &mut Window) {
+        if !self.hollow && self.shape == CursorShapeSetting::Block {
+            window.paint_quad(fill(self.bounds, self.color));
+        }
+    }
+
+    /// Paints the part that goes over the text.
+    pub fn paint_over(self, line_height: Pixels, window: &mut Window, cx: &mut App) {
+        let b = self.bounds;
+        if self.hollow {
+            window.paint_quad(outline(b, self.color, BorderStyle::Solid));
+            return;
+        }
+        match self.shape {
+            CursorShapeSetting::Block => {
+                if let Some((origin, glyph)) = self.glyph {
+                    let _ = glyph.paint(origin, line_height, TextAlign::Left, None, window, cx);
+                }
+            }
+            CursorShapeSetting::Bar => {
+                window.paint_quad(fill(Bounds::new(b.origin, size(px(2.), b.size.height)), self.color));
+            }
+            CursorShapeSetting::Underline => {
+                let y = b.origin.y + b.size.height - px(2.);
+                window.paint_quad(fill(Bounds::new(point(b.origin.x, y), size(b.size.width, px(2.))), self.color));
+            }
+        }
+    }
+}
+
+/// The cursor shape to draw, from what the program asked for and the setting.
+pub fn cursor_shape(asked: CursorShape, mode: TermMode, setting: CursorShapeSetting) -> CursorShapeSetting {
+    match asked {
+        CursorShape::Beam => CursorShapeSetting::Bar,
+        CursorShape::Underline => CursorShapeSetting::Underline,
+        _ if mode.contains(TermMode::ALT_SCREEN) => CursorShapeSetting::Block,
+        _ => setting,
+    }
 }
 
 pub struct PrepaintState {
@@ -118,7 +338,7 @@ impl IntoElement for TerminalElement {
     }
 }
 
-fn cell_style(fg: Rgb, flags: Flags) -> CellStyle {
+pub fn cell_style(fg: Rgb, flags: Flags) -> CellStyle {
     CellStyle {
         fg,
         bold: flags.contains(Flags::BOLD),
@@ -142,7 +362,7 @@ fn styled_font(base: &Font, style: &CellStyle) -> Font {
     font
 }
 
-fn text_run(text_len: usize, font: &Font, style: &CellStyle) -> TextRun {
+pub fn text_run(text_len: usize, font: &Font, style: &CellStyle) -> TextRun {
     let color = to_hsla(style.fg);
     TextRun {
         len: text_len,
@@ -162,7 +382,7 @@ fn text_run(text_len: usize, font: &Font, style: &CellStyle) -> TextRun {
 }
 
 /// Final foreground and background for a cell, after bold, dim, inverse and hidden.
-fn cell_colors(fg: Color, bg: Color, flags: Flags, overrides: &alacritty_terminal::term::color::Colors, theme: &TerminalTheme) -> (Rgb, Rgb) {
+fn cell_colors(fg: Color, bg: Color, flags: Flags, overrides: &Colors, theme: &TerminalTheme) -> (Rgb, Rgb) {
     let mut fg = fg;
     if flags.contains(Flags::BOLD) {
         fg = colors::brighten(fg);
@@ -216,7 +436,7 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let settings = Settings::get(cx).clone();
-        let theme = colors::theme_named(&settings.terminal_theme);
+        let theme = colors::active_theme(cx);
         let (font, font_size, cell_width, line_height) = cell_metrics(&settings, window);
 
         let origin = point(bounds.origin.x + PADDING, bounds.origin.y + PADDING);
@@ -249,22 +469,13 @@ impl Element for TerminalElement {
         let overrides = content.colors;
         let display_offset = content.display_offset as i32;
         let selection = content.selection;
-        let default_bg = colors::resolve(Color::Named(NamedColor::Background), overrides, theme);
-        let selection_bg = theme.selection;
         let cursor_point = content.cursor.point;
         let cursor_shape = content.cursor.shape;
         let mode = content.mode;
 
-        let cell_origin = |line: usize, column: usize| -> Point<Pixels> {
-            point(origin.x + cell_width * column as f32, origin.y + line_height * line as f32)
-        };
-
-        let mut rects: Vec<(Bounds<Pixels>, Hsla)> = Vec::new();
-        let mut batches: Vec<Batch> = Vec::new();
-        let mut current: Option<Batch> = None;
-        let mut last_rect: Option<(usize, usize, usize, Rgb)> = None;
-        let mut cursor_cell: Option<(char, CellStyle, Rgb, bool)> = None;
-
+        let mut painter = CellPainter::new(overrides, theme, cell_width, line_height);
+        let default_bg = painter.default_bg;
+        let mut cursor_cell: Option<PaintedCell> = None;
         for indexed in content.display_iter {
             let grid_point = indexed.point;
             let line = (grid_point.line.0 + display_offset) as usize;
@@ -272,139 +483,34 @@ impl Element for TerminalElement {
             if line >= lines || column >= columns {
                 continue;
             }
-            let cell = indexed.cell;
-            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let wide = cell.flags.contains(Flags::WIDE_CHAR);
-            let width = if wide { 2 } else { 1 };
-            let (fg, mut bg) = cell_colors(cell.fg, cell.bg, cell.flags, overrides, theme);
-            let selected = selection.is_some_and(|range| range.contains(grid_point));
-            if selected {
-                bg = selection_bg;
-            }
+            let selected = selection.is_some_and(|range| range.contains(grid_point)).then_some(theme.selection);
+            let row_origin = point(origin.x, origin.y + line_height * line as f32);
+            let painted = painter.cell(line, row_origin, column, indexed.cell, selected);
             if grid_point == cursor_point {
-                cursor_cell = Some((cell.c, cell_style(fg, cell.flags), bg, wide));
-            }
-
-            if bg != default_bg {
-                match last_rect.as_mut() {
-                    Some((l, start, end, color)) if *l == line && *end == column && *color == bg => {
-                        *end = column + width;
-                    }
-                    _ => {
-                        if let Some((l, start, end, color)) = last_rect.take() {
-                            rects.push((
-                                Bounds::new(cell_origin(l, start), size(cell_width * (end - start) as f32, line_height)),
-                                to_hsla(color),
-                            ));
-                        }
-                        last_rect = Some((line, column, column + width, bg));
-                    }
-                }
-            }
-
-            let style = cell_style(fg, cell.flags);
-            let blank = cell.c == ' ' || cell.c == '\0' || cell.c == '\t';
-            let decorated = style.underline || style.undercurl || style.strike;
-            let continues = current.as_ref().is_some_and(|batch| {
-                !batch.wide
-                    && !wide
-                    && batch.line == line
-                    && batch.style == style
-                    && batch.end == column
-            });
-            if blank && !decorated && !continues {
-                if let Some(batch) = current.take() {
-                    batches.push(batch);
-                }
-                continue;
-            }
-            if !continues && let Some(batch) = current.take() {
-                batches.push(batch);
-            }
-            let batch = current.get_or_insert_with(|| Batch {
-                line,
-                column,
-                end: column,
-                text: String::new(),
-                style: style.clone(),
-                wide,
-            });
-            batch.text.push(if blank { ' ' } else { cell.c });
-            batch.end = column + width;
-            if let Some(extra) = cell.zerowidth() {
-                batch.text.extend(extra.iter().copied());
-            }
-            if wide {
-                batches.push(current.take().expect("batch was just created"));
+                cursor_cell = painted;
             }
         }
-        if let Some(batch) = current.take() {
-            batches.push(batch);
-        }
-        if let Some((l, start, end, color)) = last_rect.take() {
-            rects.push((
-                Bounds::new(cell_origin(l, start), size(cell_width * (end - start) as f32, line_height)),
-                to_hsla(color),
-            ));
-        }
+        let (rects, lines_out) = painter.finish(&font, font_size, window);
 
-        let text_system = window.text_system().clone();
-        let lines_out: Vec<(Point<Pixels>, ShapedLine)> = batches
-            .into_iter()
-            .filter_map(|batch| {
-                let decorated = batch.style.underline || batch.style.undercurl || batch.style.strike;
-                let text = if decorated { batch.text } else { batch.text.trim_end().to_owned() };
-                if text.is_empty() {
-                    return None;
-                }
-                let run = text_run(text.len(), &font, &batch.style);
-                let force = if batch.wide { cell_width * 2. } else { cell_width };
-                let shaped = text_system.shape_line(text.into(), font_size, &[run], Some(force));
-                Some((cell_origin(batch.line, batch.column), shaped))
-            })
-            .collect();
-
+        let cell_origin = |line: usize, column: usize| -> Point<Pixels> {
+            point(origin.x + cell_width * column as f32, origin.y + line_height * line as f32)
+        };
         let cursor_line = cursor_point.line.0 + display_offset;
         let show_cursor = cursor_shape != CursorShape::Hidden
             && (0..lines as i32).contains(&cursor_line)
             && cursor_point.column.0 < columns
             && (self.cursor_visible || !self.focused);
         let cursor = show_cursor.then(|| {
-            let line = cursor_line as usize;
-            let column = cursor_point.column.0;
-            let (ch, style, _, wide) = cursor_cell.clone().unwrap_or((
-                ' ',
-                cell_style(theme.foreground, Flags::empty()),
+            CursorPaint::new(
+                cell_origin(cursor_line as usize, cursor_point.column.0),
+                cursor_cell,
+                self::cursor_shape(cursor_shape, mode, settings.cursor_shape),
+                overrides[NamedColor::Cursor].unwrap_or(theme.cursor),
                 default_bg,
-                false,
-            ));
-            let cursor_color = overrides[NamedColor::Cursor].unwrap_or(theme.cursor);
-            let width = if wide { cell_width * 2. } else { cell_width };
-            let shape = match cursor_shape {
-                CursorShape::Beam => CursorShapeSetting::Bar,
-                CursorShape::Underline => CursorShapeSetting::Underline,
-                _ if mode.contains(TermMode::ALT_SCREEN) => CursorShapeSetting::Block,
-                _ => settings.cursor_shape,
-            };
-            let glyph = (shape == CursorShapeSetting::Block && self.focused && ch != ' ' && ch != '\0').then(|| {
-                let inverted = CellStyle {
-                    fg: default_bg,
-                    ..style
-                };
-                let text = ch.to_string();
-                let run = text_run(text.len(), &font, &inverted);
-                let shaped = text_system.shape_line(text.into(), font_size, &[run], Some(width));
-                (cell_origin(line, column), shaped)
-            });
-            CursorPaint {
-                bounds: Bounds::new(cell_origin(line, column), size(width, line_height)),
-                color: to_hsla(cursor_color),
-                shape,
-                hollow: !self.focused,
-                glyph,
-            }
+                self.focused,
+                (&font, font_size, cell_width, line_height),
+                window,
+            )
         });
 
         let search_rects = search
@@ -415,14 +521,9 @@ impl Element for TerminalElement {
                     return None;
                 }
                 let columns = end.column.0.saturating_sub(start.column.0) + 1;
-                let color = if active {
-                    gpui_kit::hsla(0.11, 0.95, 0.55, 0.55)
-                } else {
-                    gpui_kit::hsla(0.13, 0.9, 0.6, 0.28)
-                };
                 Some((
                     Bounds::new(cell_origin(line as usize, start.column.0), size(cell_width * columns as f32, line_height)),
-                    color,
+                    search_color(active),
                 ))
             })
             .collect();
@@ -458,11 +559,8 @@ impl Element for TerminalElement {
             window.paint_quad(fill(rect, color));
         }
 
-        if let Some(cursor) = state.cursor.as_ref()
-            && !cursor.hollow
-            && cursor.shape == CursorShapeSetting::Block
-        {
-            window.paint_quad(fill(cursor.bounds, cursor.color));
+        if let Some(cursor) = state.cursor.as_ref() {
+            cursor.paint_under(window);
         }
 
         for (origin, line) in &state.lines {
@@ -470,26 +568,17 @@ impl Element for TerminalElement {
         }
 
         if let Some(cursor) = state.cursor.take() {
-            let b = cursor.bounds;
-            if cursor.hollow {
-                window.paint_quad(outline(b, cursor.color, BorderStyle::Solid));
-            } else {
-                match cursor.shape {
-                    CursorShapeSetting::Block => {
-                        if let Some((origin, glyph)) = cursor.glyph {
-                            let _ = glyph.paint(origin, state.line_height, TextAlign::Left, None, window, cx);
-                        }
-                    }
-                    CursorShapeSetting::Bar => {
-                        window.paint_quad(fill(Bounds::new(b.origin, size(px(2.), b.size.height)), cursor.color));
-                    }
-                    CursorShapeSetting::Underline => {
-                        let y = b.origin.y + b.size.height - px(2.);
-                        window.paint_quad(fill(Bounds::new(point(b.origin.x, y), size(b.size.width, px(2.))), cursor.color));
-                    }
-                }
-            }
+            cursor.paint_over(state.line_height, window, cx);
         }
+    }
+}
+
+/// The highlight behind a search match.
+pub fn search_color(active: bool) -> Hsla {
+    if active {
+        gpui_kit::hsla(0.11, 0.95, 0.55, 0.55)
+    } else {
+        gpui_kit::hsla(0.13, 0.9, 0.6, 0.28)
     }
 }
 

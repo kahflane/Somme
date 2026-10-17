@@ -1,0 +1,6 @@
+# Only the cloud server goes into the image. Everything else, .env included,
+# stays out.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/somme-cloud/

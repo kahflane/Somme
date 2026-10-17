@@ -2,15 +2,15 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Icon, StyledExt as _, v_flex};
+use gpui_kit::component::{ActiveTheme as _, StyledExt as _, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _, Render, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _, Render, SharedString,
+    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::runtime;
 use crate::store::Store;
-use crate::ui::common::Lucide;
+use crate::ui::common::{APP_NAME, logo, notify_error, notify_ok};
 
 const MIN_PASSWORD: usize = 8;
 
@@ -84,25 +84,46 @@ impl LockScreen {
         self.busy = true;
         self.error = None;
         cx.notify();
-        let vault = store.read(cx).services.vault.clone();
+        let services = store.read(cx).services.clone();
         let remember = self.remember;
         let initialized = status.initialized;
         cx.spawn_in(window, async move |this, cx| {
             let result = runtime::io(async move {
                 if initialized {
-                    vault.unlock(&password, remember).await
+                    let status = services.vault.unlock(&password, remember).await?;
+                    // What this device had before it joined the account moves in now
+                    // that the account's vault is open.
+                    let merged = services.sync.merge_previous(&password).await;
+                    Ok((status, Some(merged)))
                 } else {
-                    vault.setup(&password, remember).await
+                    services.vault.setup(&password, remember).await.map(|status| (status, None))
                 }
             })
             .await;
             let _ = this.update_in(cx, |screen, window, cx| {
                 screen.busy = false;
                 match result {
-                    Ok(status) => {
+                    Ok((status, merged)) => {
                         screen.password.update(cx, |input, cx| input.set_value("", window, cx));
                         screen.confirm.update(cx, |input, cx| input.set_value("", window, cx));
                         Store::global(cx).update(cx, |store, cx| store.set_vault(status, cx));
+                        match merged {
+                            Some(Ok(report)) if report.secrets_lost > 0 => notify_error(
+                                window,
+                                cx,
+                                "Some saved passwords stayed behind",
+                                format!(
+                                    "{} passwords or keys from this device use a different master password, so they were not added to your account.",
+                                    report.secrets_lost
+                                ),
+                            ),
+                            Some(Ok(report)) if report.added > 0 => {
+                                let items = if report.added == 1 { "item" } else { "items" };
+                                notify_ok(cx, format!("Added {} {items} from this device to your account.", report.added))
+                            }
+                            Some(Err(err)) => notify_error(window, cx, "Could not add this device's data", err),
+                            _ => {}
+                        }
                     }
                     Err(err) => {
                         screen.error = Some(err.to_string());
@@ -137,11 +158,11 @@ impl Render for LockScreen {
         let setup = !status.initialized;
         let (title, detail) = if setup {
             (
-                "Create your vault",
+                SharedString::from("Create your vault"),
                 "Hosts, keys and passwords are encrypted with a master password. It never leaves this computer.",
             )
         } else {
-            ("Unlock Somme", "Enter your master password to open the vault.")
+            (format!("Unlock {APP_NAME}").into(), "Enter your master password to open the vault.")
         };
 
         let form = v_flex()
@@ -153,16 +174,7 @@ impl Render for LockScreen {
             .border_color(theme.border)
             .bg(theme.popover)
             .shadow_xl()
-            .child(
-                div()
-                    .size(px(48.))
-                    .rounded_lg()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(theme.primary.opacity(0.15))
-                    .child(Icon::new(Lucide::LockKeyhole).size(px(24.)).text_color(theme.primary)),
-            )
+            .child(logo(px(48.)))
             .child(div().text_xl().font_semibold().child(title))
             .child(div().text_sm().text_color(theme.muted_foreground).child(detail))
             .child(Input::new(&self.password).mask_toggle())

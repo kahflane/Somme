@@ -319,6 +319,13 @@ pub struct SftpOpened {
     pub home: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeReport {
+    pub added: usize,
+    pub secrets_lost: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {

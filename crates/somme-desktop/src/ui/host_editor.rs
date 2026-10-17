@@ -12,7 +12,7 @@ use somme_application::dto::{HostInput, HostView, SecretUpdate};
 use somme_domain::Id;
 
 use crate::store::mutate;
-use crate::ui::common::{HOST_COLORS, notify_error, notify_ok, parse_color};
+use crate::ui::common::{HOST_COLORS, notify_error, parse_color};
 use crate::ui::fields::{
     ChoiceState, choice_select, group_choices, host_choices, identity_choices, key_choices, selected, snippet_choices,
 };
@@ -199,10 +199,7 @@ impl HostEditor {
             |editor, result, window, cx| {
                 editor.saving = false;
                 match result {
-                    Ok(host) => {
-                        window.close_sheet(cx);
-                        notify_ok(window, cx, format!("Saved {}", host.label));
-                    }
+                    Ok(_) => window.close_sheet(cx),
                     Err(err) => {
                         editor.error = Some(err.to_string());
                         notify_error(window, cx, "Could not save host", err);

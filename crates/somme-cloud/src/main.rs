@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %config.addr, "somme cloud listening");
     axum::serve(
         listener,
-        router(service).into_make_service_with_connect_info::<SocketAddr>(),
+        router(service, config.client_ip_header.clone()).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

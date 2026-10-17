@@ -1,24 +1,38 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::{Arc, LazyLock};
 
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme as _, Icon, StyledExt as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Div, FocusHandle, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Window, div, px, rgb,
+    AnyElement, App, ClipboardItem, Div, FocusHandle, Hsla, Image, ImageFormat, Img, IntoElement, ParentElement as _,
+    Pixels, SharedString, Styled as _, Window, div, img, px, rgb,
 };
 
 pub use gpui_kit::assets::IconName as Lucide;
 
-/// Shows a backend error as a red toast.
-pub fn notify_error(window: &mut Window, cx: &mut App, title: &str, err: impl std::fmt::Display) {
-    window.push_notification(Notification::error(err.to_string()).title(title.to_owned()), cx);
+use crate::ui::native;
+
+/// The name people see. Data folders and keychain entries keep their old names.
+pub const APP_NAME: &str = "SommeCLI";
+
+/// The app logo, drawn from the bundled SVG.
+pub fn logo(size: Pixels) -> Img {
+    static LOGO: LazyLock<Arc<Image>> = LazyLock::new(|| {
+        Arc::new(Image::from_bytes(ImageFormat::Svg, include_bytes!("../../assets/logo.svg").to_vec()))
+    });
+    img(LOGO.clone()).size(size)
 }
 
-pub fn notify_ok(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
-    window.push_notification(Notification::success(message.into()), cx);
+/// Shows a backend error in the system's alert.
+pub fn notify_error(window: &mut Window, cx: &mut App, title: &str, err: impl std::fmt::Display) {
+    native::error(title, &err.to_string(), window, cx);
+}
+
+/// Posts good news to the system's notification center.
+pub fn notify_ok(cx: &App, message: impl Into<SharedString>) {
+    native::notify(&message.into(), "", cx);
 }
 
 /// The header row at the top of a page: title on the left, buttons on the right.
@@ -171,26 +185,11 @@ pub fn form_dialog(
 pub fn confirm_delete(
     title: impl Into<SharedString>,
     detail: impl Into<SharedString>,
-    delete: impl Fn(&mut Window, &mut App) + 'static,
+    delete: impl FnOnce(&mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let title = title.into();
-    let detail = detail.into();
-    let delete = Rc::new(delete);
-    window.open_alert_dialog(cx, move |alert, _, _| {
-        let delete = delete.clone();
-        alert
-            .confirm()
-            .title(title.clone())
-            .description(detail.clone())
-            .ok_text("Delete")
-            .ok_variant(ButtonVariant::Danger)
-            .on_ok(move |_, window, cx| {
-                delete(window, cx);
-                true
-            })
-    });
+    native::confirm(&title.into(), &detail.into(), "Delete", delete, window, cx);
 }
 
 /// A label above a form control, for dialogs.
@@ -207,7 +206,6 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
-pub fn copy_text(text: impl Into<String>, message: &str, window: &mut Window, cx: &mut App) {
+pub fn copy_text(text: impl Into<String>, cx: &mut App) {
     cx.write_to_clipboard(ClipboardItem::new_string(text.into()));
-    notify_ok(window, cx, message.to_owned());
 }

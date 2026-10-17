@@ -18,5 +18,5 @@ pub use remote::{
     ConnectContext, ConnectPlan, Endpoint, ForwardSpec, GatewayError, KeyCredential, RemoteEntry,
     RemoteFs, SshGateway, StopNotifier, Tunnel,
 };
-pub use sync::{SyncGateway, SyncOutcome, SyncState};
-pub use terminal::{OutputSink, PtyGateway, TermSize, Terminal};
+pub use sync::{SyncGateway, SyncOutcome, SyncState, VaultData};
+pub use terminal::{OutputSink, PtyGateway, ShellOptions, TermSize, Terminal};

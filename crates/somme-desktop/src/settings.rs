@@ -36,42 +36,71 @@ pub enum BellSetting {
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub appearance: Appearance,
+    /// App theme used in dark mode, by name.
+    pub dark_theme: String,
+    /// App theme used in light mode, by name.
+    pub light_theme: String,
+    /// Shows the snippets and themes panel next to terminals.
+    pub side_panel: bool,
+    /// Terminals use the app theme's own colors. When off, `terminal_theme` is used.
+    pub terminal_matches_theme: bool,
     pub font_family: String,
+    /// The terminal font is used for the whole app, not only terminals.
+    pub font_everywhere: bool,
+    /// Terminal text size.
     pub font_size: f32,
+    /// Base text size for the rest of the app. Menus, lists and forms scale with it.
+    pub ui_font_size: f32,
     pub line_height: f32,
     pub terminal_theme: String,
     pub cursor_shape: CursorShapeSetting,
     pub cursor_blink: bool,
     pub scrollback_lines: usize,
+    /// Local terminals show each command as a block, with a text editor for typing commands.
+    pub command_blocks: bool,
     pub copy_on_select: bool,
     pub paste_on_right_click: bool,
+    /// Lets a server set the clipboard (OSC 52), as tmux and vim do over SSH.
+    pub remote_clipboard_write: bool,
     pub option_as_meta: bool,
     pub bell: BellSetting,
     pub log_sessions: bool,
     pub confirm_close_tab: bool,
     pub keep_history: bool,
     pub auto_lock_minutes: u32,
+    /// Folders where the file editor may start language servers. Servers can run
+    /// code from the project, like build scripts, so each folder is trusted by hand.
+    pub trusted_folders: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             appearance: Appearance::Dark,
+            dark_theme: "Somme Dark".to_owned(),
+            light_theme: "Somme Light".to_owned(),
+            side_panel: false,
+            terminal_matches_theme: true,
             font_family: default_font().to_owned(),
+            font_everywhere: true,
             font_size: 14.,
+            ui_font_size: 14.,
             line_height: 1.25,
             terminal_theme: "Somme Dark".to_owned(),
             cursor_shape: CursorShapeSetting::Block,
             cursor_blink: true,
             scrollback_lines: 10_000,
+            command_blocks: true,
             copy_on_select: false,
             paste_on_right_click: false,
+            remote_clipboard_write: false,
             option_as_meta: true,
             bell: BellSetting::Visual,
             log_sessions: false,
             confirm_close_tab: true,
             keep_history: true,
             auto_lock_minutes: 0,
+            trusted_folders: Vec::new(),
         }
     }
 }
