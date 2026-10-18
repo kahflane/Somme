@@ -6,6 +6,7 @@ mod github;
 mod host_os;
 mod look;
 mod mcp;
+mod open_with;
 mod runtime;
 mod search;
 mod services;
@@ -100,11 +101,30 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     runtime::init()?;
+    // When Somme already runs, it opens what this copy was asked to.
+    let asked = open_with::from_args();
+    if let Ok(data_dir) = services::data_dir()
+        && open_with::hand_over(&data_dir, &asked)
+    {
+        return Ok(());
+    }
     mcp::claim();
     let (events_tx, events_rx) = mpsc::unbounded();
     let services = Arc::new(runtime::block_on(Services::build(events_tx))?);
+    let (asks, asks_rx) = mpsc::unbounded();
+    if !asked.is_empty() {
+        let _ = asks.unbounded_send(asked);
+    }
 
-    gpui_kit::application().with_assets(host_os::Assets).run(move |cx| {
+    let app = gpui_kit::application().with_assets(host_os::Assets);
+    // macOS sends files from Finder this way, even before the window is up.
+    app.on_open_urls({
+        let asks = asks.clone();
+        move |urls| {
+            let _ = asks.unbounded_send(open_with::from_urls(urls));
+        }
+    });
+    app.run(move |cx| {
         // Windows and Linux name the app in notifications by this.
         cx.set_app_identity("app.somme.desktop", ui::common::APP_NAME);
         gpui_kit::init(cx);
@@ -133,12 +153,25 @@ fn main() -> anyhow::Result<()> {
             ..TitleBar::window_options()
         };
         let quit_services = services.clone();
-        let (window, _workspace) = gpui_kit::open_window(options, cx, move |window, cx| {
+        let data_dir = services.data_dir.clone();
+        let (window, workspace) = gpui_kit::open_window(options, cx, move |window, cx| {
             cx.new(|cx| Workspace::new(services, window, cx))
         })
         .expect("open window");
         pump_events(events_rx, window, cx);
+        let listening = open_with::listen(&data_dir, asks)
+            .inspect_err(|err| tracing::warn!(%err, "other copies of Somme can't hand files to this one"))
+            .ok();
+        open_with::pump(asks_rx, window, workspace, cx);
+        std::thread::spawn(move || {
+            if let Err(err) = open_with::register(&data_dir) {
+                tracing::warn!("could not add Somme to Open With: {err:#}");
+            }
+        });
+        let mut listening = Some(listening);
         cx.on_app_quit(move |_| {
+            // A copy started from now on opens by itself.
+            drop(listening.take());
             let services = quit_services.clone();
             async move { runtime::io(async move { services.shutdown().await }).await }
         })

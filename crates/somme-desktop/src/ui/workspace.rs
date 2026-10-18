@@ -13,7 +13,7 @@ use gpui_kit::component::{
 use futures::FutureExt as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Axis, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, KeyBinding, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
+    IntoElement, KeyBinding, MouseButton, ParentElement as _, PathPromptOptions, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _,
     Styled as _, Subscription, WeakEntity, Window, actions, div, prelude::FluentBuilder as _, px,
 };
@@ -231,6 +231,27 @@ struct Renaming {
     _subscription: Subscription,
 }
 
+/// Which tabs a "Close …" item in a tab's menu closes.
+#[derive(Clone, Copy)]
+enum CloseTabs {
+    Others,
+    Left,
+    Right,
+    All,
+}
+
+impl CloseTabs {
+    /// Whether the tab at `ix` goes, for the menu of the tab at `clicked`.
+    fn picks(self, ix: usize, clicked: usize) -> bool {
+        match self {
+            CloseTabs::Others => ix != clicked,
+            CloseTabs::Left => ix < clicked,
+            CloseTabs::Right => ix > clicked,
+            CloseTabs::All => true,
+        }
+    }
+}
+
 /// A tab being dragged to a new place. It also draws itself under the pointer.
 #[derive(Clone)]
 struct DraggedTab {
@@ -289,6 +310,8 @@ pub struct Workspace {
     /// Last key press, click or scroll. Auto-lock counts idle time from here.
     last_activity: Instant,
     renaming: Option<Renaming>,
+    /// The tab strip, which scrolls when the tabs don't fit.
+    tab_scroll: ScrollHandle,
     /// The pinned tabs as last saved, so they are written only when they change.
     pinned_saved: Vec<Pinned>,
     /// Pinned servers waiting for the vault to open before they connect.
@@ -338,6 +361,7 @@ impl Workspace {
             side_panel: None,
             last_activity: Instant::now(),
             renaming: None,
+            tab_scroll: ScrollHandle::new(),
             pinned_saved: Vec::new(),
             waiting_pins: Vec::new(),
             _subscriptions: subscriptions,
@@ -881,6 +905,19 @@ impl Workspace {
         }
     }
 
+    /// Opens what Somme was asked to open from outside it: a folder in a new
+    /// terminal there, a file in the editor. Files are never handed back to
+    /// the system, which may send them here again.
+    pub fn open_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        for path in paths {
+            if path.is_dir() {
+                self.open_terminal_in(SessionTarget::Local, Some(path), window, cx);
+            } else {
+                self.edit_local_file(path, None, window, cx);
+            }
+        }
+    }
+
     /// Opens a file on this computer in a tab of its own, with the cursor on
     /// `line`. Images, PDFs and the like open in the system's app.
     fn open_local_file(&mut self, path: PathBuf, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
@@ -888,6 +925,11 @@ impl Workspace {
             cx.open_with_system(&path);
             return;
         }
+        self.edit_local_file(path, line, window, cx);
+    }
+
+    /// Opens a file on this computer in the editor, or says why it can't.
+    fn edit_local_file(&mut self, path: PathBuf, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
         if self.show_local_file(&path, line, window, cx) {
             return;
         }
@@ -1097,6 +1139,7 @@ impl Workspace {
         self.active = index.filter(|ix| *ix < self.tabs.len());
         self.section = Section::Cli;
         if let Some(ix) = self.active {
+            self.tab_scroll.scroll_to_item(ix);
             if let TabContent::Terminal(_) = self.tabs[ix].content {
                 self.last_terminal = Some(self.tabs[ix].id);
             }
@@ -1248,14 +1291,43 @@ impl Workspace {
         }
     }
 
-    /// Closes a tab, asking first when sessions in it are still connected.
-    fn request_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(ix) else { return };
-        let unsaved = match &tab.content {
+    fn has_unsaved(tab: &Tab, cx: &App) -> bool {
+        match &tab.content {
             TabContent::Terminal(term) => term.read(cx).has_unsaved(cx),
             TabContent::Editor(pane) => pane.read(cx).has_changes(),
             TabContent::Changes(_) => false,
-        };
+        }
+    }
+
+    /// Closes the tabs `which` picks around the tab at `ix`, without asking.
+    /// Pinned tabs stay, and so do tabs with unsaved files, so no typing is lost.
+    fn close_tabs(&mut self, ix: usize, which: CloseTabs, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(clicked) = self.tabs.get(ix).map(|tab| tab.id) else { return };
+        let front = self.active.and_then(|active| self.tabs.get(active)).map(|tab| tab.id);
+        let ids: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(other, tab)| which.picks(*other, ix) && !tab.pinned && !Self::has_unsaved(tab, cx))
+            .map(|(_, tab)| tab.id)
+            .collect();
+        for id in ids {
+            self.remove_tab(id, window, cx);
+        }
+        // The tab in front stays there. When it closed, the clicked one comes forward.
+        let next = [front, Some(clicked)]
+            .into_iter()
+            .flatten()
+            .find_map(|id| self.tabs.iter().position(|tab| tab.id == id));
+        if next.is_some() && self.section == Section::Cli {
+            self.activate(next, window, cx);
+        }
+    }
+
+    /// Closes a tab, asking first when sessions in it are still connected.
+    fn request_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix) else { return };
+        let unsaved = Self::has_unsaved(tab, cx);
         let id = tab.id;
         let running = Settings::get(cx).confirm_close_tab && self.tab_is_running(ix, cx);
         if !unsaved && !running {
@@ -1385,7 +1457,10 @@ impl Workspace {
             theme.foreground.opacity(0.14),
         );
         let workspace = cx.entity().downgrade();
+        // Which tabs the close items in a tab's menu would reach.
+        let closable: Vec<bool> = self.tabs.iter().map(|tab| !tab.pinned).collect();
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
+            let (left, right) = (closable[..ix].contains(&true), closable[ix + 1..].contains(&true));
             let selected = self.section == Section::Cli && self.active == Some(ix);
             // Only terminal tabs can be renamed.
             let changes = !matches!(tab.content, TabContent::Terminal(_));
@@ -1433,6 +1508,8 @@ impl Workspace {
                 .h(px(26.))
                 .min_w(px(if pinned { 0. } else { 110. }))
                 .max_w(px(if pinned { 160. } else { 220. }))
+                // Short already; when tabs run out of room, the others give way.
+                .when(pinned, |el| el.flex_none())
                 .pl_2()
                 .pr(px(if pinned { 8. } else { 4. }))
                 .flex()
@@ -1501,6 +1578,12 @@ impl Workspace {
                 .context_menu(move |menu, _, _| {
                     let (rename, reset, close) = (menu_workspace.clone(), menu_workspace.clone(), menu_workspace.clone());
                     let pin = menu_workspace.clone();
+                    let close_item = |label: &'static str, which: CloseTabs, enabled: bool| {
+                        let workspace = menu_workspace.clone();
+                        PopupMenuItem::new(label).disabled(!enabled).on_click(move |_, window, cx| {
+                            let _ = workspace.update(cx, |workspace, cx| workspace.close_tabs(ix, which, window, cx));
+                        })
+                    };
                     menu.when(!changes, |menu| {
                         menu.item(PopupMenuItem::new("Rename…").icon(Icon::new(Lucide::Pencil)).on_click(
                             move |_, window, cx| {
@@ -1527,9 +1610,14 @@ impl Workspace {
                                 let _ = pin.update(cx, |workspace, cx| workspace.toggle_pin(ix, cx));
                             }),
                     )
+                    .separator()
                     .item(PopupMenuItem::new("Close Tab").icon(IconName::Close).on_click(move |_, window, cx| {
                         let _ = close.update(cx, |workspace, cx| workspace.request_close_tab(ix, window, cx));
                     }))
+                    .item(close_item("Close Other Tabs", CloseTabs::Others, left || right))
+                    .item(close_item("Close Tabs to the Left", CloseTabs::Left, left))
+                    .item(close_item("Close Tabs to the Right", CloseTabs::Right, right))
+                    .item(close_item("Close All Tabs", CloseTabs::All, left || right || !pinned))
                 })
         });
 
@@ -1551,13 +1639,20 @@ impl Workspace {
                     .menu_with_icon("Broadcast Input", Icon::new(Lucide::RadioTower), Box::new(ToggleBroadcast))
             });
 
+        // The tabs scroll; the new tab button stays in sight after them.
         h_flex()
-            .id("tab-strip")
             .flex_1()
             .min_w_0()
             .gap_1()
-            .overflow_x_scroll()
-            .children(tabs)
+            .child(
+                h_flex()
+                    .id("tab-strip")
+                    .min_w_0()
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll)
+                    .children(tabs),
+            )
             .child(new_tab)
     }
 
@@ -1575,9 +1670,13 @@ impl Workspace {
             // The kit keeps room for the window buttons, which full screen hides.
             .when(window.is_fullscreen(), |bar| bar.pl_0())
             .child(
+                // The kit's bar grows to fit what is in it, so many tabs would
+                // push the buttons out of the window. Laid over the room the
+                // bar has instead, the tabs scroll and the buttons stay.
+                div().flex_1().h_full().relative().child(
                 h_flex()
-                    .flex_1()
-                    .min_w_0()
+                    .absolute()
+                    .inset_0()
                     .pr_2()
                     .gap_2()
                     .child(self.render_tab_strip(cx))
@@ -1636,6 +1735,7 @@ impl Workspace {
                                 .on_click(cx.listener(|workspace, _, window, cx| workspace.on_lock(&LockVault, window, cx))),
                         )
                     }),
+                ),
             )
     }
 
@@ -1948,4 +2048,18 @@ fn fake_github() -> bool {
     return crate::github::api::fake_api().is_some();
     #[cfg(not(feature = "snapshot"))]
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CloseTabs;
+
+    #[test]
+    fn close_items_pick_the_right_tabs() {
+        let picked = |which: CloseTabs| (0..5).filter(|ix| which.picks(*ix, 2)).collect::<Vec<_>>();
+        assert_eq!(picked(CloseTabs::Others), [0, 1, 3, 4]);
+        assert_eq!(picked(CloseTabs::Left), [0, 1]);
+        assert_eq!(picked(CloseTabs::Right), [3, 4]);
+        assert_eq!(picked(CloseTabs::All), [0, 1, 2, 3, 4]);
+    }
 }

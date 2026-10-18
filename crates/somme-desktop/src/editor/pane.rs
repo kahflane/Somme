@@ -11,9 +11,10 @@ use std::time::Duration;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::highlighter::LanguageRegistry;
 use gpui_kit::component::input::{
-    Copy, Cut, Editor, EditorState, GoToDefinition, InputEvent, Paste, Position, Rope, RopeExt as _, SelectAll,
+    Copy, Cut, Editor, EditorState, GoToDefinition, InputEvent, Paste, Position, Rope, RopeExt as _, Search,
+    SelectAll,
 };
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, KeyBinding, MouseButton, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
@@ -23,12 +24,15 @@ use gpui_kit::{
 use crate::editor::big::{BigText, BigTextEvent};
 use crate::editor::language::{self, Language};
 use crate::editor::lsp::{self, Client, DocProvider, Status};
+use crate::editor::markdown::MarkdownPreview;
 use crate::settings::Settings;
 use crate::editor::sudo;
 use crate::editor::tools::{self, Tool};
 use crate::terminal::disk::{Disk, DiskError};
 use crate::ui::common::Lucide;
 use crate::ui::native;
+
+mod find;
 
 actions!(editor_pane, [SaveFile, CloseFile]);
 
@@ -96,6 +100,15 @@ impl FileText {
             Self::Big(text) => text.len() == 0,
         }
     }
+}
+
+/// How a Markdown file shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Source,
+    Split,
+    /// The preview, which is also edited in place.
+    Preview,
 }
 
 /// What shows a file's text.
@@ -202,7 +215,33 @@ struct OpenFile {
     /// Writes a scratch file's text once typing stops.
     autosave: Option<Task<()>>,
     help: Help,
+    /// The find bar of a JSON file, with jq.
+    find: Option<find::FindBar>,
+    view: View,
+    /// A Markdown file's preview, made when first shown.
+    preview: Option<Entity<MarkdownPreview>>,
     _subscriptions: [Subscription; 2],
+}
+
+impl OpenFile {
+    fn is_markdown(&self) -> bool {
+        matches!(self.body, Body::Code(_)) && self.language.is_some_and(|language| language.grammar == "markdown")
+    }
+
+    /// Focuses what shows the file: the preview, when only it shows.
+    fn focus(&self, window: &mut Window, cx: &mut App) {
+        match (&self.preview, self.view) {
+            (Some(preview), View::Preview) => window.focus(&preview.focus_handle(cx), cx),
+            _ => self.body.focus(window, cx),
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match (&self.preview, self.view) {
+            (Some(preview), View::Preview) => preview.focus_handle(cx),
+            _ => self.body.focus_handle(cx),
+        }
+    }
 }
 
 impl OpenFile {
@@ -238,6 +277,8 @@ pub struct EditorPane {
     /// Fills a tab of its own, instead of sitting beside terminals.
     own_tab: bool,
     focus_handle: FocusHandle,
+    /// How the last Markdown file was shown, for the next one.
+    markdown_view: View,
     _quit: Option<Subscription>,
 }
 
@@ -250,6 +291,7 @@ impl EditorPane {
             active: 0,
             own_tab: false,
             focus_handle: cx.focus_handle(),
+            markdown_view: View::Preview,
             _quit: None,
         }
     }
@@ -294,13 +336,15 @@ impl EditorPane {
         if self.show_open(&path, &disk, window, cx) {
             return;
         }
+        // JSON files get a find bar of their own, which also runs jq.
+        let json = language::detect(&path).is_some_and(|language| language.grammar == "json");
         let (body, language, colored, help, subscriptions) = match text {
             FileText::Code(text) => {
                 let language = language::detect(&path);
                 let colored = language.is_some_and(|l| LanguageRegistry::singleton().language(l.grammar).is_some());
                 let size = text.len();
                 let editor = cx.new(|cx| {
-                    let editor = EditorState::new(window, cx).default_value(text);
+                    let editor = EditorState::new(window, cx).default_value(text).searchable(!json);
                     match language.filter(|_| colored) {
                         Some(language) => editor.language(language.grammar),
                         None => editor,
@@ -324,10 +368,16 @@ impl EditorPane {
                 (Body::Code(editor), language, colored, help, subscriptions)
             }
             FileText::Big(text) => {
-                let editor = cx.new(|cx| BigText::new(text, cx));
+                let editor = cx.new(|cx| {
+                    let editor = BigText::new(text, cx);
+                    if json { editor.with_jq() } else { editor }
+                });
                 let subscriptions = [
                     cx.observe(&editor, |_, _, cx| cx.notify()),
-                    cx.subscribe(&editor, |pane, editor, _: &BigTextEvent, cx| pane.changed(editor.entity_id(), cx)),
+                    cx.subscribe_in(&editor, window, |pane, editor, event: &BigTextEvent, window, cx| match event {
+                        BigTextEvent::Changed => pane.changed(editor.entity_id(), cx),
+                        BigTextEvent::Jq => pane.open_find(Some(find::FindMode::Jq), window, cx),
+                    }),
                 ];
                 let help = Help::None("Big file: plain text only".into());
                 (Body::Big(editor), None, false, help, subscriptions)
@@ -345,8 +395,15 @@ impl EditorPane {
             scratch: false,
             autosave: None,
             help,
+            find: None,
+            view: View::Source,
+            preview: None,
             _subscriptions: subscriptions,
         });
+        let ix = self.files.len() - 1;
+        if self.files[ix].is_markdown() {
+            self.set_view(ix, self.markdown_view, window, cx);
+        }
         self.activate(self.files.len() - 1, window, cx);
         cx.emit(EditorPaneEvent::FilesChanged);
     }
@@ -633,7 +690,23 @@ impl EditorPane {
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(file) = self.files.get(ix) else { return };
         self.active = ix;
-        file.body.focus(window, cx);
+        file.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Shows Markdown file `ix` as its source, its preview, or both.
+    fn set_view(&mut self, ix: usize, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.files.get_mut(ix) else { return };
+        let Body::Code(editor) = &file.body else { return };
+        if view != View::Source && file.preview.is_none() {
+            let (editor, path, disk) = (editor.clone(), file.path.clone(), file.disk.clone());
+            file.preview = Some(cx.new(|cx| MarkdownPreview::new(editor, &path, disk, cx)));
+        }
+        file.view = view;
+        self.markdown_view = view;
+        if ix == self.active {
+            file.focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -943,6 +1016,28 @@ impl EditorPane {
                 )
             })
             .child(div().flex_none().child(language))
+            .when(file.is_markdown(), |bar| bar.child(self.render_views(file, cx)))
+    }
+
+    /// Buttons to show a Markdown file as its source, its preview, or both.
+    fn render_views(&self, file: &OpenFile, cx: &Context<Self>) -> impl IntoElement {
+        let ix = self.active;
+        let button = |id: &'static str, icon: Lucide, tooltip: &'static str, view: View| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(icon))
+                .tooltip(tooltip)
+                .selected(file.view == view)
+                .tab_stop(false)
+                .on_click(cx.listener(move |pane, _, window, cx| pane.set_view(ix, view, window, cx)))
+        };
+        h_flex()
+            .flex_none()
+            .gap_0p5()
+            .child(button("md-source", Lucide::Code, "Markdown", View::Source))
+            .child(button("md-split", Lucide::Columns2, "Side by side", View::Split))
+            .child(button("md-preview", Lucide::Eye, "Preview, which you can edit", View::Preview))
     }
 }
 
@@ -1039,7 +1134,7 @@ fn write_text(disk: &Disk, path: &Path, text: &Rope) -> Result<(), DiskError> {
 impl Focusable for EditorPane {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self.files.get(self.active) {
-            Some(file) => file.body.focus_handle(cx),
+            Some(file) => file.focus_handle(cx),
             None => self.focus_handle.clone(),
         }
     }
@@ -1055,6 +1150,8 @@ impl Render for EditorPane {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::on_close_file))
+            // Reaches here from JSON files only; other files find with the editor's own bar.
+            .on_action(cx.listener(|pane, _: &Search, window, cx| pane.open_find(None, window, cx)))
             .on_action(cx.listener(|pane, _: &tools::FormatDocument, window, cx| pane.run_tool(Tool::FormatDocument, window, cx)))
             .on_action(cx.listener(|pane, _: &tools::FormatJson, window, cx| pane.run_tool(Tool::FormatJson, window, cx)))
             .on_action(cx.listener(|pane, _: &tools::MinifyJson, window, cx| pane.run_tool(Tool::MinifyJson, window, cx)))
@@ -1095,7 +1192,19 @@ impl Render for EditorPane {
                         .into_any_element(),
                     Body::Big(editor) => editor.clone().into_any_element(),
                 };
-                pane.child(div().flex_1().min_h_0().child(body)).child(self.render_status(file, cx))
+                let body = match (&file.preview, file.view) {
+                    (Some(preview), View::Preview) => preview.clone().into_any_element(),
+                    (Some(preview), View::Split) => h_flex()
+                        .size_full()
+                        .child(div().flex_1().min_w_0().h_full().child(body))
+                        .child(div().flex_1().min_w_0().h_full().border_l_1().border_color(theme.border).child(preview.clone()))
+                        .into_any_element(),
+                    _ => body,
+                };
+                pane.children(self.render_find(file, cx))
+                    .child(div().flex_1().min_h_0().child(body))
+                    .children(self.render_jq_results(file, cx))
+                    .child(self.render_status(file, cx))
             })
     }
 }

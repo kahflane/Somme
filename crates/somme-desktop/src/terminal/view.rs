@@ -28,6 +28,7 @@ use crate::ui::common::logo;
 use crate::ui::workspace::{SplitDown, SplitLeft, SplitRight, SplitUp};
 
 mod blocks;
+mod drop;
 mod links;
 mod picker;
 mod prompt;
@@ -181,6 +182,9 @@ pub struct TerminalView {
     pending_insert: Option<String>,
     /// A command was sent and the shell has not started it yet.
     awaiting_block: bool,
+    /// Uploads of files dropped on a server's shell.
+    notes: Vec<drop::Note>,
+    next_note: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -232,6 +236,8 @@ impl TerminalView {
             picker: None,
             pending_insert: None,
             awaiting_block: false,
+            notes: Vec::new(),
+            next_note: 0,
             _subscriptions: subscriptions,
         };
         view.reset_blink(cx);
@@ -978,6 +984,7 @@ impl Render for TerminalView {
                 surface.child(div().absolute().inset_0().border_2().border_color(cx.theme().warning.opacity(0.7)))
             })
             .children(self.render_search(cx))
+            .children(self.render_notes(cx))
             .children(self.render_status(cx));
 
         let focus = self.focus_handle.clone();
@@ -1003,7 +1010,7 @@ impl Render for TerminalView {
                 .separator()
                 .menu("Clear", Box::new(Clear))
         });
-        if blocks_mode {
+        let body = if blocks_mode {
             v_flex()
                 .size_full()
                 .child(surface)
@@ -1011,7 +1018,8 @@ impl Render for TerminalView {
                 .into_any_element()
         } else {
             surface.into_any_element()
-        }
+        };
+        div().size_full().relative().child(body).children(self.render_drop_target(cx))
     }
 }
 

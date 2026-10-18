@@ -1,7 +1,8 @@
 //! Sets `Somme --service` to start at login, so agents keep working while the
 //! app is closed: a launchd agent on macOS, a systemd user service on Linux,
 //! and a Run entry on Windows. Test data folders get the files written next
-//! to them instead, and nothing is run.
+//! to them instead, and nothing is run. The steps are also used to show
+//! Somme in the system's "Open With" lists (see `open_with`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,6 +31,9 @@ pub struct Target {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
     Write(PathBuf, String),
+    /// Writes text as UTF-16, as Windows tools like `reg import` want it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WriteUtf16(PathBuf, String),
     Remove(PathBuf),
     /// Runs a program and waits. `may_fail` is for undoing what may not be there.
     Run {
@@ -41,7 +45,7 @@ pub enum Step {
     Start { program: String, args: Vec<String> },
 }
 
-fn run(program: &str, args: &[&str], may_fail: bool) -> Step {
+pub fn run(program: &str, args: &[&str], may_fail: bool) -> Step {
     Step::Run {
         program: program.to_owned(),
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
@@ -49,11 +53,11 @@ fn run(program: &str, args: &[&str], may_fail: bool) -> Step {
     }
 }
 
-fn describe(steps: &[Step]) -> String {
+pub fn describe(steps: &[Step]) -> String {
     steps
         .iter()
         .map(|step| match step {
-            Step::Write(path, text) => format!("write {}\n{text}\n", path.display()),
+            Step::Write(path, text) | Step::WriteUtf16(path, text) => format!("write {}\n{text}\n", path.display()),
             Step::Remove(path) => format!("remove {}\n", path.display()),
             Step::Run { program, args, .. } => format!("run {program} {}\n", args.join(" ")),
             Step::Start { program, args } => format!("start {program} {}\n", args.join(" ")),
@@ -61,7 +65,7 @@ fn describe(steps: &[Step]) -> String {
         .collect()
 }
 
-fn xml(text: &str) -> String {
+pub fn xml(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -210,7 +214,7 @@ pub fn apply(agents_dir: &Path, on: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if target.data_dir.is_some() {
-        dry_run(agents_dir, &steps)?;
+        dry_run(&agents_dir.join("service-files"), &steps)?;
     } else {
         for step in &steps {
             perform(step)?;
@@ -223,12 +227,11 @@ pub fn apply(agents_dir: &Path, on: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Shows what would be done, for test data folders.
-fn dry_run(agents_dir: &Path, steps: &[Step]) -> anyhow::Result<()> {
-    let out = agents_dir.join("service-files");
-    std::fs::create_dir_all(&out)?;
+/// Shows what would be done, in the folder `out`, for test data folders.
+pub fn dry_run(out: &Path, steps: &[Step]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(out)?;
     for step in steps {
-        if let Step::Write(path, text) = step
+        if let Step::Write(path, text) | Step::WriteUtf16(path, text) = step
             && let Some(name) = path.file_name()
         {
             std::fs::write(out.join(name), text)?;
@@ -238,13 +241,20 @@ fn dry_run(agents_dir: &Path, steps: &[Step]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn perform(step: &Step) -> anyhow::Result<()> {
+pub fn perform(step: &Step) -> anyhow::Result<()> {
     match step {
         Step::Write(path, text) => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(path, text)?;
+        }
+        Step::WriteUtf16(path, text) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let bytes: Vec<u8> = [0xfeff].into_iter().chain(text.encode_utf16()).flat_map(u16::to_le_bytes).collect();
+            std::fs::write(path, bytes)?;
         }
         Step::Remove(path) => match std::fs::remove_file(path) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
@@ -344,7 +354,7 @@ mod tests {
     fn test_folders_only_get_the_files() {
         let dir = tempfile::tempdir().unwrap();
         let steps = steps(&target(), true);
-        dry_run(dir.path(), &steps).unwrap();
+        dry_run(&dir.path().join("service-files"), &steps).unwrap();
         assert!(std::fs::read_to_string(dir.path().join("service-files/steps.txt")).unwrap().contains("run "));
     }
 }

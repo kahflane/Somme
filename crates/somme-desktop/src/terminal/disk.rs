@@ -15,6 +15,8 @@ use crate::runtime;
 
 /// How often a server search looks whether it should stop.
 const STOP_CHECK: Duration = Duration::from_millis(100);
+/// Deeper folders are almost always a link that loops.
+const MAX_DEPTH: usize = 32;
 
 #[derive(Clone)]
 pub enum Disk {
@@ -262,6 +264,24 @@ impl Disk {
         })
     }
 
+    /// The home folder, asking the server when the shell has not said.
+    pub fn find_home(&self) -> Option<PathBuf> {
+        match self {
+            Disk::Remote { files, home: None } => block(files.home()).ok().map(PathBuf::from),
+            _ => self.home(),
+        }
+    }
+
+    /// Copies a file or folder on this computer into the server folder `dir`,
+    /// with all that is in it. Files with the same name are replaced. Gives
+    /// how many files were copied.
+    pub fn upload(&self, local: &Path, dir: &Path) -> Result<u64, DiskError> {
+        let Disk::Remote { files, .. } = self else {
+            return Err(DiskError::Other("This is not a server.".into()));
+        };
+        upload(files.as_ref(), local, &remote(dir), 0)
+    }
+
     /// Runs `work` with this disk on a thread that may block.
     pub fn run<T: Send + 'static>(self, work: impl FnOnce(&Disk) -> T + Send + 'static) -> impl Future<Output = T> {
         runtime::io(async move {
@@ -279,6 +299,34 @@ pub fn too_big(size: u64, limit: u64) -> String {
 
 fn no_local_sudo() -> DiskError {
     DiskError::Other("Somme uses sudo only for files on servers.".into())
+}
+
+fn upload(files: &dyn RemoteFs, local: &Path, dir: &str, depth: usize) -> Result<u64, DiskError> {
+    let name = local.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(DiskError::Other(format!("{} has a name the server can't take.", local.display())));
+    }
+    let target = if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
+    // Follows links, as the copy should hold what they point at.
+    let meta = std::fs::metadata(local)?;
+    if meta.is_file() {
+        block(files.upload(local, &target))?;
+        return Ok(1);
+    }
+    // Pipes and devices may never end.
+    if !meta.is_dir() {
+        return Ok(0);
+    }
+    if depth >= MAX_DEPTH {
+        return Err(DiskError::Other(format!("{} is nested too deep.", local.display())));
+    }
+    // The folder may be there already. A real problem shows up on the first file.
+    let _ = block(files.mkdir(&target));
+    let mut count = 0;
+    for entry in std::fs::read_dir(local)? {
+        count += upload(files, &entry?.path(), &target, depth + 1)?;
+    }
+    Ok(count)
 }
 
 /// A server path as the server writes it.
@@ -319,6 +367,27 @@ mod tests {
         assert!(matches!(Disk::Local.read(&dir.path().join("missing"), 1024), Err(DiskError::Other(_))));
         assert_eq!(DiskError::from(GatewayError::SudoWrongPassword), DiskError::Password { wrong: true });
         assert_eq!(DiskError::from(GatewayError::Session("no sudo".into())), DiskError::Other("no sudo".into()));
+    }
+
+    #[test]
+    fn a_folder_goes_up_with_all_inside() {
+        let (here, server) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let project = here.path().join("my project");
+        std::fs::create_dir_all(project.join("src/deep")).unwrap();
+        std::fs::write(project.join("README.md"), "hi").unwrap();
+        std::fs::write(project.join("src/deep/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(here.path().join("notes.txt"), "notes").unwrap();
+        std::fs::create_dir_all(server.path().join("home/me")).unwrap();
+        let disk = fake::disk(server.path());
+        let home = Path::new(fake::HOME);
+        assert_eq!(disk.upload(&project, home), Ok(2));
+        assert_eq!(disk.upload(&here.path().join("notes.txt"), home), Ok(1));
+        // Again, over what is there now.
+        assert_eq!(disk.upload(&project, home), Ok(2));
+        let up = server.path().join("home/me");
+        assert_eq!(std::fs::read_to_string(up.join("my project/src/deep/main.rs")).unwrap(), "fn main() {}");
+        assert_eq!(std::fs::read_to_string(up.join("notes.txt")).unwrap(), "notes");
+        assert!(Disk::Local.upload(&project, home).is_err());
     }
 }
 

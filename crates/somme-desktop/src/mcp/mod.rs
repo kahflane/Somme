@@ -5,12 +5,12 @@
 //! script is written to the script log before it runs.
 
 mod bridge;
-mod install;
+pub mod install;
 mod log;
 mod protocol;
 mod server;
 mod service;
-mod transport;
+pub mod transport;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -247,13 +247,13 @@ impl Agents {
 }
 
 #[cfg(unix)]
-fn make_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn make_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
-fn make_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn make_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }

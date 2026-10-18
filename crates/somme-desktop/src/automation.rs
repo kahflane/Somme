@@ -4,13 +4,14 @@
 //! Run with `SOMME_SCRIPT=steps.txt`. One step per line:
 //! `wait 500`, `key cmd-t`, `type hello`, `click 120 40`, `move 120 40`, `drag 10 10 200 10`, `scroll 120 40 -300`,
 //! `action workspace::NewTab`, `bench X Y N` (scrolls N times and prints the average frame time),
+//! `files X Y a.txt | my folder` (drags files from outside over the window), `release X Y` (drops them),
 //! `shot out.png`, `quit`. Lines starting with `#` are skipped.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::{
-    AnyWindowHandle, App, AsyncApp, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+    AnyWindowHandle, App, AsyncApp, ExternalPaths, FileDropEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
     ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 
@@ -196,6 +197,32 @@ async fn run_step(line: &str, base: &Path, window: AnyWindowHandle, cx: &mut Asy
                 cx,
             )?;
             cx.background_executor().timer(pause).await;
+        }
+        "files" | "release" => {
+            let mut parts = arg.splitn(3, ' ');
+            let (Some(Ok(x)), Some(Ok(y))) = (parts.next().map(str::parse::<f32>), parts.next().map(str::parse::<f32>)) else {
+                anyhow::bail!("expected: files X Y PATH | PATH, or release X Y");
+            };
+            let position = point(px(x), px(y));
+            let events = if command == "files" {
+                let paths = parts.next().unwrap_or_default().split('|').map(|path| base.join(path.trim())).collect();
+                vec![
+                    FileDropEvent::Entered {
+                        position,
+                        paths: ExternalPaths(paths),
+                    },
+                    FileDropEvent::Pending { position },
+                ]
+            } else {
+                vec![FileDropEvent::Submit { position }]
+            };
+            for event in events {
+                window.update(cx, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.dispatch_event(PlatformInput::FileDrop(event), cx);
+                })?;
+                cx.background_executor().timer(Duration::from_millis(40)).await;
+            }
         }
         "scroll" => {
             let mut parts = arg.split_whitespace().map(str::parse::<f32>);

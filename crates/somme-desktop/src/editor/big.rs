@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Copy, Cut, Escape, Input, InputEvent, InputState, Paste, Rope, SelectAll};
 use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, Hsla, InteractiveElement as _, IntoElement,
@@ -35,6 +35,8 @@ const SCROLLBAR: Pixels = px(12.);
 
 pub enum BigTextEvent {
     Changed,
+    /// The find bar's jq button was clicked.
+    Jq,
 }
 
 /// One change that can be undone: `removed` was at `at`, and `inserted` took its place.
@@ -121,6 +123,8 @@ pub struct BigText {
     /// The last edit was typing, so more typing joins it for undo.
     typing: bool,
     bar: Option<Bar>,
+    /// The find bar offers jq, for JSON files.
+    jq: bool,
     metrics: Option<Metrics>,
     drag: Drag,
 }
@@ -141,9 +145,20 @@ impl BigText {
             redo: Vec::new(),
             typing: false,
             bar: None,
+            jq: false,
             metrics: None,
             drag: Drag::None,
         }
+    }
+
+    /// Offers jq in the find bar.
+    pub fn with_jq(mut self) -> Self {
+        self.jq = true;
+        self
+    }
+
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_bar(BarMode::Find, window, cx);
     }
 
     pub fn text(&self) -> &Rope {
@@ -841,6 +856,16 @@ impl BigText {
                         cx.stop_propagation();
                     }
                 }))
+                .when(find && self.jq, |row| {
+                    row.child(Button::new("big-find-text").ghost().xsmall().label("Text").selected(true)).child(
+                        Button::new("big-find-jq").ghost().xsmall().label("jq").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.close_bar(window, cx);
+                                cx.emit(BigTextEvent::Jq);
+                            },
+                        )),
+                    )
+                })
                 .child(div().w(px(280.)).child(Input::new(&bar.input).small()))
                 .child(div().px_1().text_xs().text_color(theme.muted_foreground).child(status))
                 .when(find, |row| {
