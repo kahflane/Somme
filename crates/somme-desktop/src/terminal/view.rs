@@ -24,6 +24,7 @@ use crate::terminal::element::{TerminalElement, grid_point};
 use crate::terminal::mouse::{self, ReportButton, ReportKind};
 use crate::terminal::session::{SessionEvent, Status, TerminalSession};
 use crate::terminal::keys;
+use crate::ui::workspace::{SplitDown, SplitLeft, SplitRight, SplitUp};
 
 mod blocks;
 mod links;
@@ -338,6 +339,10 @@ impl TerminalView {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The find box sits inside the terminal, so its keys pass through here too.
+        if self.find_focused(window, cx) {
+            return;
+        }
         if self.wants_prompt(cx) {
             // Typing over the blocks goes to the editor.
             self.focus_prompt(window, cx);
@@ -604,6 +609,12 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn find_focused(&self, window: &Window, cx: &App) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|search| search.input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
         self.search = None;
         window.focus(&self.focus_handle, cx);
@@ -704,6 +715,8 @@ impl TerminalView {
             h_flex()
                 .key_context("TerminalSearch")
                 .on_action(cx.listener(Self::close_find))
+                // A click here must not reach the terminal behind, which takes focus.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .absolute()
                 .top_2()
                 .right_4()
@@ -966,6 +979,11 @@ impl Render for TerminalView {
                 .separator()
                 .menu("Select All", Box::new(SelectAll))
                 .menu("Find…", Box::new(Find))
+                .separator()
+                .menu("Split Right", Box::new(SplitRight))
+                .menu("Split Left", Box::new(SplitLeft))
+                .menu("Split Down", Box::new(SplitDown))
+                .menu("Split Up", Box::new(SplitUp))
                 .separator()
                 .menu("Clear", Box::new(Clear))
         });

@@ -12,7 +12,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext as _, Axis, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, KeyBinding, MouseButton, ParentElement as _, Render, SharedString,
+    IntoElement, KeyBinding, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
     StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, actions, div, prelude::FluentBuilder as _, px,
 };
@@ -22,10 +22,15 @@ use somme_application::dto::{HostInput, HostView, SecretUpdate};
 use somme_domain::Id;
 
 use crate::changes::ChangesView;
+use crate::editor::pane::{FileText, cant_open, read_text};
+use crate::editor::scratch::{self, OpenEntry};
+use crate::editor::system_open;
+use crate::editor::{EditorPane, EditorPaneEvent};
 use crate::services::Services;
 use crate::settings::Settings;
 use crate::store::{Store, StoreEvent, mutate};
 use crate::terminal::SessionTarget;
+use crate::terminal::disk::Disk;
 use crate::ui::common::{Lucide, avatar, notify_error, parse_color};
 use crate::ui::native;
 use crate::ui::fields::host_input;
@@ -47,13 +52,17 @@ actions!(
     workspace,
     [
         NewLocalTerminal,
+        NewEditor,
+        OpenFile,
         CloseTab,
         ClosePane,
         NextTab,
         PreviousTab,
         ShowHome,
         SplitRight,
+        SplitLeft,
         SplitDown,
+        SplitUp,
         FocusNextPane,
         FocusPreviousPane,
         ToggleBroadcast,
@@ -88,6 +97,8 @@ pub fn init(cx: &mut App) {
     let m = "ctrl-shift";
     cx.bind_keys([
         KeyBinding::new(&format!("{m}-t"), NewLocalTerminal, None),
+        KeyBinding::new(&format!("{m}-n"), NewEditor, None),
+        KeyBinding::new(&format!("{m}-o"), OpenFile, None),
         KeyBinding::new(&format!("{m}-w"), ClosePane, None),
         KeyBinding::new(&format!("{m}-shift-w"), CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
@@ -192,12 +203,14 @@ impl Page {
 enum TabContent {
     Terminal(Entity<TerminalTab>),
     Changes(Entity<ChangesView>),
+    /// Files on this computer, or scratch files not saved anywhere yet.
+    Editor(Entity<EditorPane>),
 }
 
 struct Tab {
     id: usize,
     content: TabContent,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 /// A tab whose new name is being typed.
@@ -310,6 +323,9 @@ impl Workspace {
         };
         // The app starts on a local terminal, without waiting for the vault.
         workspace.open_terminal(SessionTarget::Local, window, cx);
+        if Settings::get(cx).reopen_files {
+            workspace.reopen_files(window, cx);
+        }
         workspace
     }
 
@@ -352,6 +368,10 @@ impl Workspace {
                     content: TabContent::Changes(view),
                     ..
                 }) => window.focus(&view.focus_handle(cx), cx),
+                Some(Tab {
+                    content: TabContent::Editor(pane),
+                    ..
+                }) => window.focus(&pane.focus_handle(cx), cx),
                 None => window.focus(&self.focus_handle, cx),
             },
             Section::Ssh if !Store::global(cx).read(cx).is_unlocked() => {
@@ -377,7 +397,7 @@ impl Workspace {
         self.tabs.push(Tab {
             id,
             content: TabContent::Terminal(tab),
-            _subscription: subscription,
+            _subscriptions: vec![subscription],
         });
         self.activate(Some(self.tabs.len() - 1), window, cx);
     }
@@ -386,7 +406,7 @@ impl Workspace {
     fn open_changes(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.tabs.iter().position(|tab| match &tab.content {
             TabContent::Changes(view) => view.read(cx).shows(&dir),
-            TabContent::Terminal(_) => false,
+            TabContent::Terminal(_) | TabContent::Editor(_) => false,
         });
         if let Some(ix) = open {
             if let TabContent::Changes(view) = &self.tabs[ix].content {
@@ -402,9 +422,138 @@ impl Workspace {
         self.tabs.push(Tab {
             id,
             content: TabContent::Changes(view),
-            _subscription: subscription,
+            _subscriptions: vec![subscription],
         });
         self.activate(Some(self.tabs.len() - 1), window, cx);
+    }
+
+    /// Opens an empty scratch file in a new tab. It is kept in the app data
+    /// folder until it is saved somewhere.
+    fn new_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match scratch::create(&scratch::dir(&self.services.data_dir)) {
+            Ok(path) => self.open_editor(path, FileText::Code(String::new()), true, true, window, cx),
+            Err(err) => notify_error(window, cx, "Can't make a new file", err),
+        }
+    }
+
+    /// Opens a file in a tab of its own. `show` brings that tab, or the one the
+    /// file is open in already, to the front.
+    fn open_editor(
+        &mut self,
+        path: PathBuf,
+        text: FileText,
+        scratch: bool,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self.tabs.iter().position(|tab| match &tab.content {
+            TabContent::Editor(pane) => pane.read(cx).holds(&path),
+            TabContent::Terminal(_) | TabContent::Changes(_) => false,
+        });
+        if let Some(ix) = open {
+            if show {
+                self.activate(Some(ix), window, cx);
+            }
+            return;
+        }
+        let pane = cx.new(EditorPane::in_tab);
+        pane.update(cx, |pane, cx| {
+            if scratch {
+                pane.add_scratch(path, text, window, cx);
+            } else {
+                pane.add(path, Disk::Local, text, false, None, window, cx);
+            }
+        });
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let subscriptions = vec![
+            cx.observe(&pane, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&pane, window, move |workspace, _, event, window, cx| match event {
+                EditorPaneEvent::Empty => workspace.remove_tab(id, window, cx),
+                EditorPaneEvent::FilesChanged => workspace.save_open_files(cx),
+            }),
+        ];
+        self.tabs.push(Tab {
+            id,
+            content: TabContent::Editor(pane),
+            _subscriptions: subscriptions,
+        });
+        if show {
+            self.activate(Some(self.tabs.len() - 1), window, cx);
+        } else {
+            // Adding the file focused its editor.
+            self.focus_current(window, cx);
+            cx.notify();
+        }
+        self.save_open_files(cx);
+    }
+
+    /// Asks for files on this computer and opens each in its own tab.
+    fn open_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |workspace, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            for path in paths {
+                if system_open::opens_outside(&path) {
+                    let _ = workspace.update(cx, |_, cx| cx.open_with_system(&path));
+                    continue;
+                }
+                let text = Disk::Local.run({
+                    let path = path.clone();
+                    move |disk| read_text(disk, &path)
+                });
+                let text = text.await;
+                let _ = workspace.update_in(cx, |workspace, window, cx| match text {
+                    Ok(text) => workspace.open_editor(path, text, false, true, window, cx),
+                    Err(err) => cant_open(&path, &err, window, cx),
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Opens the editor files that were open when the app last quit, behind
+    /// the tab in front. They are read off the UI thread so the terminal is not
+    /// kept waiting. Files that are gone are skipped.
+    fn reopen_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let data_dir = self.services.data_dir.clone();
+        let files = Disk::Local.run(move |disk| {
+            scratch::load_list(&data_dir)
+                .into_iter()
+                .filter_map(|entry| read_text(disk, &entry.path).ok().map(|text| (entry, text)))
+                .collect::<Vec<_>>()
+        });
+        cx.spawn_in(window, async move |workspace, cx| {
+            let files = files.await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                for (entry, text) in files {
+                    workspace.open_editor(entry.path, text, entry.scratch, false, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Remembers the open editor files, in tab order, for the next start.
+    fn save_open_files(&self, cx: &App) {
+        let entries: Vec<OpenEntry> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                TabContent::Editor(pane) => Some(pane),
+                TabContent::Terminal(_) | TabContent::Changes(_) => None,
+            })
+            .flat_map(|pane| {
+                pane.read(cx).files().map(|(path, scratch)| OpenEntry { path: path.to_owned(), scratch }).collect::<Vec<_>>()
+            })
+            .collect();
+        scratch::save_list(&self.services.data_dir, &entries);
     }
 
     /// The folder of the local terminal used last: the focused pane of the open
@@ -508,6 +657,7 @@ impl Workspace {
             PaletteAction::Host(id) => self.connect_host(id, window, cx),
             PaletteAction::Snippet(script) => self.send_snippet(&script, true, window, cx),
             PaletteAction::NewLocalTerminal => self.open_terminal(SessionTarget::Local, window, cx),
+            PaletteAction::NewEditor => self.new_editor(window, cx),
             PaletteAction::Page(page) => self.show_page(page, window, cx),
             PaletteAction::Lock => Store::global(cx).update(cx, |store, cx| store.lock(cx)),
             PaletteAction::Unlock => self.show_page(Page::Hosts, window, cx),
@@ -734,7 +884,10 @@ impl Workspace {
 
     fn remove_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|t| t.id == id) else { return };
-        self.tabs.remove(ix);
+        if let TabContent::Editor(pane) = self.tabs.remove(ix).content {
+            pane.update(cx, |pane, _| pane.discard());
+            self.save_open_files(cx);
+        }
         let next = match self.active {
             Some(active) if active == ix => {
                 if self.tabs.is_empty() {
@@ -764,8 +917,12 @@ impl Workspace {
         }
         let active_id = self.active.map(|ix| self.tabs[ix].id);
         let tab = self.tabs.remove(from);
+        let editor = matches!(tab.content, TabContent::Editor(_));
         self.tabs.insert(to, tab);
         self.active = active_id.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+        if editor {
+            self.save_open_files(cx);
+        }
         cx.notify();
     }
 
@@ -808,7 +965,7 @@ impl Workspace {
     fn tab_is_running(&self, ix: usize, cx: &App) -> bool {
         match &self.tabs[ix].content {
             TabContent::Terminal(tab) => tab.read(cx).is_running(cx),
-            TabContent::Changes(_) => false,
+            TabContent::Changes(_) | TabContent::Editor(_) => false,
         }
     }
 
@@ -817,6 +974,7 @@ impl Workspace {
         let Some(tab) = self.tabs.get(ix) else { return };
         let unsaved = match &tab.content {
             TabContent::Terminal(term) => term.read(cx).has_unsaved(cx),
+            TabContent::Editor(pane) => pane.read(cx).has_changes(),
             TabContent::Changes(_) => false,
         };
         let id = tab.id;
@@ -850,7 +1008,7 @@ impl Workspace {
         }
         match &self.tabs.get(self.active?)?.content {
             TabContent::Terminal(tab) => Some(tab.clone()),
-            TabContent::Changes(_) => None,
+            TabContent::Changes(_) | TabContent::Editor(_) => None,
         }
     }
 
@@ -929,9 +1087,10 @@ impl Workspace {
         }
     }
 
-    fn on_split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
+    /// Splits the focused pane. `before` puts the new pane on the left or on top.
+    fn on_split(&mut self, axis: Axis, before: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_terminal() {
-            tab.update(cx, |tab, cx| tab.split(axis, window, cx));
+            tab.update(cx, |tab, cx| tab.split(axis, before, window, cx));
         }
     }
 
@@ -952,7 +1111,14 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
             let selected = self.section == Section::Cli && self.active == Some(ix);
-            let changes = matches!(tab.content, TabContent::Changes(_));
+            // Only terminal tabs can be renamed.
+            let changes = !matches!(tab.content, TabContent::Terminal(_));
+            let icon = match &tab.content {
+                TabContent::Changes(_) => Some(Lucide::FileDiff),
+                TabContent::Editor(_) => Some(Lucide::FileText),
+                TabContent::Terminal(_) => None,
+            };
+            let unsaved = matches!(&tab.content, TabContent::Editor(pane) if pane.read(cx).has_changes());
             let (title, color, broadcast, running, renamed) = match &tab.content {
                 TabContent::Terminal(term) => {
                     let term = term.read(cx);
@@ -966,6 +1132,7 @@ impl Workspace {
                     (term.title(cx), color, term.broadcast, term.is_running(cx), term.custom_title.is_some())
                 }
                 TabContent::Changes(view) => (view.read(cx).title(), None, false, false, false),
+                TabContent::Editor(pane) => (pane.read(cx).title(), None, false, false, false),
             };
             let dot = color.unwrap_or(if running { theme.success } else { theme.muted_foreground });
             let editing = self.renaming.as_ref().filter(|r| r.tab_id == tab.id).map(|r| r.input.clone());
@@ -1007,12 +1174,15 @@ impl Workspace {
                         .text_color(theme.tab_foreground)
                         .hover(|el| el.bg(tab_hover))
                 })
-                .when(changes, |el| el.child(Icon::new(Lucide::FileDiff).size(px(13.))))
-                .when(!changes, |el| el.child(div().flex_none().size(px(7.)).rounded_full().bg(dot)))
+                .when_some(icon, |el, icon| el.child(Icon::new(icon).size(px(13.))))
+                .when(icon.is_none(), |el| el.child(div().flex_none().size(px(7.)).rounded_full().bg(dot)))
                 .when(broadcast, |el| {
                     el.child(Icon::new(Lucide::RadioTower).size(px(12.)).text_color(theme.warning))
                 })
                 .child(label)
+                .when(unsaved, |el| {
+                    el.child(div().flex_none().size(px(7.)).rounded_full().bg(theme.foreground.opacity(0.7)))
+                })
                 .child(
                     Button::new(("close-tab", tab.id))
                         .ghost()
@@ -1076,8 +1246,13 @@ impl Workspace {
             .tooltip("New tab")
             .dropdown_menu(|menu, _, _| {
                 menu.menu_with_icon("Local Terminal", Icon::new(Lucide::SquareTerminal), Box::new(NewLocalTerminal))
+                    .menu_with_icon("Text Editor", Icon::new(Lucide::FilePen), Box::new(NewEditor))
+                    .menu_with_icon("Open File…", Icon::new(Lucide::FolderOpen), Box::new(OpenFile))
+                    .separator()
                     .menu_with_icon("Split Right", Icon::new(Lucide::Columns2), Box::new(SplitRight))
+                    .menu_with_icon("Split Left", Icon::new(Lucide::Columns2), Box::new(SplitLeft))
                     .menu_with_icon("Split Down", Icon::new(Lucide::Rows2), Box::new(SplitDown))
+                    .menu_with_icon("Split Up", Icon::new(Lucide::Rows2), Box::new(SplitUp))
                     .separator()
                     .menu_with_icon("Broadcast Input", Icon::new(Lucide::RadioTower), Box::new(ToggleBroadcast))
             });
@@ -1309,6 +1484,12 @@ impl Render for Workspace {
         {
             view.clone().into_any_element()
         } else if let Some(Tab {
+            content: TabContent::Editor(pane),
+            ..
+        }) = tab
+        {
+            pane.clone().into_any_element()
+        } else if let Some(Tab {
             content: TabContent::Terminal(term),
             ..
         }) = tab
@@ -1349,14 +1530,18 @@ impl Render for Workspace {
             .capture_any_mouse_down(cx.listener(|w, _, _, _| w.touch()))
             .on_scroll_wheel(cx.listener(|w, _, _, _| w.touch()))
             .on_action(cx.listener(Self::on_new_local))
+            .on_action(cx.listener(|w, _: &NewEditor, window, cx| w.new_editor(window, cx)))
+            .on_action(cx.listener(|w, _: &OpenFile, window, cx| w.open_files(window, cx)))
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_lock))
             .on_action(cx.listener(|w, _: &NextTab, window, cx| w.cycle_tab(true, window, cx)))
             .on_action(cx.listener(|w, _: &PreviousTab, window, cx| w.cycle_tab(false, window, cx)))
             .on_action(cx.listener(|w, _: &ShowHome, window, cx| w.show_section(Section::Ssh, window, cx)))
-            .on_action(cx.listener(|w, _: &SplitRight, window, cx| w.on_split(Axis::Horizontal, window, cx)))
-            .on_action(cx.listener(|w, _: &SplitDown, window, cx| w.on_split(Axis::Vertical, window, cx)))
+            .on_action(cx.listener(|w, _: &SplitRight, window, cx| w.on_split(Axis::Horizontal, false, window, cx)))
+            .on_action(cx.listener(|w, _: &SplitLeft, window, cx| w.on_split(Axis::Horizontal, true, window, cx)))
+            .on_action(cx.listener(|w, _: &SplitDown, window, cx| w.on_split(Axis::Vertical, false, window, cx)))
+            .on_action(cx.listener(|w, _: &SplitUp, window, cx| w.on_split(Axis::Vertical, true, window, cx)))
             .on_action(cx.listener(|w, _: &FocusNextPane, window, cx| {
                 if let Some(tab) = w.active_terminal() {
                     tab.update(cx, |tab, cx| tab.focus_next(true, window, cx));

@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::input::{
     Copy as InputCopy, Escape, IndentInline, InputEvent, MoveDown, MoveEnd, MoveRight, MoveUp, Search as InputSearch,
@@ -11,7 +13,7 @@ use gpui_kit::component::input::{
 use gpui_kit::component::{Icon, Size, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement,
-    Focusable as _, KeyBinding, MouseButton, ParentElement as _, Styled as _, Subscription, Window,
+    Focusable as _, KeyBinding, MouseButton, ParentElement as _, Styled as _, Subscription, Task, Window,
     actions, div, prelude::FluentBuilder as _, px, rems, transparent_black,
 };
 
@@ -34,6 +36,8 @@ const CONTEXT: &str = "TerminalPrompt";
 const KEY_CONTEXT: &str = "Terminal TerminalPrompt";
 /// Completion choices or past commands shown at once.
 const MENU_ROWS: usize = 8;
+/// How long typing pauses before folders are looked up for `cd`.
+const SUGGEST_DELAY: Duration = Duration::from_millis(60);
 
 pub(super) fn init(cx: &mut App) {
     let ctx = Some(CONTEXT);
@@ -73,6 +77,10 @@ pub(super) struct Prompt {
     /// The rest of a past command that starts with what is typed, shown in grey,
     /// with the typed text it was found for.
     ghost: Option<(String, String)>,
+    /// Looks up folders for the `cd` being typed.
+    suggest: Option<Task<()>>,
+    /// The folder those lookups read last.
+    listings: Arc<complete::Listings>,
     _subscription: Subscription,
 }
 
@@ -96,6 +104,7 @@ impl Prompt {
                     prompt.menu = None;
                 }
                 view.update_ghost(cx);
+                view.suggest_folders(window, cx);
                 cx.notify();
             }
             InputEvent::Focus => {
@@ -127,6 +136,8 @@ impl Prompt {
             menu: None,
             expected: None,
             ghost: None,
+            suggest: None,
+            listings: Arc::default(),
             _subscription: subscription,
         }
     }
@@ -223,6 +234,8 @@ impl TerminalView {
         }
         prompt.browse = None;
         prompt.menu = None;
+        // The command may make or remove folders.
+        prompt.listings.clear();
         prompt.ran.push(Entry {
             command: text.clone(),
             time: Some(now_secs()),
@@ -352,6 +365,23 @@ impl TerminalView {
     fn complete_word(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(prompt) = self.prompt.as_mut() else { return };
         if let Some(menu) = prompt.menu.as_mut() {
+            // A list that showed up while typing: take the only choice, or
+            // what all choices share, before moving through it.
+            if menu.selected.is_none() {
+                let range = menu.completion.range.clone();
+                if let [only] = menu.completion.choices.as_slice() {
+                    let text = finished(only);
+                    prompt.menu = None;
+                    self.replace_in_prompt(range, &text, window, cx);
+                    return;
+                }
+                let common = menu.completion.common().unwrap_or_default();
+                if common.len() > range.len() {
+                    menu.completion.range = range.start..range.start + common.len();
+                    self.replace_in_prompt(range, &common, window, cx);
+                    return;
+                }
+            }
             let count = menu.completion.choices.len();
             menu.selected = Some(menu.selected.map_or(0, |i| (i + 1) % count));
             cx.notify();
@@ -383,6 +413,54 @@ impl TerminalView {
             });
         })
         .detach();
+    }
+
+    /// Lists folders while a `cd` is typed: the ones here first, then ones
+    /// past `cd` commands went to.
+    fn suggest_folders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let Some(prompt) = self.prompt.as_mut() else { return };
+        let (line, cursor) = {
+            let editor = prompt.editor.read(cx);
+            (editor.value().to_string(), editor.cursor())
+        };
+        if prompt.browse.is_some() || self.picker.is_some() || !complete::typing_folder(&line, cursor) {
+            prompt.suggest = None;
+            return;
+        }
+        let commands = prompt
+            .ran
+            .iter()
+            .rev()
+            .map(|entry| entry.command.as_str())
+            .chain(session.history.iter().rev().map(String::as_str))
+            .chain(prompt.file_history.iter().rev().map(|entry| entry.command.as_str()));
+        let recent = complete::cd_targets(commands);
+        let cwd = session.blocks.as_ref().and_then(|b| b.cwd.clone());
+        let disk = session.disk();
+        let listings = prompt.listings.clone();
+        prompt.suggest = Some(cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor().timer(SUGGEST_DELAY).await;
+            let Some(disk) = disk.await else { return };
+            let typed = line.clone();
+            let cwd = cwd.or_else(|| disk.home()).unwrap_or_default();
+            let found = disk
+                .run(move |disk| complete::suggest_folders(&line, cursor, &cwd, &recent, &listings, disk))
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                let Some(prompt) = view.prompt.as_mut() else { return };
+                let editor = prompt.editor.read(cx);
+                // Typing went on, or the history list opened, while the names were read.
+                if editor.value().as_str() != typed || editor.cursor() != cursor || prompt.browse.is_some() {
+                    return;
+                }
+                prompt.menu = found.map(|completion| Menu {
+                    completion,
+                    selected: None,
+                });
+                cx.notify();
+            });
+        }));
     }
 
     /// Fills in the only choice, or what all choices share, and lists the rest.
@@ -540,13 +618,26 @@ impl TerminalView {
             let start = selected.saturating_sub(MENU_ROWS - 1).min(choices.len().saturating_sub(MENU_ROWS));
             let rows = choices.iter().enumerate().skip(start).take(MENU_ROWS).map(|(i, choice)| {
                 let active = menu.selected == Some(i);
-                div()
+                h_flex()
                     .id(("completion", i))
+                    .gap_2()
                     .px_1p5()
                     .rounded_sm()
                     .when(active, |row| row.bg(foreground.opacity(0.12)))
                     .text_color(if choice.dir { to_hsla(theme.ansi[4]) } else { foreground })
-                    .child(choice.label.clone())
+                    .child(div().flex_1().min_w_0().truncate().child(choice.label.clone()))
+                    .when(choice.recent, |row| {
+                        row.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .items_center()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(Icon::new(Lucide::Clock).size(px(12.)))
+                                .child("recent"),
+                        )
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |view, _, window, cx| {

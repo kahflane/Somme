@@ -14,9 +14,10 @@ use crate::terminal::view::{
 use crate::ui::common::APP_NAME;
 use crate::ui::native;
 use crate::ui::workspace::{
-    CloseTab, ClosePane, FocusNextPane, FocusPreviousPane, LockVault, NewLocalTerminal, NextTab, OpenSettings,
+    CloseTab, ClosePane, FocusNextPane, FocusPreviousPane, LockVault, NewEditor, NewLocalTerminal, NextTab, OpenFile,
+    OpenSettings,
     PreviousTab, Quit, RenameTab, ShowForwarding, ShowHosts, ShowKeychain, ShowKnownHosts, ShowLogs,
-    ShowSnippets, SplitDown, SplitRight, ToggleBroadcast, TogglePalette, ToggleSidePanel,
+    ShowSnippets, SplitDown, SplitLeft, SplitRight, SplitUp, ToggleBroadcast, TogglePalette, ToggleSidePanel,
 };
 
 actions!(
@@ -105,10 +106,15 @@ pub fn init(cx: &mut App) {
     cx.set_menus(menus());
 }
 
-fn with_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut App)) {
-    if let Some(handle) = cx.active_window() {
-        let _ = handle.update(cx, |_, window, cx| f(window, cx));
-    }
+/// Runs `f` on the front window, or the only one when the app is not in
+/// front. Menu actions arrive while that window is busy handling them, so this
+/// waits until it is free.
+fn with_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut App) + 'static) {
+    cx.defer(|cx| {
+        if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
+            let _ = handle.update(cx, |_, window, cx| f(window, cx));
+        }
+    });
 }
 
 /// Presses a shortcut in the front window, as if typed.
@@ -136,8 +142,13 @@ fn menus() -> Vec<Menu> {
         ]),
         Menu::new("File").items([
             MenuItem::action("New Tab", NewLocalTerminal),
+            MenuItem::action("New Text Editor", NewEditor),
+            MenuItem::action("Open File…", OpenFile),
+            MenuItem::separator(),
             MenuItem::action("Split Right", SplitRight),
+            MenuItem::action("Split Left", SplitLeft),
             MenuItem::action("Split Down", SplitDown),
+            MenuItem::action("Split Up", SplitUp),
             MenuItem::separator(),
             MenuItem::action("Command Palette…", TogglePalette),
             MenuItem::separator(),

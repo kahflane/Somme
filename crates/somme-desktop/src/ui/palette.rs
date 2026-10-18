@@ -24,6 +24,7 @@ pub enum PaletteAction {
     /// Runs a snippet in the terminal used last.
     Snippet(String),
     NewLocalTerminal,
+    NewEditor,
     Page(Page),
     Lock,
     /// Opens the SSH section, which asks for the master password.
@@ -144,6 +145,16 @@ fn rows(query: &str, cx: &App) -> Vec<Row> {
             action: PaletteAction::NewLocalTerminal,
             icon: Icon::new(Lucide::SquareTerminal),
             title: "New Local Terminal".into(),
+            detail: "".into(),
+            kind: "Command",
+        },
+    );
+    add(
+        "New Text Editor",
+        Row {
+            action: PaletteAction::NewEditor,
+            icon: Icon::new(Lucide::FilePen),
+            title: "New Text Editor".into(),
             detail: "".into(),
             kind: "Command",
         },

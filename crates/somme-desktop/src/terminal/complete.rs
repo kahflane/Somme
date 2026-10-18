@@ -1,14 +1,27 @@
 //! Tab completion for the command editor: command names from the shell's PATH,
-//! and files and folders, wherever the shell runs.
+//! and files and folders, wherever the shell runs. Also the folders shown while
+//! typing after `cd`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::terminal::disk::Disk;
+use parking_lot::Mutex;
+
+use crate::terminal::disk::{Disk, Entry};
 
 /// Most choices kept, so a huge folder stays quick.
 const MAX_CHOICES: usize = 500;
+/// Most folders from past `cd` commands shown, and most looked up, as each
+/// look on a server takes a round trip.
+const MAX_RECENT: usize = 5;
+const MAX_RECENT_CHECKS: usize = 20;
+/// How long a folder's names are kept while a `cd` is typed.
+const LISTING_TTL: Duration = Duration::from_secs(3);
+
+/// Commands that take a folder.
+const FOLDER_COMMANDS: &[&str] = &["cd", "pushd"];
 
 /// Shell words that are not files on PATH.
 const BUILTINS: &[&str] = &[
@@ -25,6 +38,32 @@ pub struct Choice {
     /// What goes into the line, already escaped.
     pub insert: String,
     pub dir: bool,
+    /// A folder from a past `cd`, not from the folder listed.
+    pub recent: bool,
+}
+
+/// The folder last listed for [`suggest_folders`], so typing a name in it
+/// does not read it again on each key. That matters most on a server.
+#[derive(Default)]
+pub struct Listings(Mutex<Option<(PathBuf, Instant, Vec<Entry>)>>);
+
+impl Listings {
+    /// Forgets the folder, as a command may have changed it.
+    pub fn clear(&self) {
+        *self.0.lock() = None;
+    }
+
+    fn list(&self, dir: &Path, disk: &Disk) -> Option<Vec<Entry>> {
+        if let Some((kept, at, entries)) = &*self.0.lock()
+            && kept == dir
+            && at.elapsed() < LISTING_TTL
+        {
+            return Some(entries.clone());
+        }
+        let entries = disk.list(dir, usize::MAX, can_escape)?;
+        *self.0.lock() = Some((dir.to_path_buf(), Instant::now(), entries.clone()));
+        Some(entries)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,12 +116,72 @@ pub fn complete(line: &str, cursor: usize, cwd: &Path, path_var: Option<&str>, d
     let choices = if command_spot && !word.contains('/') && !word.is_empty() {
         commands(word, path_var, disk)
     } else {
-        paths(word, cwd, disk)
+        paths(word, cwd, disk, wants_folder(line, start), None)
     };
     (!choices.is_empty()).then_some(Completion {
         range: start..cursor,
         choices,
     })
+}
+
+/// Whether the cursor sits at the end of a `cd` or `pushd` line, on its folder.
+pub fn typing_folder(line: &str, cursor: usize) -> bool {
+    cursor == line.len() && !line.contains('\n') && {
+        let start = word_start(line, cursor);
+        wants_folder(line, start) && !line[start..].starts_with('-')
+    }
+}
+
+/// Folders for the `cd` being typed: ones in the folder the word points at
+/// first, then ones from past `cd` commands. `recent` holds those commands'
+/// folders as typed, newest first. Reads `disk`, so it may block.
+pub fn suggest_folders(
+    line: &str,
+    cursor: usize,
+    cwd: &Path,
+    recent: &[String],
+    listings: &Listings,
+    disk: &Disk,
+) -> Option<Completion> {
+    if !typing_folder(line, cursor) {
+        return None;
+    }
+    let start = word_start(line, cursor);
+    let word = &line[start..cursor];
+    let mut choices = paths(word, cwd, disk, true, Some(listings));
+    let (typed_dir, _) = split_word(word);
+    let shown: Vec<PathBuf> = match base_dir(&unescape(typed_dir), cwd, disk) {
+        Some(base) => choices.iter().map(|choice| base.join(choice.label.trim_end_matches('/'))).collect(),
+        None => Vec::new(),
+    };
+    choices.extend(recent_folders(word, recent, cwd, &shown, disk));
+    (!choices.is_empty()).then_some(Completion {
+        range: start..cursor,
+        choices,
+    })
+}
+
+/// The folders past `cd` commands went to, as typed, in the commands' order.
+/// Commands newest first give folders newest first.
+pub fn cd_targets<'a>(commands: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    commands
+        .filter_map(|command| {
+            let (name, target) = command.trim().split_once(' ')?;
+            let target = target.trim();
+            let simple = !target.is_empty() && !target.contains(['\n', ';', '&', '|', '$', '`', '(', ')', '<', '>']);
+            (FOLDER_COMMANDS.contains(&name) && simple).then(|| target.to_owned())
+        })
+        .filter(|target| seen.insert(target.clone()))
+        .take(200)
+        .collect()
+}
+
+/// Whether the word starting at `start` is the folder for `cd` or `pushd`.
+fn wants_folder(line: &str, start: usize) -> bool {
+    let before = line[..start].trim_end();
+    let command = before.rsplit(['|', ';', '&', '(']).next().unwrap_or_default().trim();
+    FOLDER_COMMANDS.contains(&command)
 }
 
 /// Where the word under the cursor starts. A backslash keeps the next character in the word.
@@ -159,6 +258,7 @@ fn commands(prefix: &str, path_var: Option<&str>, disk: &Disk) -> Vec<Choice> {
             insert: escape(&name),
             label: name,
             dir: false,
+            recent: false,
         })
         .collect()
 }
@@ -168,42 +268,146 @@ const PATH_SEPARATOR: char = ':';
 #[cfg(not(unix))]
 const PATH_SEPARATOR: char = ';';
 
-fn paths(word: &str, cwd: &Path, disk: &Disk) -> Vec<Choice> {
-    // Keep what the user typed for the folder part, and only replace the name.
-    let (typed_dir, typed_name) = match word.rfind('/') {
+/// Splits a word into its folder part, up to the last slash, and the name.
+fn split_word(word: &str) -> (&str, &str) {
+    match word.rfind('/') {
         Some(slash) => word.split_at(slash + 1),
         None => ("", word),
-    };
+    }
+}
+
+/// The folder a typed folder part points at. Paths follow the shell's rules,
+/// with `/`, even when this computer uses `\`.
+fn base_dir(dir_text: &str, cwd: &Path, disk: &Disk) -> Option<PathBuf> {
+    if let Some(rest) = dir_text.strip_prefix("~/") {
+        Some(disk.home()?.join(rest))
+    } else if dir_text.starts_with('/') {
+        Some(PathBuf::from(dir_text))
+    } else {
+        Some(cwd.join(dir_text))
+    }
+}
+
+/// Names in the folder the word points at that start with its last part.
+/// `folders` keeps only folders. With `listings`, for suggestions while
+/// typing, names that start the same in another case count too, or failing
+/// that, ones with the part anywhere in them.
+fn paths(word: &str, cwd: &Path, disk: &Disk, folders: bool, listings: Option<&Listings>) -> Vec<Choice> {
+    let loose = listings.is_some();
+    // Keep what the user typed for the folder part, and only replace the name.
+    let (typed_dir, typed_name) = split_word(word);
     let dir_text = unescape(typed_dir);
     let name = unescape(typed_name);
-    let base: PathBuf = if let Some(rest) = dir_text.strip_prefix("~/") {
-        let Some(home) = disk.home() else { return Vec::new() };
-        home.join(rest)
-    } else if dir_text == "~" || (dir_text.is_empty() && name == "~") {
+    if dir_text == "~" || (dir_text.is_empty() && name == "~") {
         return vec![Choice {
             label: "~/".into(),
             insert: "~/".into(),
             dir: true,
+            recent: false,
         }];
-    } else if dir_text.starts_with('/') {
-        PathBuf::from(&dir_text)
-    } else {
-        cwd.join(&dir_text)
+    }
+    let Some(base) = base_dir(&dir_text, cwd, disk) else { return Vec::new() };
+    let lower = name.to_lowercase();
+    // 0: starts with the name, 1: the same in another case, 2: has it anywhere.
+    let rank = |file: &str| -> Option<u8> {
+        if file.starts_with(&name) {
+            Some(0)
+        } else if !loose {
+            None
+        } else if file.to_lowercase().starts_with(&lower) {
+            Some(1)
+        } else if !name.is_empty() && file.to_lowercase().contains(&lower) {
+            Some(2)
+        } else {
+            None
+        }
     };
-    let keep = |file: &str| file.starts_with(&name) && (!file.starts_with('.') || name.starts_with('.')) && can_escape(file);
-    let Some(entries) = disk.list(&base, usize::MAX, keep) else { return Vec::new() };
-    let mut found: Vec<(String, bool)> = entries.into_iter().map(|entry| (entry.name, entry.dir)).collect();
-    found.sort();
-    found.truncate(MAX_CHOICES);
-    found
+    let keep = |file: &str| rank(file).is_some() && (!file.starts_with('.') || name.starts_with('.')) && can_escape(file);
+    let entries = match listings {
+        Some(listings) => listings.list(&base, disk),
+        None => disk.list(&base, usize::MAX, keep),
+    };
+    let Some(entries) = entries else { return Vec::new() };
+    let mut found: Vec<(u8, String, bool)> = entries
         .into_iter()
-        .map(|(file, dir)| {
+        .filter(|entry| (entry.dir || !folders) && keep(&entry.name))
+        .filter_map(|entry| Some((rank(&entry.name)?, entry.name, entry.dir)))
+        .collect();
+    // Names that only have the part somewhere count when nothing starts with it.
+    if found.iter().any(|(rank, ..)| *rank < 2) {
+        found.retain(|(rank, ..)| *rank < 2);
+    }
+    if loose {
+        found.sort_by_cached_key(|(rank, file, _)| (*rank, file.to_lowercase()));
+    } else {
+        found.sort();
+    }
+    found.truncate(MAX_CHOICES);
+    let mut choices: Vec<Choice> = found
+        .into_iter()
+        .map(|(_, file, dir)| {
             let slash = if dir { "/" } else { "" };
             Choice {
                 label: format!("{file}{slash}"),
                 insert: format!("{typed_dir}{}{slash}", escape(&file)),
                 dir,
+                recent: false,
             }
+        })
+        .collect();
+    // `..` is never listed, but `cd ..` is common.
+    if folders && name.starts_with('.') && "..".starts_with(name.as_str()) {
+        choices.insert(0, Choice {
+            label: "../".into(),
+            insert: format!("{typed_dir}../"),
+            dir: true,
+            recent: false,
+        });
+    }
+    choices
+}
+
+/// Folders from past `cd` commands that fit the word: ones under the folder
+/// typed, or whose name starts with it. Only full paths count, as others
+/// depended on where the shell was. Skips `skip` and folders that are gone.
+fn recent_folders(word: &str, recent: &[String], cwd: &Path, skip: &[PathBuf], disk: &Disk) -> Vec<Choice> {
+    let typed = unescape(word);
+    let full = typed.starts_with(['/', '~']);
+    if typed.contains('/') && !full {
+        return Vec::new();
+    }
+    let lower = typed.to_lowercase();
+    let home = disk.home();
+    let mut seen = HashSet::new();
+    recent
+        .iter()
+        .filter_map(|target| {
+            let target = unescape(target);
+            let target = target.trim_end_matches('/');
+            let (path, insert) = if let Some(rest) = target.strip_prefix("~/") {
+                (home.as_ref()?.join(rest), format!("~/{}/", escape(rest)))
+            } else if target.starts_with('/') && target.len() > 1 {
+                (PathBuf::from(target), format!("{}/", escape(target)))
+            } else {
+                return None;
+            };
+            let fits = if full {
+                target.starts_with(typed.as_str()) && target.len() > typed.trim_end_matches('/').len()
+            } else {
+                let name = target.rsplit('/').next().unwrap_or_default();
+                name.to_lowercase().starts_with(&lower)
+            };
+            let new = path != cwd && !skip.contains(&path) && can_escape(target) && seen.insert(path.clone());
+            (fits && new).then_some((path, insert))
+        })
+        .take(MAX_RECENT_CHECKS)
+        .filter(|(path, _)| disk.is_dir(path) == Some(true))
+        .take(MAX_RECENT)
+        .map(|(_, insert)| Choice {
+            label: insert.clone(),
+            insert,
+            dir: true,
+            recent: true,
         })
         .collect()
 }
@@ -271,6 +475,79 @@ mod tests {
         let path = bin.to_string_lossy().into_owned();
         let done = complete("echo hi | sommet", 16, dir.path(), Some(&path), &Disk::Local).unwrap();
         assert_eq!(done.common().as_deref(), Some("sommetool "));
+    }
+
+    #[test]
+    fn cd_lists_folders_only() {
+        let dir = folder();
+        std::fs::write(dir.path().join("setup.txt"), "").unwrap();
+        let done = complete("cd s", 4, dir.path(), None, &Disk::Local).unwrap();
+        assert_eq!(done.choices.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["src/"]);
+        let ls = complete("ls s", 4, dir.path(), None, &Disk::Local).unwrap();
+        assert_eq!(ls.choices.len(), 2);
+    }
+
+    #[test]
+    fn suggests_local_folders_then_recent_ones() {
+        let dir = folder();
+        std::fs::create_dir(dir.path().join("Projects")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir(elsewhere.path().join("pictures")).unwrap();
+        let far = elsewhere.path().join("pictures").to_string_lossy().replace('\\', "/");
+        let gone = format!("{far}-gone");
+        let commands = [format!("cd {far}"), format!("cd {gone}"), "cd src".into(), "ls".into()];
+        let recent = cd_targets(commands.iter().map(String::as_str));
+        assert_eq!(recent, [far.clone(), gone, "src".into()]);
+        let listings = Listings::default();
+        let near = |line: &str| suggest_folders(line, line.len(), dir.path(), &recent, &listings, &Disk::Local).unwrap();
+        let labels = |done: Completion| done.choices.into_iter().map(|c| c.label).collect::<Vec<_>>();
+        // Folders here first, in any case, then the recent one that is still there.
+        assert_eq!(labels(near("cd ")), ["my docs/", "Projects/", "src/", &format!("{far}/")]);
+        assert_eq!(labels(near("cd p")), ["Projects/", &format!("{far}/")]);
+        // Nothing starts with "doc", so names that have it count.
+        assert_eq!(labels(near("cd doc")), ["my docs/"]);
+        assert_eq!(labels(near("cd ..")), ["../"]);
+        assert_eq!(labels(near("cd ./s")), ["src/"]);
+        assert!(suggest_folders("ls ", 3, dir.path(), &recent, &listings, &Disk::Local).is_none());
+        assert!(suggest_folders("cd src ", 7, dir.path(), &recent, &listings, &Disk::Local).is_none());
+        assert!(typing_folder("git pull && cd sr", 17));
+        assert!(!typing_folder("cd -", 4));
+    }
+
+    #[test]
+    fn suggests_folders_on_a_server() {
+        use crate::terminal::disk::fake;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home/me");
+        std::fs::create_dir_all(home.join("proj/deep")).unwrap();
+        std::fs::create_dir_all(home.join("Pics")).unwrap();
+        std::fs::create_dir_all(root.path().join("var/log")).unwrap();
+        std::fs::write(home.join("notes.txt"), "").unwrap();
+        let mut here = vec!["Pics/", "proj/"];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path().join("var/log"), home.join("logs")).unwrap();
+            here.insert(0, "logs/");
+        }
+        let disk = fake::disk(root.path());
+        let listings = Listings::default();
+        let recent = cd_targets(["cd /var/log", "cd ~/gone", "cd proj"].into_iter());
+        let cwd = Path::new(fake::HOME);
+        let labels = |line: &str| {
+            let found = suggest_folders(line, line.len(), cwd, &recent, &listings, &disk);
+            found.map(|done| done.choices.into_iter().map(|c| c.label).collect::<Vec<_>>()).unwrap_or_default()
+        };
+        // Folders here, links to folders too, then the recent one still there.
+        assert_eq!(labels("cd "), [here.as_slice(), &["/var/log/"]].concat());
+        assert_eq!(labels("cd ~/p"), ["proj/", "Pics/"]);
+        assert_eq!(labels("cd proj/"), ["deep/"]);
+        assert_eq!(labels("cd /v"), ["var/", "/var/log/"]);
+        assert_eq!(labels("cd ~"), ["~/"]);
+        assert_eq!(labels("cd ../"), ["me/"]);
+        // Tab completion goes to the server too.
+        let done = complete("cd ~/pr", 7, cwd, None, &disk).unwrap();
+        assert_eq!(done.common().as_deref(), Some("~/proj/"));
     }
 
     #[test]

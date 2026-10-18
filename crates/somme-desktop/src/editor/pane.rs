@@ -1,19 +1,23 @@
-//! Files open beside a terminal: a tab per file, the code, and a status line.
-//! Files can be on this computer or on the server an SSH shell runs on.
+//! Files open beside a terminal or in their own tab: a tab per file, the code,
+//! and a status line. Files can be on this computer or on the server an SSH
+//! shell runs on.
 
+use std::io::{BufReader, BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::highlighter::LanguageRegistry;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position, Rope};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, KeyBinding, MouseButton, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, actions, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Task, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 
+use crate::editor::big::{BigText, BigTextEvent};
 use crate::editor::language::{self, Language};
 use crate::editor::lsp::{self, Client, DocProvider, Status};
 use crate::settings::Settings;
@@ -27,8 +31,12 @@ actions!(editor_pane, [SaveFile, CloseFile]);
 const CONTEXT: &str = "EditorPane";
 /// Bigger files open without a language server, which gets the whole text on each change.
 const LSP_MAX_BYTES: usize = 2 * 1024 * 1024;
-/// Bigger files do not open.
-const MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// Files bigger than this, or with more lines than `BIG_LINES`, open in the
+/// plain editor made for big files. The code editor slows down on them.
+const BIG_BYTES: u64 = 8 * 1024 * 1024;
+const BIG_LINES: usize = 100_000;
+/// Any size at all, for reads that take a limit.
+const ANY_SIZE: u64 = 1 << 40;
 
 pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
@@ -44,6 +52,8 @@ pub fn init(cx: &mut App) {
 pub enum EditorPaneEvent {
     /// The last file was closed.
     Empty,
+    /// A file was opened, closed, or saved under a new name.
+    FilesChanged,
 }
 
 /// Whether a language server helps with a file.
@@ -55,17 +65,98 @@ enum Help {
     None(String),
 }
 
+/// A file's text, as [`read_text`] reads it.
+pub enum FileText {
+    /// Small enough for the code editor.
+    Code(String),
+    /// For the plain editor made for big files.
+    Big(Rope),
+}
+
+impl FileText {
+    fn sort(text: String) -> Self {
+        let lines = memchr::memchr_iter(b'\n', text.as_bytes()).count();
+        if text.len() as u64 > BIG_BYTES || lines > BIG_LINES {
+            Self::Big(Rope::from(text))
+        } else {
+            Self::Code(text)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Code(text) => text.is_empty(),
+            Self::Big(text) => text.len() == 0,
+        }
+    }
+}
+
+/// What shows a file's text.
+enum Body {
+    /// The code editor, with colors and code help.
+    Code(Entity<EditorState>),
+    /// The plain editor that stays fast on big files.
+    Big(Entity<BigText>),
+}
+
+impl Body {
+    fn id(&self) -> EntityId {
+        match self {
+            Self::Code(editor) => editor.entity_id(),
+            Self::Big(editor) => editor.entity_id(),
+        }
+    }
+
+    fn text(&self, cx: &App) -> Rope {
+        match self {
+            Self::Code(editor) => editor.read(cx).text().clone(),
+            Self::Big(editor) => editor.read(cx).text().clone(),
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Code(editor) => editor.focus_handle(cx),
+            Self::Big(editor) => editor.focus_handle(cx),
+        }
+    }
+
+    fn focus(&self, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Code(editor) => editor.update(cx, |editor, cx| editor.focus(window, cx)),
+            Self::Big(editor) => window.focus(&editor.focus_handle(cx), cx),
+        }
+    }
+
+    /// The cursor's line and column, counting from zero.
+    fn cursor(&self, cx: &App) -> (usize, usize) {
+        match self {
+            Self::Code(editor) => {
+                let Position { line, character } = editor.read(cx).cursor_position();
+                (line as usize, character as usize)
+            }
+            Self::Big(editor) => editor.read(cx).cursor_position(),
+        }
+    }
+}
+
 struct OpenFile {
     path: PathBuf,
     disk: Disk,
-    editor: Entity<EditorState>,
+    body: Body,
     language: Option<Language>,
     /// The highlighter knows the language.
     colored: bool,
     /// Changed since it was opened or saved.
     dirty: bool,
+    /// Counts changes, to tell whether typing went on during a save.
+    edits: u64,
     /// Read and saved as root, with sudo.
     as_root: bool,
+    /// Not saved anywhere yet. Its text is kept in the scratch folder.
+    scratch: bool,
+    /// Writes a scratch file's text once typing stops.
+    autosave: Option<Task<()>>,
     help: Help,
     _subscriptions: [Subscription; 2],
 }
@@ -78,12 +169,32 @@ impl OpenFile {
             .unwrap_or_default()
             .into()
     }
+
+    /// Writes a scratch file's text to the scratch folder.
+    fn keep_scratch(&self, cx: &App) {
+        if let Err(err) = write_text(&Disk::Local, &self.path, &self.body.text(cx)) {
+            tracing::warn!(%err, "could not keep the scratch file");
+        }
+    }
+
+    /// Stops the language server watching this file. A scratch file is deleted.
+    fn forget(self) {
+        if let Help::Server { client, uri } = &self.help {
+            client.close(uri);
+        }
+        if self.scratch {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub struct EditorPane {
     files: Vec<OpenFile>,
     active: usize,
+    /// Fills a tab of its own, instead of sitting beside terminals.
+    own_tab: bool,
     focus_handle: FocusHandle,
+    _quit: Option<Subscription>,
 }
 
 impl EventEmitter<EditorPaneEvent> for EditorPane {}
@@ -93,7 +204,23 @@ impl EditorPane {
         Self {
             files: Vec::new(),
             active: 0,
+            own_tab: false,
             focus_handle: cx.focus_handle(),
+            _quit: None,
+        }
+    }
+
+    /// A pane for a tab of its own, which can hold scratch files.
+    pub fn in_tab(cx: &mut Context<Self>) -> Self {
+        // Typing just before quitting would miss the autosave.
+        let quit = cx.on_app_quit(|pane, cx| {
+            pane.keep_scratch_now(cx);
+            async {}
+        });
+        Self {
+            own_tab: true,
+            _quit: Some(quit),
+            ..Self::new(cx)
         }
     }
 
@@ -114,7 +241,7 @@ impl EditorPane {
         &mut self,
         path: PathBuf,
         disk: Disk,
-        text: String,
+        text: FileText,
         as_root: bool,
         shell_path: Option<&str>,
         window: &mut Window,
@@ -123,49 +250,129 @@ impl EditorPane {
         if self.show_open(&path, &disk, window, cx) {
             return;
         }
-        let language = language::detect(&path);
-        let colored = language.is_some_and(|l| LanguageRegistry::singleton().language(l.grammar).is_some());
-        let size = text.len();
-        let editor = cx.new(|cx| {
-            let editor = EditorState::new(window, cx).default_value(text);
-            match language.filter(|_| colored) {
-                Some(language) => editor.language(language.grammar),
-                None => editor,
-            }
-        });
-        let help = match language {
-            // Language servers run here, and read files from this computer.
-            Some(_) if !disk.is_local() => Help::None("Code help runs for files on this computer".into()),
-            Some(_) if size > LSP_MAX_BYTES => Help::None("File too big for code help".into()),
-            Some(language) => Self::help_for(&path, &language, &editor, shell_path, cx),
-            None => Help::None(String::new()),
-        };
-        let subscriptions = [
-            cx.observe(&editor, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&editor, window, |pane, editor, event, _, cx| {
-                if let InputEvent::Change = event
-                    && let Some(file) = pane.files.iter_mut().find(|file| file.editor == *editor)
-                {
-                    file.dirty = true;
-                    if let Help::Server { client, uri } = &file.help {
-                        client.sync(uri, editor.read(cx).text());
+        let (body, language, colored, help, subscriptions) = match text {
+            FileText::Code(text) => {
+                let language = language::detect(&path);
+                let colored = language.is_some_and(|l| LanguageRegistry::singleton().language(l.grammar).is_some());
+                let size = text.len();
+                let editor = cx.new(|cx| {
+                    let editor = EditorState::new(window, cx).default_value(text);
+                    match language.filter(|_| colored) {
+                        Some(language) => editor.language(language.grammar),
+                        None => editor,
                     }
-                    cx.notify();
-                }
-            }),
-        ];
+                });
+                let help = match language {
+                    // Language servers run here, and read files from this computer.
+                    Some(_) if !disk.is_local() => Help::None("Code help runs for files on this computer".into()),
+                    Some(_) if size > LSP_MAX_BYTES => Help::None("File too big for code help".into()),
+                    Some(language) => Self::help_for(&path, &language, &editor, shell_path, cx),
+                    None => Help::None(String::new()),
+                };
+                let subscriptions = [
+                    cx.observe(&editor, |_, _, cx| cx.notify()),
+                    cx.subscribe_in(&editor, window, |pane, editor, event, _, cx| {
+                        if let InputEvent::Change = event {
+                            pane.changed(editor.entity_id(), cx);
+                        }
+                    }),
+                ];
+                (Body::Code(editor), language, colored, help, subscriptions)
+            }
+            FileText::Big(text) => {
+                let editor = cx.new(|cx| BigText::new(text, cx));
+                let subscriptions = [
+                    cx.observe(&editor, |_, _, cx| cx.notify()),
+                    cx.subscribe(&editor, |pane, editor, _: &BigTextEvent, cx| pane.changed(editor.entity_id(), cx)),
+                ];
+                let help = Help::None("Big file: plain text only".into());
+                (Body::Big(editor), None, false, help, subscriptions)
+            }
+        };
         self.files.push(OpenFile {
             path,
             disk,
-            editor,
+            body,
             language,
             colored,
             dirty: false,
+            edits: 0,
             as_root,
+            scratch: false,
+            autosave: None,
             help,
             _subscriptions: subscriptions,
         });
         self.activate(self.files.len() - 1, window, cx);
+        cx.emit(EditorPaneEvent::FilesChanged);
+    }
+
+    /// Notes a change to a file's text.
+    fn changed(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        let Some(file) = self.files.iter_mut().find(|file| file.body.id() == id) else { return };
+        file.edits += 1;
+        if file.scratch {
+            // Empty scratch files close without asking.
+            file.dirty = file.body.text(cx).len() > 0;
+            file.autosave = Some(Self::keep_scratch_soon(id, cx));
+        } else {
+            file.dirty = true;
+        }
+        if let (Help::Server { client, uri }, Body::Code(editor)) = (&file.help, &file.body) {
+            client.sync(uri, editor.read(cx).text());
+        }
+        cx.notify();
+    }
+
+    /// Adds a scratch file from the scratch folder, with its kept text.
+    pub fn add_scratch(&mut self, path: PathBuf, text: FileText, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty = !text.is_empty();
+        self.add(path.clone(), Disk::Local, text, false, None, window, cx);
+        if let Some(file) = self.files.iter_mut().find(|file| file.path == path) {
+            file.scratch = true;
+            file.dirty = dirty;
+        }
+    }
+
+    /// Writes a scratch file's text half a second after the last change.
+    fn keep_scratch_soon(id: EntityId, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |pane, cx| {
+            cx.background_executor().timer(Duration::from_millis(500)).await;
+            let _ = pane.update(cx, |pane, cx| {
+                if let Some(file) = pane.files.iter().find(|file| file.body.id() == id) {
+                    file.keep_scratch(cx);
+                }
+            });
+        })
+    }
+
+    /// Writes every scratch file's text now.
+    fn keep_scratch_now(&mut self, cx: &mut Context<Self>) {
+        for file in self.files.iter_mut().filter(|file| file.scratch) {
+            file.autosave = None;
+            file.keep_scratch(cx);
+        }
+    }
+
+    /// The files to open again next time, with whether each is a scratch file.
+    pub fn files(&self) -> impl Iterator<Item = (&Path, bool)> {
+        self.files.iter().filter(|file| file.disk.is_local()).map(|file| (file.path.as_path(), file.scratch))
+    }
+
+    pub fn holds(&self, path: &Path) -> bool {
+        self.files.iter().any(|file| file.path == path && file.disk.is_local())
+    }
+
+    /// The name of the file in front.
+    pub fn title(&self) -> SharedString {
+        self.files.get(self.active).map(OpenFile::name).unwrap_or_default()
+    }
+
+    /// Lets go of every file, for a tab closed without saving. Scratch text is thrown away.
+    pub fn discard(&mut self) {
+        for file in self.files.drain(..) {
+            file.forget();
+        }
     }
 
     /// Opens `path` with `selection` picked, for Go to Definition.
@@ -175,10 +382,10 @@ impl EditorPane {
             Err(err) => return cant_open(&path, &err, window, cx),
         }
         let file = self.files.iter().find(|file| file.path == path && file.disk.is_local());
-        let (Some(range), Some(file)) = (selection, file) else {
+        let (Some(range), Some(Body::Code(editor))) = (selection, file.map(|file| &file.body)) else {
             return;
         };
-        file.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.set_cursor_position(range.start, window, cx);
         });
     }
@@ -275,11 +482,14 @@ impl EditorPane {
     fn start_trusted(&mut self, cx: &mut Context<Self>) {
         for ix in 0..self.files.len() {
             let file = &self.files[ix];
-            let (Help::Untrusted { root, found }, Some(language)) = (&file.help, file.language) else { continue };
+            let (Help::Untrusted { root, found }, Some(language), Body::Code(editor)) = (&file.help, file.language, &file.body)
+            else {
+                continue;
+            };
             if !lsp::is_trusted(root, cx) {
                 continue;
             }
-            let (path, editor, root, found) = (file.path.clone(), file.editor.clone(), root.clone(), found.clone());
+            let (path, editor, root, found) = (file.path.clone(), editor.clone(), root.clone(), found.clone());
             self.files[ix].help = Self::attach_server(&path, &language, &editor, &found, &root, cx);
         }
         cx.notify();
@@ -288,29 +498,28 @@ impl EditorPane {
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(file) = self.files.get(ix) else { return };
         self.active = ix;
-        file.editor.update(cx, |editor, cx| editor.focus(window, cx));
+        file.body.focus(window, cx);
         cx.notify();
     }
 
     fn save(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(file) = self.files.get(self.active) else { return };
-        let text = file.editor.read(cx).text().clone();
-        let (path, disk, editor, name) = (file.path.clone(), file.disk.clone(), file.editor.clone(), file.name());
-        if disk.is_local() {
-            let result = disk.write(&path, text.to_string().as_bytes());
-            self.saved(&editor, &text, result, false, window, cx);
+        if file.scratch {
+            self.save_scratch(window, cx);
             return;
         }
-        let as_root = file.as_root;
+        let text = file.body.text(cx);
+        let (path, disk, id, name) = (file.path.clone(), file.disk.clone(), file.body.id(), file.name());
+        let (edits, as_root) = (file.edits, file.as_root);
+        // Off the UI thread, as big files take a while.
         cx.spawn_in(window, async move |pane, cx| {
-            let bytes = text.to_string();
             if !as_root {
                 let result = disk.clone().run({
-                    let (path, bytes) = (path.clone(), bytes.clone());
-                    move |disk| disk.write(&path, bytes.as_bytes())
+                    let (path, text) = (path.clone(), text.clone());
+                    move |disk| write_text(disk, &path, &text)
                 });
                 match result.await {
-                    Err(DiskError::Denied) => {
+                    Err(DiskError::Denied) if disk.can_sudo() => {
                         let title = format!("Save {name} with sudo?");
                         let detail = "Your account can't change this file. Somme can save it as root with sudo. \
                                       It keeps its owner and permissions.";
@@ -319,29 +528,82 @@ impl EditorPane {
                         }
                     }
                     result => {
-                        let _ = pane.update_in(cx, |pane, window, cx| pane.saved(&editor, &text, result, false, window, cx));
+                        let _ = pane.update_in(cx, |pane, window, cx| pane.saved(id, edits, &text, result, false, window, cx));
                         return;
                     }
                 }
             }
+            let bytes = text.to_string();
             let result = sudo::as_root(&disk, move |disk, password| disk.write_as_root(&path, bytes.as_bytes(), password), cx).await;
-            let _ = pane.update_in(cx, |pane, window, cx| pane.saved(&editor, &text, result, true, window, cx));
+            let _ = pane.update_in(cx, |pane, window, cx| pane.saved(id, edits, &text, result, true, window, cx));
         })
         .detach();
     }
 
+    /// Asks where to save the scratch file in front, then saves it there.
+    fn save_scratch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.files.get(self.active) else { return };
+        let (id, name) = (file.body.id(), file.name());
+        let dir = dirs::document_dir().or_else(dirs::home_dir).unwrap_or_default();
+        let picked = cx.prompt_for_new_path(&dir, Some(name.as_ref()));
+        cx.spawn_in(window, async move |pane, cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            let _ = pane.update_in(cx, |pane, window, cx| pane.move_scratch(id, path, window, cx));
+        })
+        .detach();
+    }
+
+    /// Saves a scratch file at `path`, where it lives from now on.
+    fn move_scratch(&mut self, id: EntityId, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.files.iter().position(|file| file.body.id() == id) else { return };
+        if let Err(err) = write_text(&Disk::Local, &path, &self.files[ix].body.text(cx)) {
+            native::error(&format!("Can't save {}", self.files[ix].name()), &err.to_string(), window, cx);
+            return;
+        }
+        // The new name may say what language it is. Big files stay plain.
+        let (language, colored, help) = match &self.files[ix].body {
+            Body::Code(editor) => {
+                let editor = editor.clone();
+                let language = language::detect(&path);
+                let colored = language.is_some_and(|l| LanguageRegistry::singleton().language(l.grammar).is_some());
+                if let Some(language) = language.filter(|_| colored) {
+                    editor.update(cx, |editor, cx| editor.set_highlighter(language.grammar, cx));
+                }
+                let help = match language {
+                    Some(language) => Self::help_for(&path, &language, &editor, None, cx),
+                    None => Help::None(String::new()),
+                };
+                (language, colored, help)
+            }
+            Body::Big(_) => (None, false, Help::None("Big file: plain text only".into())),
+        };
+        let file = &mut self.files[ix];
+        let scratch = std::mem::replace(&mut file.path, path);
+        let _ = std::fs::remove_file(scratch);
+        file.scratch = false;
+        file.autosave = None;
+        file.dirty = false;
+        file.language = language;
+        file.colored = colored;
+        file.help = help;
+        cx.emit(EditorPaneEvent::FilesChanged);
+        cx.notify();
+    }
+
     /// Marks a file saved as `text`, or says why it wasn't. `as_root` says it
     /// was saved with sudo, so later saves go the same way.
+    #[allow(clippy::too_many_arguments)]
     fn saved(
         &mut self,
-        editor: &Entity<EditorState>,
+        id: EntityId,
+        edits: u64,
         text: &Rope,
         result: Result<(), DiskError>,
         as_root: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(file) = self.files.iter_mut().find(|file| file.editor == *editor) else { return };
+        let Some(file) = self.files.iter_mut().find(|file| file.body.id() == id) else { return };
         match result {
             Ok(()) => {}
             Err(DiskError::Cancelled) => return,
@@ -353,7 +615,7 @@ impl EditorPane {
         }
         file.as_root |= as_root;
         // Typing during a slow save leaves changes to save.
-        file.dirty = *file.editor.read(cx).text() != *text;
+        file.dirty = file.edits != edits;
         if let Help::Server { client, uri } = &file.help {
             client.saved(uri, text);
         }
@@ -371,14 +633,14 @@ impl EditorPane {
             self.close(ix, window, cx);
             return;
         }
-        let (editor, pane) = (file.editor.clone(), cx.entity().downgrade());
+        let (id, pane) = (file.body.id(), cx.entity().downgrade());
         native::confirm(
             &format!("Close {} without saving?", file.name()),
             "Your changes will be lost.",
             "Close Without Saving",
             move |window, cx| {
                 let _ = pane.update(cx, |pane, cx| {
-                    if let Some(ix) = pane.files.iter().position(|file| file.editor == editor) {
+                    if let Some(ix) = pane.files.iter().position(|file| file.body.id() == id) {
                         pane.close(ix, window, cx);
                     }
                 });
@@ -389,14 +651,12 @@ impl EditorPane {
     }
 
     fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let file = self.files.remove(ix);
-        if let Help::Server { client, uri } = &file.help {
-            client.close(uri);
-        }
+        self.files.remove(ix).forget();
         if self.files.is_empty() {
             cx.emit(EditorPaneEvent::Empty);
             return;
         }
+        cx.emit(EditorPaneEvent::FilesChanged);
         if self.active >= ix && self.active > 0 {
             self.active -= 1;
         }
@@ -482,9 +742,11 @@ impl EditorPane {
 
     fn render_status(&self, file: &OpenFile, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let Position { line, character } = file.editor.read(cx).cursor_position();
+        let (line, character) = file.body.cursor(cx);
+        let plain = file.scratch || matches!(file.body, Body::Big(_)) || file.path.extension().is_some_and(|ext| ext == "txt");
         let language = match (file.language, file.colored) {
             (Some(language), true) => language.label.to_owned(),
+            _ if plain => "Plain text".to_owned(),
             _ => "Language support is unavailable for this file type".to_owned(),
         };
         let (server, server_color) = match &file.help {
@@ -500,7 +762,10 @@ impl EditorPane {
             Help::Untrusted { root, found } => Some((root.clone(), found.name())),
             _ => None,
         };
-        let problems = file.editor.read(cx).diagnostics().map_or(0, |set| set.len());
+        let problems = match &file.body {
+            Body::Code(editor) => editor.read(cx).diagnostics().map_or(0, |set| set.len()),
+            Body::Big(_) => 0,
+        };
         h_flex()
             .h(px(26.))
             .flex_none()
@@ -555,28 +820,66 @@ pub fn cant_open(path: &Path, err: &DiskError, window: &mut Window, cx: &mut App
     native::error(&format!("Can't open {name}"), &err.to_string(), window, cx);
 }
 
-/// Reads a file as text. Err says why it can't be edited. Slow for big files
-/// and server files: run it in [`Disk::run`].
-pub fn read_text(disk: &Disk, path: &Path) -> Result<String, DiskError> {
-    text(disk.read(path, MAX_BYTES)?)
+/// Reads a file as text, of any size. Err says why it can't be edited. Slow
+/// for big files and server files: run it in [`Disk::run`].
+pub fn read_text(disk: &Disk, path: &Path) -> Result<FileText, DiskError> {
+    if disk.is_local() && std::fs::metadata(path)?.len() > BIG_BYTES {
+        return read_big(path).map(FileText::Big);
+    }
+    text(disk.read(path, ANY_SIZE)?).map(FileText::sort)
 }
 
 /// [`read_text`] as root, with sudo.
-pub fn read_text_as_root(disk: &Disk, path: &Path, password: Option<&str>) -> Result<String, DiskError> {
-    text(disk.read_as_root(path, MAX_BYTES, password)?)
+pub fn read_text_as_root(disk: &Disk, path: &Path, password: Option<&str>) -> Result<FileText, DiskError> {
+    text(disk.read_as_root(path, ANY_SIZE, password)?).map(FileText::sort)
+}
+
+/// Reads a big file on this computer straight into a rope, without a second copy.
+fn read_big(path: &Path) -> Result<Rope, DiskError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut head = vec![0; 8192];
+    let read = file.read(&mut head)?;
+    if head[..read].contains(&0) {
+        return Err(not_text());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Rope::from_reader(BufReader::with_capacity(1 << 20, file)).map_err(|err| match err.kind() {
+        std::io::ErrorKind::InvalidData => not_utf8(),
+        _ => err.into(),
+    })
 }
 
 fn text(bytes: Vec<u8>) -> Result<String, DiskError> {
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
-        return Err(DiskError::Other("It is not a text file.".into()));
+        return Err(not_text());
     }
-    String::from_utf8(bytes).map_err(|_| DiskError::Other("It is not UTF-8 text.".into()))
+    String::from_utf8(bytes).map_err(|_| not_utf8())
+}
+
+fn not_text() -> DiskError {
+    DiskError::Other("It is not a text file.".into())
+}
+
+fn not_utf8() -> DiskError {
+    DiskError::Other("It is not UTF-8 text.".into())
+}
+
+/// Writes `text` to `path`. On this computer it goes a piece at a time, so a
+/// big file needs no second copy.
+fn write_text(disk: &Disk, path: &Path, text: &Rope) -> Result<(), DiskError> {
+    if !disk.is_local() {
+        return disk.write(path, text.to_string().as_bytes());
+    }
+    let mut out = BufWriter::new(std::fs::File::create(path)?);
+    text.write_to(&mut out)?;
+    out.flush()?;
+    Ok(())
 }
 
 impl Focusable for EditorPane {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self.files.get(self.active) {
-            Some(file) => file.editor.focus_handle(cx),
+            Some(file) => file.body.focus_handle(cx),
             None => self.focus_handle.clone(),
         }
     }
@@ -594,21 +897,21 @@ impl Render for EditorPane {
             .on_action(cx.listener(Self::on_close_file))
             .size_full()
             .bg(theme.background)
-            .border_l_1()
-            .border_color(theme.border)
-            .child(self.render_tabs(cx))
+            .when(!self.own_tab, |pane| pane.border_l_1().border_color(theme.border))
+            // In a tab of its own, the workspace tab already names a single file.
+            .when(!self.own_tab || self.files.len() > 1, |pane| pane.child(self.render_tabs(cx)))
             .when_some(file, |pane, file| {
-                pane.child(
-                    div().flex_1().min_h_0().child(
-                        Editor::new(&file.editor)
-                            .appearance(false)
-                            .bordered(false)
-                            .size_full()
-                            .font_family(settings.font_family.clone())
-                            .text_size(px(settings.font_size.clamp(6., 72.))),
-                    ),
-                )
-                .child(self.render_status(file, cx))
+                let body = match &file.body {
+                    Body::Code(editor) => Editor::new(editor)
+                        .appearance(false)
+                        .bordered(false)
+                        .size_full()
+                        .font_family(settings.font_family.clone())
+                        .text_size(px(settings.font_size.clamp(6., 72.)))
+                        .into_any_element(),
+                    Body::Big(editor) => editor.clone().into_any_element(),
+                };
+                pane.child(div().flex_1().min_h_0().child(body)).child(self.render_status(file, cx))
             })
     }
 }
@@ -627,8 +930,47 @@ mod tests {
         let read = |name: &str| read_text(&Disk::Local, &dir.join(name));
         let results = [read("a.txt"), read("b.bin"), read("c.txt")];
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(results[0].as_deref(), Ok("hello"));
+        assert!(matches!(&results[0], Ok(FileText::Code(text)) if text == "hello"));
         assert!(results[1].is_err());
         assert!(results[2].is_err());
+    }
+
+    #[test]
+    fn files_on_a_server_open_and_save_at_any_size() {
+        use crate::terminal::disk::fake;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("srv")).unwrap();
+        let line = "2026-10-18 10:00:00 INFO order query done\n";
+        let big = line.repeat(BIG_BYTES as usize / line.len() + 10);
+        std::fs::write(root.path().join("srv/app.log"), &big).unwrap();
+        std::fs::write(root.path().join("srv/a.txt"), "hi").unwrap();
+        let disk = fake::disk(root.path());
+        let Ok(FileText::Big(text)) = read_text(&disk, Path::new("/srv/app.log")) else {
+            panic!("a big file on a server opens in the plain editor");
+        };
+        assert_eq!(text.len(), big.len());
+        write_text(&disk, Path::new("/srv/copy.log"), &text).unwrap();
+        assert_eq!(std::fs::read(root.path().join("srv/copy.log")).unwrap(), big.as_bytes());
+        assert!(matches!(read_text(&disk, Path::new("/srv/a.txt")), Ok(FileText::Code(text)) if text == "hi"));
+    }
+
+    #[test]
+    fn big_and_long_files_go_to_the_plain_editor() {
+        let dir = std::env::temp_dir().join(format!("somme-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = "2026-10-18 10:00:00 INFO order query done\n";
+        let big = line.repeat(BIG_BYTES as usize / line.len() + 10);
+        std::fs::write(dir.join("big.log"), &big).unwrap();
+        let read = read_text(&Disk::Local, &dir.join("big.log"));
+        let saved = match &read {
+            Ok(FileText::Big(text)) => write_text(&Disk::Local, &dir.join("copy.log"), text).map(|()| std::fs::read(dir.join("copy.log")).unwrap()),
+            _ => Err(DiskError::Cancelled),
+        };
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(&read, Ok(FileText::Big(text)) if text.len() == big.len()));
+        assert_eq!(saved.unwrap(), big.as_bytes());
+        assert!(matches!(FileText::sort("a\n".repeat(BIG_LINES + 1)), FileText::Big(_)));
+        assert!(matches!(FileText::sort("a\n".repeat(10)), FileText::Code(_)));
     }
 }
