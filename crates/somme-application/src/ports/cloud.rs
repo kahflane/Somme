@@ -52,6 +52,10 @@ pub trait CloudAccounts: Send + Sync {
 
 pub trait SessionStore: Send + Sync {
     fn load(&self) -> Option<CloudSession>;
+    /// Who is signed in. Unlike `load`, this may answer without the secret store.
+    fn profile(&self) -> Option<CloudProfile> {
+        self.load().map(|session| session.profile)
+    }
     fn save(&self, session: &CloudSession) -> Result<(), GatewayError>;
     fn clear(&self) -> Result<(), GatewayError>;
 }

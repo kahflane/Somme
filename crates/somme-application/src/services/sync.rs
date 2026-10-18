@@ -52,14 +52,22 @@ impl SyncService {
         self.gateway.state().into()
     }
 
+    /// Who is signed in, without reading the sign-in itself when that can wait.
     pub fn account(&self) -> AccountStatus {
-        let profile = self.sessions.load().map(|s| s.profile);
+        let profile = self.sessions.profile();
         AccountStatus {
             signed_in: profile.is_some(),
             login: profile.as_ref().map(|p| p.login.clone()),
             name: profile.as_ref().and_then(|p| p.name.clone()),
             avatar_url: profile.and_then(|p| p.avatar_url),
         }
+    }
+
+    /// Reads the saved sign-in, which can ask the system keychain, and
+    /// returns who it belongs to.
+    pub fn load_session(&self) -> AccountStatus {
+        let _ = self.sessions.load();
+        self.account()
     }
 
     /// Signs in with GitHub in the browser. Starting another sign-in, or
@@ -83,7 +91,7 @@ impl SyncService {
 
     /// The signed-in user's GitHub picture.
     pub async fn avatar(&self) -> AppResult<Option<Vec<u8>>> {
-        let Some(url) = self.sessions.load().and_then(|s| s.profile.avatar_url) else {
+        let Some(url) = self.sessions.profile().and_then(|p| p.avatar_url) else {
             return Ok(None);
         };
         Ok(Some(self.cloud.avatar(&url).await?))

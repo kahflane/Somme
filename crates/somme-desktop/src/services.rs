@@ -139,6 +139,8 @@ pub struct Services {
     pub sync: Arc<SyncService>,
     pub import: Arc<ImportService>,
     pub preferences: Arc<PreferenceService>,
+    sync_gateway: Arc<TursoSync>,
+    publisher: Arc<dyn EventPublisher>,
 }
 
 fn data_dir() -> anyhow::Result<PathBuf> {
@@ -162,7 +164,7 @@ impl Services {
         let cloud_sessions: Arc<dyn SessionStore> = if test_mode {
             Arc::new(MemorySessionStore::default())
         } else {
-            Arc::new(KeyringSessionStore::default())
+            Arc::new(KeyringSessionStore::new(data_dir.join("account.json")))
         };
         let master_key: Arc<dyn KeyStore> = if test_mode {
             Arc::new(MemoryKeyStore::default())
@@ -235,7 +237,6 @@ impl Services {
             publisher.clone(),
             repo.clone(),
         ));
-        sync_gateway.start(publisher);
 
         Ok(Self {
             data_dir,
@@ -252,7 +253,16 @@ impl Services {
             sessions,
             sync,
             import,
+            sync_gateway,
+            publisher,
         })
+    }
+
+    /// Starts background sync. It needs the GitHub sign-in from the keychain,
+    /// so it waits until the vault or the account is first used. Runs on the
+    /// IO runtime; later calls do nothing.
+    pub fn start_sync(&self) {
+        self.sync_gateway.start(self.publisher.clone());
     }
 
     pub async fn shutdown(&self) {

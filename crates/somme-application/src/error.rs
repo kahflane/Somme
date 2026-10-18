@@ -18,11 +18,11 @@ pub enum AppError {
     Cloud(#[from] CloudError),
     #[error("{0} not found")]
     NotFound(&'static str),
-    #[error("the vault is locked")]
+    #[error("your saved servers and keys are locked. Unlock them with your master password first")]
     VaultLocked,
-    #[error("the vault is not set up yet")]
+    #[error("no master password is set yet")]
     VaultNotInitialized,
-    #[error("the vault is already set up")]
+    #[error("a master password is already set")]
     VaultAlreadyInitialized,
     #[error("wrong master password")]
     WrongPassword,

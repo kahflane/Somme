@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::sidebar::{Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, TitleBar, WindowExt as _, h_flex,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, TitleBar, WindowExt as _, h_flex,
     v_flex,
 };
 use gpui_kit::{
@@ -25,7 +26,7 @@ use crate::services::Services;
 use crate::settings::Settings;
 use crate::store::{Store, StoreEvent, mutate};
 use crate::terminal::SessionTarget;
-use crate::ui::common::{APP_NAME, Lucide, avatar, logo, notify_error, parse_color};
+use crate::ui::common::{Lucide, avatar, notify_error, parse_color};
 use crate::ui::native;
 use crate::ui::fields::host_input;
 use crate::ui::filter::parse_quick_connect;
@@ -116,6 +117,16 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// What the rail on the left shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    /// The terminal tabs. The app starts here.
+    Cli,
+    /// Hosts and the rest of the vault. Asks for the master password first.
+    Ssh,
+    Settings,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Hosts,
@@ -129,6 +140,17 @@ pub enum Page {
 }
 
 impl Page {
+    /// The pages in the SSH section, in sidebar order.
+    const VAULT: [Page; 7] = [
+        Page::Hosts,
+        Page::Sftp,
+        Page::Keychain,
+        Page::Forwarding,
+        Page::Snippets,
+        Page::KnownHosts,
+        Page::Logs,
+    ];
+
     pub(crate) const ALL: [Page; 8] = [
         Page::Hosts,
         Page::Sftp,
@@ -216,12 +238,16 @@ impl Render for DraggedTab {
 pub struct Workspace {
     services: Arc<Services>,
     tabs: Vec<Tab>,
-    /// `None` shows the home screen (hosts, keychain, ...).
+    /// The tab in front when the CLI section shows. `None` once every tab is closed.
     active: Option<usize>,
+    section: Section,
+    /// The vault page the SSH section shows.
     page: Page,
     next_tab_id: usize,
     /// The terminal tab used last, where snippets run from the home screen.
     last_terminal: Option<usize>,
+    /// The tab on this computer used last, where the CLI icon goes back to.
+    last_local: Option<usize>,
     lock_screen: Entity<LockScreen>,
     hosts: Option<Entity<HostsPage>>,
     keychain: Option<Entity<KeychainPage>>,
@@ -237,8 +263,6 @@ pub struct Workspace {
     side_panel: Option<(Entity<SidePanel>, Subscription)>,
     /// Last key press, click or scroll. Auto-lock counts idle time from here.
     last_activity: Instant,
-    /// Set after the first unlock, so the start-up terminal opens only once.
-    started: bool,
     renaming: Option<Renaming>,
     _subscriptions: Vec<Subscription>,
 }
@@ -249,29 +273,25 @@ impl Workspace {
         let lock_screen = cx.new(|cx| LockScreen::new(window, cx));
         let subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&store, window, |workspace, store, event, window, cx| match event {
+            cx.subscribe_in(&store, window, |workspace, _, event, window, cx| match event {
+                // Locking only closes the vault. Terminals stay as they are.
                 StoreEvent::VaultChanged => {
-                    if store.read(cx).is_unlocked() {
-                        // The app starts on a local terminal.
-                        if !workspace.started && workspace.tabs.is_empty() {
-                            workspace.open_terminal(SessionTarget::Local, window, cx);
-                        }
-                        workspace.started = true;
+                    if workspace.section == Section::Ssh {
                         workspace.focus_current(window, cx);
-                    } else {
-                        workspace.lock_screen.update(cx, |lock, cx| lock.focus_password(window, cx));
                     }
                 }
             }),
         ];
         Self::watch_idle(cx);
-        Self {
+        let mut workspace = Self {
             services,
             tabs: Vec::new(),
             active: None,
+            section: Section::Cli,
             page: Page::Hosts,
             next_tab_id: 0,
             last_terminal: None,
+            last_local: None,
             lock_screen,
             hosts: None,
             keychain: None,
@@ -285,10 +305,12 @@ impl Workspace {
             palette: None,
             side_panel: None,
             last_activity: Instant::now(),
-            started: false,
             renaming: None,
             _subscriptions: subscriptions,
-        }
+        };
+        // The app starts on a local terminal, without waiting for the vault.
+        workspace.open_terminal(SessionTarget::Local, window, cx);
+        workspace
     }
 
     /// Locks the vault once the user has been idle longer than the auto-lock setting.
@@ -320,16 +342,22 @@ impl Workspace {
     }
 
     fn focus_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active.and_then(|ix| self.tabs.get(ix)) {
-            Some(Tab {
-                content: TabContent::Terminal(tab),
-                ..
-            }) => window.focus(&tab.focus_handle(cx), cx),
-            Some(Tab {
-                content: TabContent::Changes(view),
-                ..
-            }) => window.focus(&view.focus_handle(cx), cx),
-            None => window.focus(&self.focus_handle, cx),
+        match self.section {
+            Section::Cli => match self.active.and_then(|ix| self.tabs.get(ix)) {
+                Some(Tab {
+                    content: TabContent::Terminal(tab),
+                    ..
+                }) => window.focus(&tab.focus_handle(cx), cx),
+                Some(Tab {
+                    content: TabContent::Changes(view),
+                    ..
+                }) => window.focus(&view.focus_handle(cx), cx),
+                None => window.focus(&self.focus_handle, cx),
+            },
+            Section::Ssh if !Store::global(cx).read(cx).is_unlocked() => {
+                self.lock_screen.update(cx, |lock, cx| lock.focus_password(window, cx));
+            }
+            Section::Ssh | Section::Settings => window.focus(&self.focus_handle, cx),
         }
     }
 
@@ -449,9 +477,6 @@ impl Workspace {
             self.close_palette(window, cx);
             return;
         }
-        if !Store::global(cx).read(cx).is_unlocked() {
-            return;
-        }
         let palette = cx.new(|cx| CommandPalette::new(window, cx));
         let subscription = cx.subscribe_in(&palette, window, |workspace, _, event, window, cx| match event {
             PaletteEvent::Dismiss => workspace.close_palette(window, cx),
@@ -473,6 +498,10 @@ impl Workspace {
 
     fn run_palette_action(&mut self, action: PaletteAction, window: &mut Window, cx: &mut Context<Self>) {
         match action {
+            // Saving a host needs the vault, so a locked one asks for it first.
+            PaletteAction::QuickConnect(_) if !Store::global(cx).read(cx).is_unlocked() => {
+                self.show_page(Page::Hosts, window, cx)
+            }
             PaletteAction::QuickConnect(text) => {
                 self.quick_connect(&text, None, window, cx);
             }
@@ -481,6 +510,7 @@ impl Workspace {
             PaletteAction::NewLocalTerminal => self.open_terminal(SessionTarget::Local, window, cx),
             PaletteAction::Page(page) => self.show_page(page, window, cx),
             PaletteAction::Lock => Store::global(cx).update(cx, |store, cx| store.lock(cx)),
+            PaletteAction::Unlock => self.show_page(Page::Hosts, window, cx),
         }
     }
 
@@ -640,15 +670,63 @@ impl Workspace {
         }
     }
 
+    /// Shows the CLI section with the tab at `index` in front.
     fn activate(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         self.active = index.filter(|ix| *ix < self.tabs.len());
-        match self.active {
-            Some(ix) => {
-                if let TabContent::Terminal(_) = self.tabs[ix].content {
-                    self.last_terminal = Some(self.tabs[ix].id);
-                }
+        self.section = Section::Cli;
+        if let Some(ix) = self.active {
+            if let TabContent::Terminal(_) = self.tabs[ix].content {
+                self.last_terminal = Some(self.tabs[ix].id);
             }
-            None => self.reload_page(cx),
+            if !self.is_ssh_tab(ix, cx) {
+                self.last_local = Some(self.tabs[ix].id);
+            }
+        }
+        self.focus_current(window, cx);
+        cx.notify();
+    }
+
+    fn is_ssh_tab(&self, ix: usize, cx: &App) -> bool {
+        matches!(
+            &self.tabs[ix].content,
+            TabContent::Terminal(term) if matches!(term.read(cx).target, SessionTarget::Ssh { .. })
+        )
+    }
+
+    /// The rail icon that lights up. An SSH tab in front counts as SSH.
+    fn rail_section(&self, cx: &App) -> Section {
+        match self.section {
+            Section::Cli if self.active.is_some_and(|ix| self.is_ssh_tab(ix, cx)) => Section::Ssh,
+            section => section,
+        }
+    }
+
+    /// Like pressing ⌘1 to ⌘8: a number past the last tab does nothing.
+    fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.tabs.len() {
+            self.activate(Some(ix), window, cx);
+        }
+    }
+
+    fn show_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        if section == Section::Cli {
+            // The CLI icon goes to a tab on this computer, never an SSH one.
+            let local = |ix: &usize| !self.is_ssh_tab(*ix, cx);
+            let ix = self
+                .active
+                .filter(local)
+                .or_else(|| self.tabs.iter().position(|t| Some(t.id) == self.last_local))
+                .or_else(|| (0..self.tabs.len()).rev().find(local));
+            match ix {
+                Some(ix) => self.activate(Some(ix), window, cx),
+                None => self.open_terminal(SessionTarget::Local, window, cx),
+            }
+            return;
+        }
+        self.section = section;
+        if section == Section::Ssh {
+            Store::global(cx).update(cx, |store, cx| store.open_vault(cx));
+            self.reload_page(cx);
         }
         self.focus_current(window, cx);
         cx.notify();
@@ -668,7 +746,13 @@ impl Workspace {
             Some(active) if active > ix => Some(active - 1),
             other => other,
         };
-        self.activate(next, window, cx);
+        // A tab that ends behind the vault or settings leaves them in front.
+        if self.section == Section::Cli {
+            self.activate(next, window, cx);
+        } else {
+            self.active = next;
+            cx.notify();
+        }
     }
 
     /// Moves the tab with `id` to position `to`, keeping the same tab in front.
@@ -759,7 +843,11 @@ impl Workspace {
         );
     }
 
+    /// The terminal tab in front, when the CLI section shows.
     fn active_terminal(&self) -> Option<Entity<TerminalTab>> {
+        if self.section != Section::Cli {
+            return None;
+        }
         match &self.tabs.get(self.active?)?.content {
             TabContent::Terminal(tab) => Some(tab.clone()),
             TabContent::Changes(_) => None,
@@ -767,16 +855,28 @@ impl Workspace {
     }
 
     fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // Position 0 is the home screen, tabs follow.
-        let count = self.tabs.len() + 1;
-        let current = self.active.map(|ix| ix + 1).unwrap_or(0);
-        let next = if forward { (current + 1) % count } else { (current + count - 1) % count };
-        self.activate(next.checked_sub(1), window, cx);
+        let count = self.tabs.len();
+        if count == 0 {
+            return;
+        }
+        // From the vault or settings, the first step lands on the first or last tab.
+        let next = match self.active.filter(|_| self.section == Section::Cli) {
+            Some(ix) if forward => (ix + 1) % count,
+            Some(ix) => (ix + count - 1) % count,
+            None if forward => 0,
+            None => count - 1,
+        };
+        self.activate(Some(next), window, cx);
     }
 
+    /// Shows a vault page in the SSH section, or the settings.
     pub fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if page == Page::Settings {
+            self.show_section(Section::Settings, window, cx);
+            return;
+        }
         self.page = page;
-        self.activate(None, window, cx);
+        self.show_section(Section::Ssh, window, cx);
     }
 
     /// Opens the SFTP screen with `host_id` on the right side.
@@ -817,18 +917,15 @@ impl Workspace {
     fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_terminal() {
             Some(tab) if tab.read(cx).panes().len() > 1 => tab.update(cx, |tab, cx| tab.close_active(window, cx)),
-            Some(_) => {
-                if let Some(ix) = self.active {
-                    self.request_close_tab(ix, window, cx);
-                }
-            }
-            None => window.remove_window(),
+            _ => self.on_close_tab(&CloseTab, window, cx),
         }
     }
 
+    /// Closes the tab in front, or the window when no tab is.
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.active {
-            self.request_close_tab(ix, window, cx);
+        match self.active.filter(|_| self.section == Section::Cli) {
+            Some(ix) => self.request_close_tab(ix, window, cx),
+            None => window.remove_window(),
         }
     }
 
@@ -852,36 +949,9 @@ impl Workspace {
             theme.foreground.opacity(0.09),
             theme.foreground.opacity(0.14),
         );
-        let home_active = self.active.is_none();
-        let home = div()
-            .id("tab-home")
-            .h(px(26.))
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .rounded_md()
-            .border_1()
-            .text_sm()
-            .cursor_pointer()
-            .when(home_active, |el| {
-                el.bg(tab_active).border_color(theme.border).text_color(theme.foreground)
-            })
-            .when(!home_active, |el| {
-                el.bg(tab_bg)
-                    .border_color(theme.transparent)
-                    .text_color(theme.tab_foreground)
-                    .hover(|el| el.bg(tab_hover))
-            })
-            .child(Icon::new(Lucide::LayoutGrid).size(px(14.)))
-            .child("Vault")
-            // Keeps a press here from moving the window, as the title bar behind would.
-            .block_mouse_except_scroll()
-            .on_click(cx.listener(|workspace, _, window, cx| workspace.activate(None, window, cx)));
-
         let workspace = cx.entity().downgrade();
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
-            let selected = self.active == Some(ix);
+            let selected = self.section == Section::Cli && self.active == Some(ix);
             let changes = matches!(tab.content, TabContent::Changes(_));
             let (title, color, broadcast, running, renamed) = match &tab.content {
                 TabContent::Terminal(term) => {
@@ -961,6 +1031,7 @@ impl Workspace {
                         workspace.activate(Some(ix), window, cx);
                     }
                 }))
+                // Keeps a press here from moving the window, as the title bar behind would.
                 .block_mouse_except_scroll()
                 .on_mouse_down(
                     MouseButton::Middle,
@@ -1017,7 +1088,6 @@ impl Workspace {
             .min_w_0()
             .gap_1()
             .overflow_x_scroll()
-            .child(home)
             .children(tabs)
             .child(new_tab)
     }
@@ -1033,9 +1103,8 @@ impl Workspace {
                     .min_w_0()
                     .pr_2()
                     .gap_2()
-                    .when(unlocked, |bar| bar.child(self.render_tab_strip(cx)))
-                    .when(!unlocked, |bar| bar.child(div().flex_1().text_sm().child(APP_NAME)))
-                    .when(unlocked && self.side_panel_fits(cx), |bar| {
+                    .child(self.render_tab_strip(cx))
+                    .when(self.side_panel_fits(cx), |bar| {
                         bar.child(
                             Button::new("side-panel")
                                 .ghost()
@@ -1046,87 +1115,124 @@ impl Workspace {
                                 .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_side_panel(window, cx))),
                         )
                     })
-                    .when(unlocked, |bar| {
-                        bar.child(
-                            Button::new("palette")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Search)
-                                .tooltip("Search and connect (⌘P)")
-                                .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_palette(window, cx))),
-                        )
-                    })
+                    .child(
+                        Button::new("palette")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Search)
+                            .tooltip("Search and connect (⌘P)")
+                            .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_palette(window, cx))),
+                    )
                     // Locking is part of the vault, so the button only shows there.
-                    .when(unlocked && self.active.is_none(), |bar| {
+                    .when(unlocked && self.section == Section::Ssh, |bar| {
                         bar.child(
                             Button::new("lock")
                                 .ghost()
                                 .xsmall()
                                 .icon(Icon::new(Lucide::Lock))
-                                .tooltip("Lock vault (⌘⇧L)")
+                                .tooltip("Lock saved servers and keys (⌘⇧L)")
                                 .on_click(cx.listener(|workspace, _, window, cx| workspace.on_lock(&LockVault, window, cx))),
                         )
-                    })
-                    .when(unlocked, |bar| bar.child(self.render_account_button(cx))),
+                    }),
             )
     }
 
-    /// The GitHub picture of the signed-in user. It opens the account settings.
-    fn render_account_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The thin strip on the left: CLI, SSH and settings, with the account at the bottom.
+    fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let lit = self.rail_section(cx);
+        let item = |id: &'static str, icon: Lucide, section: Section, name: &'static str, action: Box<dyn gpui_kit::Action>| {
+            let current = lit == section;
+            div()
+                .id(id)
+                .relative()
+                .size(px(34.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .cursor_pointer()
+                .when(current, |el| el.bg(theme.foreground.opacity(0.1)))
+                .when(!current, |el| el.opacity(0.7).hover(|el| el.opacity(1.).bg(theme.foreground.opacity(0.05))))
+                // A bar on the outer edge marks where you are.
+                .when(current, |el| {
+                    el.child(div().absolute().left(px(-5.)).top(px(8.)).w(px(3.)).h(px(18.)).rounded_r(px(2.)).bg(theme.primary))
+                })
+                .child(Icon::new(icon).size(px(18.)).text_color(theme.foreground))
+                .tooltip(move |window, cx| Tooltip::new(name).action(action.as_ref(), None).build(window, cx))
+                .on_click(cx.listener(move |workspace, _, window, cx| workspace.show_section(section, window, cx)))
+        };
+
         let store = Store::global(cx).read(cx);
-        let tooltip = match &store.account.login {
-            Some(login) => format!("Signed in as @{login}"),
-            None => "Sign in with GitHub".to_owned(),
+        let handle: SharedString = match &store.account.login {
+            Some(login) => format!("@{login}").into(),
+            None => "Sign in with GitHub".into(),
         };
-        let button = Button::new("account").ghost().xsmall();
-        let button = match store.avatar.clone() {
-            Some(picture) => button.child(avatar(Some(picture), px(18.), cx)),
-            None => button.icon(Icon::new(Lucide::CircleUser)),
-        };
-        button
-            .tooltip(tooltip)
-            .on_click(cx.listener(|workspace, _, window, cx| workspace.show_account(window, cx)))
+        let account = div()
+            .id("rail-account")
+            .size(px(34.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_lg()
+            .cursor_pointer()
+            .hover(|el| el.bg(theme.foreground.opacity(0.05)))
+            .child(avatar(store.avatar.clone(), px(22.), cx))
+            .tooltip(move |window, cx| Tooltip::new(handle.clone()).build(window, cx))
+            .on_click(cx.listener(|workspace, _, window, cx| workspace.show_account(window, cx)));
+
+        v_flex()
+            .flex_none()
+            .w(px(44.))
+            .h_full()
+            .py_2()
+            .gap_1()
+            .items_center()
+            .bg(theme.sidebar)
+            .border_r_1()
+            .border_color(theme.sidebar_border)
+            .child(item("rail-cli", Lucide::SquareTerminal, Section::Cli, "Terminal", Box::new(NewLocalTerminal)))
+            .child(item("rail-ssh", Lucide::Server, Section::Ssh, "SSH", Box::new(ShowHome)))
+            .child(item("rail-settings", Lucide::Settings, Section::Settings, "Settings", Box::new(OpenSettings)))
+            .child(div().flex_1())
+            .child(account)
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let store = Store::global(cx).read(cx);
-        let (account, picture) = (store.account.clone(), store.avatar.clone());
-        let items = Page::ALL.into_iter().map(|page| {
+        let items = Page::VAULT.into_iter().map(|page| {
             SidebarMenuItem::new(page.label())
                 .icon(page.icon())
-                .active(self.page == page && self.active.is_none())
+                .active(self.page == page)
                 .on_click(cx.listener(move |workspace, _, window, cx| workspace.show_page(page, window, cx)))
         });
-        let account_label: SharedString = account
-            .login
-            .map_or_else(|| "Not signed in".to_owned(), |login| format!("@{login}"))
-            .into();
         Sidebar::new("nav")
             .collapsible(false)
-            .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .gap_2()
-                        .child(logo(px(20.)))
-                        .child(div().font_semibold().child(APP_NAME)),
-                ),
-            )
-            .child(SidebarGroup::new("Vault").child(SidebarMenu::new().children(items)))
-            .footer(
-                SidebarFooter::new().child(
-                    h_flex()
-                        .id("account")
-                        .w_full()
-                        .gap_2()
-                        .cursor_pointer()
-                        .on_click(cx.listener(|workspace, _, window, cx| workspace.show_account(window, cx)))
-                        .child(avatar(picture, px(18.), cx))
-                        .child(div().text_sm().truncate().child(account_label)),
-                ),
+            .child(SidebarGroup::new("SSH").child(SidebarMenu::new().children(items)))
+    }
+
+    /// Shown in the CLI section once every tab is closed.
+    fn render_no_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(Icon::new(Lucide::SquareTerminal).size(px(40.)).text_color(cx.theme().muted_foreground))
+            .child(
+                Button::new("no-tabs-new")
+                    .primary()
+                    .label("New Terminal")
+                    .tooltip("⌘T")
+                    .on_click(cx.listener(|workspace, _, window, cx| {
+                        workspace.open_terminal(SessionTarget::Local, window, cx)
+                    })),
             )
     }
 
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.section == Section::Settings {
+            return self.settings.get_or_insert_with(|| cx.new(SettingsPage::new)).clone().into_any_element();
+        }
         match self.page {
             Page::Hosts => {
                 let workspace = cx.entity().downgrade();
@@ -1189,18 +1295,23 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let unlocked = Store::global(cx).read(cx).is_unlocked();
         let theme = cx.theme().clone();
-        let body: AnyElement = if !unlocked {
+        let tab = self.active.and_then(|ix| self.tabs.get(ix)).filter(|_| self.section == Section::Cli);
+        let body: AnyElement = if self.section == Section::Ssh && !unlocked {
             self.lock_screen.clone().into_any_element()
+        } else if self.section == Section::Settings {
+            self.render_page(window, cx)
+        } else if self.section == Section::Cli && tab.is_none() {
+            self.render_no_tabs(cx).into_any_element()
         } else if let Some(Tab {
             content: TabContent::Changes(view),
             ..
-        }) = self.active.and_then(|ix| self.tabs.get(ix))
+        }) = tab
         {
             view.clone().into_any_element()
         } else if let Some(Tab {
             content: TabContent::Terminal(term),
             ..
-        }) = self.active.and_then(|ix| self.tabs.get(ix))
+        }) = tab
         {
             let term = term.clone();
             if Settings::get(cx).side_panel && self.side_panel_fits(cx) {
@@ -1243,7 +1354,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_lock))
             .on_action(cx.listener(|w, _: &NextTab, window, cx| w.cycle_tab(true, window, cx)))
             .on_action(cx.listener(|w, _: &PreviousTab, window, cx| w.cycle_tab(false, window, cx)))
-            .on_action(cx.listener(|w, _: &ShowHome, window, cx| w.activate(None, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowHome, window, cx| w.show_section(Section::Ssh, window, cx)))
             .on_action(cx.listener(|w, _: &SplitRight, window, cx| w.on_split(Axis::Horizontal, window, cx)))
             .on_action(cx.listener(|w, _: &SplitDown, window, cx| w.on_split(Axis::Vertical, window, cx)))
             .on_action(cx.listener(|w, _: &FocusNextPane, window, cx| {
@@ -1276,20 +1387,26 @@ impl Render for Workspace {
             .on_action(cx.listener(|w, _: &ShowForwarding, window, cx| w.show_page(Page::Forwarding, window, cx)))
             .on_action(cx.listener(|w, _: &ShowKnownHosts, window, cx| w.show_page(Page::KnownHosts, window, cx)))
             .on_action(cx.listener(|w, _: &ShowLogs, window, cx| w.show_page(Page::Logs, window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab1, window, cx| w.activate(Some(0), window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab2, window, cx| w.activate(Some(1), window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab3, window, cx| w.activate(Some(2), window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab4, window, cx| w.activate(Some(3), window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab5, window, cx| w.activate(Some(4), window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab6, window, cx| w.activate(Some(5), window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab7, window, cx| w.activate(Some(6), window, cx)))
-            .on_action(cx.listener(|w, _: &SelectTab8, window, cx| w.activate(Some(7), window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab1, window, cx| w.select_tab(0, window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab2, window, cx| w.select_tab(1, window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab3, window, cx| w.select_tab(2, window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab4, window, cx| w.select_tab(3, window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab5, window, cx| w.select_tab(4, window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab6, window, cx| w.select_tab(5, window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab7, window, cx| w.select_tab(6, window, cx)))
+            .on_action(cx.listener(|w, _: &SelectTab8, window, cx| w.select_tab(7, window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab9, window, cx| {
                 let last = w.tabs.len().checked_sub(1);
                 w.activate(last, window, cx)
             }))
             .child(self.render_title_bar(window, cx))
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_rail(cx))
+                    .child(div().flex_1().min_w_0().h_full().child(body)),
+            )
             .when_some(self.palette.as_ref(), |root, (palette, _)| {
                 root.child(
                     div()
