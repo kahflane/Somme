@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::future::{LocalBoxFuture, Shared};
-use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use gpui_kit::component::input::{Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, KeyDownEvent,
@@ -29,6 +29,8 @@ use crate::ui::workspace::Page;
 const MAX_ROWS: usize = 50;
 /// A search starts once typing pauses this long, not on every key.
 const SEARCH_DELAY: Duration = Duration::from_millis(150);
+/// Each search on a server runs `find` there, so typing gets longer to stop.
+const SERVER_SEARCH_DELAY: Duration = Duration::from_millis(350);
 const PLACEHOLDER: &str = "Search hosts, commands and snippets, or type user@host";
 
 /// What a palette row does when picked.
@@ -316,8 +318,11 @@ impl CommandPalette {
             (Scope::Computer, _) => (local(), Place::Computer),
             (Scope::Folder(dir), _) => (local(), Place::Folder(dir.clone())),
         };
+        let on_server = matches!(search.scope, Scope::Here | Scope::Server)
+            && self.context.here.as_ref().is_some_and(|here| here.server.is_some());
+        let delay = if on_server { SERVER_SEARCH_DELAY } else { SEARCH_DELAY };
         search._task = Some(cx.spawn(async move |palette, cx| {
-            cx.background_executor().timer(SEARCH_DELAY).await;
+            cx.background_executor().timer(delay).await;
             let Some(disk) = disk.await else {
                 let reason = "Can't reach the files on this server.".to_owned();
                 let _ = palette.update(cx, |palette, cx| palette.search_done(Err(reason), cx));
@@ -741,6 +746,19 @@ impl Render for CommandPalette {
                 cx.stop_propagation();
                 cx.emit(PaletteEvent::Dismiss);
             }))
+            // The text box takes Tab as an action before any key handler sees it.
+            .capture_action(cx.listener(|palette, _: &IndentInline, _, cx| {
+                if palette.search.is_some() {
+                    cx.stop_propagation();
+                    palette.cycle_scope(1, cx);
+                }
+            }))
+            .capture_action(cx.listener(|palette, _: &OutdentInline, _, cx| {
+                if palette.search.is_some() {
+                    cx.stop_propagation();
+                    palette.cycle_scope(-1, cx);
+                }
+            }))
             .capture_key_down(cx.listener(|palette, event: &KeyDownEvent, window, cx| {
                 if palette.search.is_none() {
                     return;
@@ -748,10 +766,7 @@ impl Render for CommandPalette {
                 let keystroke = &event.keystroke;
                 let modifiers = keystroke.modifiers;
                 let plain = !(modifiers.control || modifiers.platform || modifiers.alt);
-                if keystroke.key == "tab" && plain {
-                    cx.stop_propagation();
-                    palette.cycle_scope(if modifiers.shift { -1 } else { 1 }, cx);
-                } else if keystroke.key == "backspace" && plain && palette.query.is_empty() {
+                if keystroke.key == "backspace" && plain && palette.query.is_empty() {
                     cx.stop_propagation();
                     palette.leave_search(window, cx);
                 }

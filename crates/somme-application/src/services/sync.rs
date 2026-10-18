@@ -114,6 +114,11 @@ impl SyncService {
     }
 
     /// Forgets the GitHub token, as when GitHub stops taking it.
+    /// Where on github.com the user can let Somme see more organizations.
+    pub async fn github_access_page(&self) -> AppResult<String> {
+        Ok(self.cloud.github_access_page().await?)
+    }
+
     pub fn forget_github(&self) -> AppResult<()> {
         Ok(self.github.clear()?)
     }

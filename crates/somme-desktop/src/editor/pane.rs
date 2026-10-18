@@ -16,12 +16,14 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, KeyBinding, MouseButton, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, actions, div, prelude::FluentBuilder as _, px,
+    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TextAlign, TextRun, Window, actions, canvas, div,
+    font, point, prelude::FluentBuilder as _, px,
 };
 
 use crate::editor::big::{BigText, BigTextEvent};
+use crate::editor::blame::{self, Blame, Change};
 use crate::editor::language::{self, Language};
 use crate::editor::lsp::{self, Client, DocProvider, Status};
 use crate::editor::markdown::MarkdownPreview;
@@ -29,7 +31,7 @@ use crate::settings::Settings;
 use crate::editor::sudo;
 use crate::editor::tools::{self, Tool};
 use crate::terminal::disk::{Disk, DiskError};
-use crate::ui::common::Lucide;
+use crate::ui::common::{Lucide, ago};
 use crate::ui::native;
 
 mod find;
@@ -39,6 +41,8 @@ actions!(editor_pane, [SaveFile, CloseFile]);
 const CONTEXT: &str = "EditorPane";
 /// Bigger files open without a language server, which gets the whole text on each change.
 const LSP_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Git is asked again who changed each line once typing pauses this long.
+const BLAME_PAUSE: Duration = Duration::from_millis(800);
 /// Files bigger than this, or with more lines than `BIG_LINES`, open in the
 /// plain editor made for big files. The code editor slows down on them.
 const BIG_BYTES: u64 = 8 * 1024 * 1024;
@@ -65,6 +69,8 @@ pub enum EditorPaneEvent {
     Empty,
     /// A file was opened, closed, or saved under a new name.
     FilesChanged,
+    /// Show what a commit changed, in the repo at this folder.
+    OpenCommit(PathBuf, String),
 }
 
 /// Whether a language server helps with a file.
@@ -220,6 +226,9 @@ struct OpenFile {
     view: View,
     /// A Markdown file's preview, made when first shown.
     preview: Option<Entity<MarkdownPreview>>,
+    /// Who last changed each line, for a file in a git repo.
+    blame: Option<Rc<Blame>>,
+    blaming: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -398,9 +407,12 @@ impl EditorPane {
             find: None,
             view: View::Source,
             preview: None,
+            blame: None,
+            blaming: None,
             _subscriptions: subscriptions,
         });
         let ix = self.files.len() - 1;
+        self.blame_soon(self.files[ix].body.id(), Duration::ZERO, cx);
         if self.files[ix].is_markdown() {
             self.set_view(ix, self.markdown_view, window, cx);
         }
@@ -422,7 +434,51 @@ impl EditorPane {
         if let (Help::Server { client, uri }, Body::Code(editor)) = (&file.help, &file.body) {
             client.sync(uri, editor.read(cx).text());
         }
+        self.blame_soon(id, BLAME_PAUSE, cx);
         cx.notify();
+    }
+
+    /// Asks git who last changed each line of a file, after `delay`. Typing
+    /// in the meantime asks again later instead.
+    fn blame_soon(&mut self, id: EntityId, delay: Duration, cx: &mut Context<Self>) {
+        let on = Settings::get(cx).line_blame;
+        let Some(file) = self.files.iter_mut().find(|file| file.body.id() == id) else { return };
+        if !on || file.scratch || !file.disk.is_local() || !matches!(file.body, Body::Code(_)) {
+            file.blame = None;
+            file.blaming = None;
+            return;
+        }
+        file.blaming = Some(cx.spawn(async move |pane, cx| {
+            cx.background_executor().timer(delay).await;
+            let Ok(Some((path, text))) = pane.update(cx, |pane, cx| {
+                let file = pane.files.iter().find(|file| file.body.id() == id)?;
+                Some((file.path.clone(), file.body.text(cx).to_string()))
+            }) else {
+                return;
+            };
+            let found = cx.background_spawn(async move { blame::read(&path, &text) }).await;
+            let _ = pane.update(cx, |pane, cx| {
+                if let Some(file) = pane.files.iter_mut().find(|file| file.body.id() == id) {
+                    file.blame = found.map(Rc::new);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn toggle_blame(&mut self, cx: &mut Context<Self>) {
+        Settings::update(cx, |settings| settings.line_blame = !settings.line_blame);
+        let ids: Vec<EntityId> = self.files.iter().map(|file| file.body.id()).collect();
+        for id in ids {
+            self.blame_soon(id, Duration::ZERO, cx);
+        }
+        cx.notify();
+    }
+
+    /// Who changed the cursor's line, when blame is on and git knows.
+    fn cursor_change(&self, file: &OpenFile, cx: &App) -> Option<std::sync::Arc<Change>> {
+        let (line, _) = file.body.cursor(cx);
+        file.blame.as_ref()?.line(line).cloned().filter(|_| Settings::get(cx).line_blame)
     }
 
     /// Adds a scratch file from the scratch folder, with its kept text.
@@ -827,6 +883,7 @@ impl EditorPane {
         if let Help::Server { client, uri } = &file.help {
             client.saved(uri, text);
         }
+        self.blame_soon(id, Duration::ZERO, cx);
         cx.notify();
     }
 
@@ -997,6 +1054,7 @@ impl EditorPane {
                 )
             })
             .child(div().flex_1())
+            .children(self.render_blame(file, cx))
             .when(file.as_root, |bar| {
                 bar.child(div().flex_none().text_color(theme.warning).child("Saving as root"))
             })
@@ -1017,6 +1075,55 @@ impl EditorPane {
             })
             .child(div().flex_none().child(language))
             .when(file.is_markdown(), |bar| bar.child(self.render_views(file, cx)))
+    }
+
+    /// Who last changed the cursor's line, and a switch for showing it.
+    fn render_blame(&self, file: &OpenFile, cx: &Context<Self>) -> Option<impl IntoElement> {
+        if !file.disk.is_local() || file.scratch || !matches!(file.body, Body::Code(_)) {
+            return None;
+        }
+        let theme = cx.theme();
+        let on = Settings::get(cx).line_blame;
+        let change = self.cursor_change(file, cx);
+        let dir = file.path.parent().map(Path::to_path_buf);
+        Some(
+            h_flex()
+                .min_w_0()
+                .gap_1()
+                .items_center()
+                .when_some(change, |bar, change| {
+                    let sha = change.sha.clone();
+                    let tip = match &change.sha {
+                        Some(sha) => format!("{} · {}\nClick to see what it changed", &sha[..7], change.summary),
+                        None => "Changed here, not committed yet".to_owned(),
+                    };
+                    bar.child(
+                        div()
+                            .id("blame-line")
+                            .flex_shrink_0()
+                            .max_w(px(240.))
+                            .truncate()
+                            .when(sha.is_some(), |el| el.cursor_pointer().hover(|el| el.text_color(theme.foreground)))
+                            .child(who_when(&change))
+                            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let (Some(dir), Some(sha)) = (dir.clone(), sha.clone()) {
+                                    cx.emit(EditorPaneEvent::OpenCommit(dir, sha));
+                                }
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("blame-toggle")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(Lucide::GitCommitHorizontal))
+                        .selected(on)
+                        .tab_stop(false)
+                        .tooltip(if on { "Hide who changed each line" } else { "Show who changed each line" })
+                        .on_click(cx.listener(|pane, _, _, cx| pane.toggle_blame(cx))),
+                ),
+        )
     }
 
     /// Buttons to show a Markdown file as its source, its preview, or both.
@@ -1192,6 +1299,31 @@ impl Render for EditorPane {
                         .into_any_element(),
                     Body::Big(editor) => editor.clone().into_any_element(),
                 };
+                // Who changed the cursor's line, after its end, as GitLens shows it.
+                let body = match (&file.body, self.cursor_change(file, cx)) {
+                    (Body::Code(editor), Some(change)) if file.view != View::Preview => {
+                        let text = match change.sha {
+                            Some(_) => format!("{}  •  {}", who_when(&change), change.summary),
+                            // Git's summary here only says where the text came from.
+                            None => who_when(&change),
+                        };
+                        let editor = editor.clone();
+                        let (family, size) = (settings.font_family.clone(), px(settings.font_size.clamp(6., 72.)));
+                        let color = theme.muted_foreground.opacity(0.7);
+                        div().relative().size_full().overflow_hidden().child(body).child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, cx| {
+                                    paint_line_blame(&editor, &text, &family, size, color, bounds, window, cx);
+                                },
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
+                        .into_any_element()
+                    }
+                    _ => body,
+                };
                 let body = match (&file.preview, file.view) {
                     (Some(preview), View::Preview) => preview.clone().into_any_element(),
                     (Some(preview), View::Split) => h_flex()
@@ -1207,6 +1339,47 @@ impl Render for EditorPane {
                     .child(self.render_status(file, cx))
             })
     }
+}
+
+/// "Ann Lee, 3 days ago", or that the change is not committed yet.
+fn who_when(change: &Change) -> String {
+    match change.sha {
+        Some(_) => format!("{}, {}", change.author, ago(change.time)),
+        None => "You, not committed yet".to_owned(),
+    }
+}
+
+/// Writes `text` a little after the end of the cursor's line, when there is
+/// room for it inside `bounds`.
+#[allow(clippy::too_many_arguments)]
+fn paint_line_blame(
+    editor: &Entity<EditorState>,
+    text: &str,
+    family: &str,
+    size: Pixels,
+    color: gpui_kit::Hsla,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let state = editor.read(cx);
+    let line = state.cursor_position().line as usize;
+    let end = state.text().line_end_offset(line);
+    let Some(spot) = state.range_to_bounds(&(end..end)) else { return };
+    let x = spot.left() + px(32.);
+    if spot.top() < bounds.top() || spot.bottom() > bounds.bottom() || x + px(80.) > bounds.right() {
+        return;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: font(family.to_owned()),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window.text_system().shape_line(SharedString::from(text.to_owned()), size, &[run], None);
+    let _ = shaped.paint(point(x, spot.top()), spot.size.height, TextAlign::Left, None, window, cx);
 }
 
 #[cfg(test)]

@@ -67,22 +67,30 @@ fn looks_like_text(path: &Path) -> bool {
     }
 }
 
-/// `path` as one word for the shell on this computer.
-fn shell_word(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    if cfg!(windows) {
-        // Windows names can't hold quotes.
-        format!("\"{text}\"")
-    } else if complete::can_escape(&text) {
-        complete::escape(&text)
+/// `path` as one word for the shell on this computer, or `None` when no
+/// quoting keeps the shell from acting on its name.
+fn shell_word(path: &Path) -> Option<String> {
+    word(path.to_str()?, cfg!(windows))
+}
+
+fn word(text: &str, windows: bool) -> Option<String> {
+    // Typed into a terminal these are keys, not text: Ctrl-U wipes the line
+    // typed so far and Enter runs what follows.
+    if !complete::can_escape(text) {
+        return None;
+    }
+    if windows {
+        // Names can't hold quotes, but cmd still expands %…% inside them, and
+        // PowerShell, often run from cmd, expands $… and `….
+        (!text.contains(['%', '$', '`'])).then(|| format!("\"{text}\""))
     } else {
-        format!("'{}'", text.replace('\'', r"'\''"))
+        Some(complete::escape(text))
     }
 }
 
-fn cd_command(path: &Path) -> String {
+fn cd_command(word: &str) -> String {
     // cmd only changes the drive too with /d.
-    if cfg!(windows) { format!("cd /d {}", shell_word(path)) } else { format!("cd {}", shell_word(path)) }
+    if cfg!(windows) { format!("cd /d {word}") } else { format!("cd {word}") }
 }
 
 fn items(count: usize) -> String {
@@ -122,21 +130,35 @@ impl TerminalView {
     /// when the shell waits for a command; the rest is typed in as paths.
     fn drop_here(&mut self, sorted: Vec<Dropped>, cx: &mut Context<Self>) {
         let mut rest = Vec::new();
+        let mut skipped = 0;
         for item in sorted {
-            match item {
-                Dropped::Text(path) => cx.emit(TerminalViewEvent::OpenFile(path)),
-                Dropped::Folder(path) => rest.push((true, path)),
-                Dropped::Other(path) => rest.push((false, path)),
+            let (folder, path) = match item {
+                Dropped::Text(path) => {
+                    cx.emit(TerminalViewEvent::OpenFile(path));
+                    continue;
+                }
+                Dropped::Folder(path) => (true, path),
+                Dropped::Other(path) => (false, path),
+            };
+            match shell_word(&path) {
+                Some(word) => rest.push((folder, word)),
+                None => skipped += 1,
             }
         }
+        if skipped > 0 {
+            let id = self.add_note(String::new(), cx);
+            let text = format!("Didn't type {}. The name has characters the shell would act on.", items(skipped));
+            self.end_note(id, text, NoteState::Failed, cx);
+        }
         if let [(true, folder)] = rest.as_slice()
+            && skipped == 0
             && self.shell_waits(cx)
         {
             self.run_text(&cd_command(folder), cx);
             return;
         }
         if !rest.is_empty() {
-            let words: Vec<String> = rest.iter().map(|(_, path)| shell_word(path)).collect();
+            let words: Vec<&str> = rest.iter().map(|(_, word)| word.as_str()).collect();
             self.paste_text(&format!("{} ", words.join(" ")), cx);
         }
     }
@@ -284,11 +306,15 @@ mod tests {
         assert!(!looks_like_text(&path));
     }
 
-    #[cfg(unix)]
     #[test]
     fn paths_are_one_word_each() {
-        assert_eq!(shell_word(Path::new("/Users/me/My Files/a&b.txt")), r"/Users/me/My\ Files/a\&b.txt");
-        assert_eq!(shell_word(Path::new("/tmp/line\nbreak")), "'/tmp/line\nbreak'");
-        assert_eq!(cd_command(Path::new("/tmp/it's")), r"cd /tmp/it\'s");
+        assert_eq!(word("/Users/me/My Files/a&b $(x).txt", false).unwrap(), r"/Users/me/My\ Files/a\&b\ \$\(x\).txt");
+        assert_eq!(word(r"C:\My Files\a&b.txt", true).unwrap(), r#""C:\My Files\a&b.txt""#);
+        // Ctrl-U and Enter would wipe the line and run the rest.
+        assert_eq!(word("/tmp/x\u{15}rm -rf ~\r", false), None);
+        assert_eq!(word("/tmp/line\nbreak", false), None);
+        for name in [r"C:\$(calc)", r"C:\%PATH%", r"C:\`calc`"] {
+            assert_eq!(word(name, true), None, "{name}");
+        }
     }
 }

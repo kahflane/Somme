@@ -6,7 +6,6 @@ use std::sync::Arc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
@@ -15,6 +14,8 @@ use gpui_kit::{
 };
 
 use super::api::{ApiError, GitHub, Item, Kind, Page, State};
+use super::counts::Counts;
+use super::mentions::{self, Mentions};
 use super::detail::{DetailEvent, DetailView};
 use super::repo::Repo;
 use super::widgets::{self, Tone};
@@ -30,12 +31,18 @@ pub enum GitHubPanelEvent {
 struct Draft {
     title: Entity<InputState>,
     body: Entity<TextareaState>,
+    mentions: Option<Entity<Mentions>>,
     busy: bool,
 }
 
 pub struct GitHubPanel {
     services: Arc<Services>,
+    /// The repository as the folder's git remote names it.
     repo: Repo,
+    /// Where it is on GitHub now, once known. Its new name is the one to ask with.
+    real: Option<Repo>,
+    /// The open count the title bar showed last, to see when it changes.
+    seen: Option<u64>,
     kind: Kind,
     state: State,
     /// None until GitHub gave Somme access.
@@ -59,14 +66,19 @@ impl EventEmitter<GitHubPanelEvent> for GitHubPanel {}
 impl GitHubPanel {
     pub fn new(repo: Repo, kind: Kind, services: Arc<Services>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter, like label:bug or author:octocat"));
-        let subscriptions = vec![cx.subscribe_in(&filter, window, |panel, _, event, _, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                panel.load(false, cx);
-            }
-        })];
+        let subscriptions = vec![
+            cx.subscribe_in(&filter, window, |panel, _, event, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    panel.load(false, cx);
+                }
+            }),
+            cx.observe_global::<Counts>(|panel, cx| panel.follow_counts(cx)),
+        ];
         let client = services.sync.github_token().and_then(|token| GitHub::new(token).ok());
         let mut panel = Self {
             services,
+            real: Counts::real(&repo, cx),
+            seen: None,
             repo,
             kind,
             state: State::Open,
@@ -100,6 +112,8 @@ impl GitHubPanel {
         if repo == self.repo && kind == self.kind && self.detail.is_none() && self.draft.is_none() {
             return;
         }
+        self.real = Counts::real(&repo, cx);
+        self.seen = None;
         self.repo = repo;
         self.kind = kind;
         self.state = State::Open;
@@ -107,6 +121,28 @@ impl GitHubPanel {
         self.draft = None;
         self.page = None;
         self.load(false, cx);
+    }
+
+    /// The name to ask GitHub with.
+    fn api_repo(&self) -> Repo {
+        self.real.clone().unwrap_or_else(|| self.repo.clone())
+    }
+
+    /// Shows the list again when the title bar's number changes.
+    fn follow_counts(&mut self, cx: &mut Context<Self>) {
+        let Some(summary) = Counts::summary(&self.repo, cx) else { return };
+        let open = if self.kind == Kind::Pulls { summary.pulls } else { summary.issues };
+        let changed = self.seen.is_some_and(|seen| seen != open);
+        self.seen = Some(open);
+        let plain_list = self.state == State::Open
+            && self.detail.is_none()
+            && self.draft.is_none()
+            && self.filter.read(cx).value().trim().is_empty()
+            // Not while the user reads further down.
+            && self.scroll.offset().y >= px(0.);
+        if changed && plain_list && !self.loading {
+            self.load(false, cx);
+        }
     }
 
     fn load(&mut self, more: bool, cx: &mut Context<Self>) {
@@ -123,15 +159,32 @@ impl GitHubPanel {
         let generation = self.generation;
         self.loading = true;
         self.error = None;
-        let (repo, kind, state) = (self.repo.clone(), self.kind, self.state);
+        let (repo, real, kind, state) = (self.repo.clone(), self.real.clone(), self.kind, self.state);
         let query = self.filter.read(cx).value().to_string();
         cx.spawn(async move |this, cx| {
-            let result = runtime::io(async move { client.list(&repo, kind, state, &query, after).await }).await;
+            let result = runtime::io(async move {
+                // Search finds nothing under a moved repository's old name.
+                let summary = match real {
+                    Some(_) => None,
+                    None => Some(client.summary(&repo).await?),
+                };
+                let real = real.or_else(|| summary.as_ref().map(|summary| summary.repo.clone())).unwrap_or(repo);
+                let page = client.list(&real, kind, state, &query, after).await?;
+                Ok::<_, ApiError>((summary, page))
+            })
+            .await;
             let _ = this.update(cx, |panel, cx| {
                 if panel.generation != generation {
                     return;
                 }
                 panel.loading = false;
+                let result = result.map(|(summary, page)| {
+                    if let Some(summary) = summary {
+                        panel.real = Some(summary.repo.clone());
+                        Counts::learned(panel.repo.clone(), summary, cx);
+                    }
+                    page
+                });
                 match result {
                     Ok(page) => match panel.page.as_mut().filter(|_| more) {
                         Some(shown) => {
@@ -156,6 +209,7 @@ impl GitHubPanel {
     fn failed(&mut self, err: ApiError, cx: &mut Context<Self>) {
         if matches!(err, ApiError::Unauthorized) {
             let _ = self.services.sync.forget_github();
+            Counts::forget_client(cx);
             self.client = None;
             self.detail = None;
         }
@@ -174,6 +228,7 @@ impl GitHubPanel {
                 panel.connecting = false;
                 match token.map_err(|err| err.to_string()).and_then(|t| GitHub::new(t).map_err(|e| e.to_string())) {
                     Ok(client) => {
+                        Counts::use_client(client.clone(), cx);
                         panel.client = Some(client);
                         panel.load(false, cx);
                     }
@@ -186,15 +241,36 @@ impl GitHubPanel {
         cx.notify();
     }
 
+    /// Asks GitHub again for what the panel shows, and for the title bar's numbers.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        Counts::refresh(&self.repo, &self.services, true, cx);
+        match &self.detail {
+            Some((detail, _)) => detail.update(cx, |detail, cx| detail.load(cx)),
+            None => self.load(false, cx),
+        }
+    }
+
+    /// Opens Somme's page on github.com, where the user can let it see more
+    /// organizations. An organization may also need an owner to approve it.
+    fn manage_access(&mut self, cx: &mut Context<Self>) {
+        let sync = self.services.sync.clone();
+        cx.spawn(async move |this, cx| {
+            let page = runtime::io(async move { sync.github_access_page().await }).await;
+            let _ = this.update(cx, |panel, cx| match page {
+                Ok(page) => cx.open_url(&page),
+                Err(err) => {
+                    panel.error = Some(err.to_string());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn cancel_connect(&mut self, cx: &mut Context<Self>) {
         self.services.sync.cancel_sign_in();
         self.connecting = false;
         cx.notify();
-    }
-
-    fn set_kind(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        let repo = self.repo.clone();
-        self.show(repo, kind, cx);
     }
 
     fn set_state(&mut self, state: State, cx: &mut Context<Self>) {
@@ -206,7 +282,7 @@ impl GitHubPanel {
 
     pub fn open(&mut self, number: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
-        let (repo, kind) = (self.repo.clone(), self.kind);
+        let (repo, kind) = (self.api_repo(), self.kind);
         let view = cx.new(|cx| DetailView::new(client, repo, kind, number, window, cx));
         let subscription = cx.subscribe(&view, |panel, _, event, cx| match event {
             DetailEvent::Back => {
@@ -226,8 +302,15 @@ impl GitHubPanel {
         let title = cx.new(|cx| InputState::new(window, cx).placeholder("Title"));
         let body = cx.new(|cx| TextareaState::new(window, cx).auto_grow(8, 24).placeholder("Add a description"));
         title.update(cx, |title, cx| title.focus(window, cx));
+        let repo = self.api_repo().clone();
+        let mentions = self.client.clone().map(|client| cx.new(|cx| Mentions::new(body.clone(), client, repo, cx)));
         self.detail = None;
-        self.draft = Some(Draft { title, body, busy: false });
+        self.draft = Some(Draft {
+            title,
+            body,
+            mentions,
+            busy: false,
+        });
         cx.notify();
     }
 
@@ -240,7 +323,7 @@ impl GitHubPanel {
         let body = draft.body.read(cx).value().to_string();
         draft.busy = true;
         self.error = None;
-        let repo = self.repo.clone();
+        let repo = self.api_repo();
         cx.spawn_in(window, async move |this, cx| {
             let created = runtime::io(async move { client.create_issue(&repo, &title, &body).await }).await;
             let _ = this.update_in(cx, |panel, window, cx| match created {
@@ -263,8 +346,8 @@ impl GitHubPanel {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let panel = cx.entity().downgrade();
-        let url = format!("{}/{}", self.repo.url(), if self.kind == Kind::Pulls { "pulls" } else { "issues" });
+        let repo = self.api_repo();
+        let url = format!("{}/{}", repo.url(), if self.kind == Kind::Pulls { "pulls" } else { "issues" });
         h_flex()
             .h(px(40.))
             .flex_none()
@@ -280,21 +363,27 @@ impl GitHubPanel {
                     .truncate()
                     .text_sm()
                     .font_semibold()
-                    .child(SharedString::from(self.repo.full_name())),
+                    .child(SharedString::from(repo.full_name())),
             )
             .child(div().flex_1())
-            .child(
-                TabBar::new("gh-kind")
-                    .segmented()
-                    .xsmall()
-                    .selected_index(if self.kind == Kind::Pulls { 0 } else { 1 })
-                    .child(Tab::new().label("Pull requests"))
-                    .child(Tab::new().label("Issues"))
-                    .on_click(move |ix, _, cx| {
-                        let kind = if *ix == 0 { Kind::Pulls } else { Kind::Issues };
-                        let _ = panel.update(cx, |panel, cx| panel.set_kind(kind, cx));
-                    }),
-            )
+            .when(self.client.is_some(), |bar| {
+                bar.child(
+                    Button::new("gh-refresh")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(Lucide::RefreshCw))
+                        .tooltip("Refresh")
+                        .on_click(cx.listener(|panel, _, _, cx| panel.refresh(cx))),
+                )
+                .child(
+                    Button::new("gh-access")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(Lucide::Building2))
+                        .tooltip("Choose which organizations Somme can see")
+                        .on_click(cx.listener(|panel, _, _, cx| panel.manage_access(cx))),
+                )
+            })
             .child(
                 Button::new("gh-open-web")
                     .ghost()
@@ -431,7 +520,16 @@ impl GitHubPanel {
             .flex_1()
             .min_h_0()
             .child(filter_row)
-            .children(self.error.clone().map(|err| div().px_2().pb_2().child(error_line(err, cx))))
+            .children(self.error.clone().map(|err| {
+                v_flex().px_2().pb_2().gap_1().items_start().child(error_line(err, cx)).child(
+                    // Most often the repository belongs to an organization Somme can't see yet.
+                    Button::new("gh-access-error")
+                        .ghost()
+                        .xsmall()
+                        .label("Choose which organizations Somme can see")
+                        .on_click(cx.listener(|panel, _, _, cx| panel.manage_access(cx))),
+                )
+            }))
             .child(
                 v_flex()
                     .flex_1()
@@ -598,7 +696,13 @@ impl GitHubPanel {
                     .child(div().text_base().font_semibold().child("New issue")),
             )
             .child(Input::new(&draft.title))
-            .child(div().font_family(theme.mono_font_family.clone()).child(Textarea::new(&draft.body)))
+            .child({
+                let body = div().font_family(theme.mono_font_family.clone()).child(Textarea::new(&draft.body));
+                match &draft.mentions {
+                    Some(mentions) => mentions::field(body, mentions),
+                    None => body,
+                }
+            })
             .children(self.error.clone().map(|err| error_line(err, cx)))
             .child(
                 h_flex().justify_end().child(

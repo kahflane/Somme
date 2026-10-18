@@ -104,11 +104,9 @@ impl HttpCloudClient {
             CloudError::Rejected(message)
         }
     }
-}
 
-#[async_trait]
-impl CloudAccounts for HttpCloudClient {
-    async fn sign_in_with_github(&self) -> Result<CloudSession, CloudError> {
+    /// Somme's GitHub app, as the cloud names it.
+    async fn github_config(&self) -> Result<GitHubConfig, CloudError> {
         let response = self
             .http
             .get(format!("{}/v1/auth/github", self.base))
@@ -118,7 +116,14 @@ impl CloudAccounts for HttpCloudClient {
         if !response.status().is_success() {
             return Err(Self::rejection(response).await);
         }
-        let config: GitHubConfig = response.json().await.map_err(unreachable)?;
+        response.json().await.map_err(unreachable)
+    }
+}
+
+#[async_trait]
+impl CloudAccounts for HttpCloudClient {
+    async fn sign_in_with_github(&self) -> Result<CloudSession, CloudError> {
+        let config = self.github_config().await?;
         let grant = github_login::sign_in(&config.client_id, None, |page: &str| open::that_detached(page)).await?;
         let response = self
             .http
@@ -183,16 +188,7 @@ impl CloudAccounts for HttpCloudClient {
     }
 
     async fn github_access(&self, session: &CloudSession) -> Result<GitHubAccess, CloudError> {
-        let response = self
-            .http
-            .get(format!("{}/v1/auth/github", self.base))
-            .send()
-            .await
-            .map_err(unreachable)?;
-        if !response.status().is_success() {
-            return Err(Self::rejection(response).await);
-        }
-        let config: GitHubConfig = response.json().await.map_err(unreachable)?;
+        let config = self.github_config().await?;
         let grant =
             github_login::sign_in(&config.client_id, Some(REPO_SCOPE), |page: &str| open::that_detached(page)).await?;
         let response = self
@@ -218,6 +214,16 @@ impl CloudAccounts for HttpCloudClient {
             token: Zeroizing::new(body.token),
             scope: body.scope,
         })
+    }
+
+    async fn github_access_page(&self) -> Result<String, CloudError> {
+        let config = self.github_config().await?;
+        let id = &config.client_id;
+        // It goes into a URL; GitHub's ids are letters, digits and dots.
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+            return Err(CloudError::Rejected("Somme Cloud sent a strange GitHub app id".into()));
+        }
+        Ok(format!("https://github.com/settings/connections/applications/{id}"))
     }
 
     async fn avatar(&self, url: &str) -> Result<Vec<u8>, CloudError> {

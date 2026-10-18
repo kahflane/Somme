@@ -6,7 +6,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, h_resizable, resizable_panel, v_flex, v_resizable,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    AnyElement, AnyView, App, AppContext as _, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
@@ -18,6 +18,7 @@ use crate::editor::{EditorPane, EditorPaneEvent};
 use crate::github::api::Kind;
 use crate::github::panel::{GitHubPanel, GitHubPanelEvent};
 use crate::github::repo::Repo;
+use crate::graph::{GraphEvent, GraphView};
 use crate::services::Services;
 use crate::terminal::disk::{Disk, DiskError};
 use crate::terminal::session::Status;
@@ -88,6 +89,8 @@ pub enum TerminalTabEvent {
     Empty,
     /// Show the git changes of the repo that holds this folder.
     OpenChanges(PathBuf),
+    /// Show what a commit changed in the repo that holds this folder.
+    OpenCommit(PathBuf, String),
 }
 
 /// One tab of terminals: a tree of split panes with an optional broadcast mode.
@@ -106,6 +109,8 @@ pub struct TerminalTab {
     editor: Option<(Entity<EditorPane>, Subscription)>,
     /// Pull requests or issues of the shell's GitHub repository, on the right.
     github: Option<(Entity<GitHubPanel>, Subscription)>,
+    /// The commit graph of the shell's repository, on the right in place of the GitHub panel.
+    graph: Option<(Entity<GraphView>, Subscription)>,
     /// Panes put away in the bar at the bottom. They keep running.
     minimized: Vec<Entity<TerminalView>>,
     /// The pane filling the whole tab, with the others kept behind it.
@@ -134,6 +139,7 @@ impl TerminalTab {
             subscriptions: Vec::new(),
             editor: None,
             github: None,
+            graph: None,
             minimized: Vec::new(),
             maximized: None,
         };
@@ -170,6 +176,14 @@ impl TerminalTab {
             TerminalViewEvent::TitleChanged | TerminalViewEvent::RepoChanged => {
                 cx.emit(TerminalTabEvent::Changed);
                 cx.notify();
+            }
+            TerminalViewEvent::PhaseChanged => {
+                if *view == tab.active
+                    && let Some((graph, _)) = &tab.graph
+                    && let Some(dir) = tab.git_dir(cx)
+                {
+                    graph.update(cx, |graph, cx| graph.follow(dir, cx));
+                }
             }
             TerminalViewEvent::OpenFile(path) => tab.open_file(view, path.clone(), None, window, cx),
             TerminalViewEvent::OpenChanges(dir) => cx.emit(TerminalTabEvent::OpenChanges(dir.clone())),
@@ -291,6 +305,7 @@ impl TerminalTab {
                         cx.notify();
                     }
                     EditorPaneEvent::FilesChanged => {}
+                    EditorPaneEvent::OpenCommit(dir, sha) => cx.emit(TerminalTabEvent::OpenCommit(dir.clone(), sha.clone())),
                 });
                 self.editor = Some((pane.clone(), subscription));
                 pane
@@ -319,6 +334,7 @@ impl TerminalTab {
             }
             Some((panel, _)) => panel.update(cx, |panel, cx| panel.show(repo, kind, cx)),
             None => {
+                self.graph = None;
                 let services = self.services.clone();
                 let panel = cx.new(|cx| GitHubPanel::new(repo, kind, services, window, cx));
                 let subscription = cx.subscribe_in(&panel, window, |tab, _, event, window, cx| match event {
@@ -331,6 +347,41 @@ impl TerminalTab {
                 });
                 self.github = Some((panel, subscription));
             }
+        }
+        cx.emit(TerminalTabEvent::Changed);
+        cx.notify();
+    }
+
+    /// The folder of the focused shell, when it is a local one in a git repo.
+    pub fn git_dir(&self, cx: &App) -> Option<PathBuf> {
+        let session = self.active.read(cx).session.read(cx);
+        let blocks = session.blocks.as_ref().filter(|_| session.is_local())?;
+        blocks.git.as_ref()?;
+        blocks.cwd.clone()
+    }
+
+    pub fn graph_shown(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    /// Opens the commit graph of the shell's repository beside the terminals,
+    /// or closes it.
+    pub fn toggle_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.graph.take().is_some() {
+            window.focus(&self.active.focus_handle(cx), cx);
+        } else if let Some(dir) = self.git_dir(cx) {
+            let graph = cx.new(|cx| GraphView::new(dir, cx));
+            let subscription = cx.subscribe_in(&graph, window, |tab, _, event, window, cx| match event {
+                GraphEvent::Close => {
+                    tab.graph = None;
+                    window.focus(&tab.active.focus_handle(cx), cx);
+                    cx.emit(TerminalTabEvent::Changed);
+                    cx.notify();
+                }
+                GraphEvent::OpenCommit(dir, sha) => cx.emit(TerminalTabEvent::OpenCommit(dir.clone(), sha.clone())),
+            });
+            self.github = None;
+            self.graph = Some((graph, subscription));
         }
         cx.emit(TerminalTabEvent::Changed);
         cx.notify();
@@ -649,17 +700,22 @@ impl Render for TerminalTab {
             .child(div().flex_1().min_h_0().children(panes))
             .when(!self.minimized.is_empty(), |col| col.child(self.render_minimized(cx)))
             .into_any_element();
-        let body = match (&self.editor, &self.github) {
+        let side = match (&self.github, &self.graph) {
+            (Some((github, _)), _) => Some(AnyView::from(github.clone())),
+            (None, Some((graph, _))) => Some(AnyView::from(graph.clone())),
+            (None, None) => None,
+        };
+        let body = match (&self.editor, side) {
             (None, None) => terminals,
             (Some((editor, _)), None) => h_resizable("editor-split")
                 .child(resizable_panel().child(terminals))
                 .child(resizable_panel().child(editor.clone()))
                 .into_any_element(),
             // The group's `children` replaces the panels, so the editor goes in with `child`.
-            (editor, Some((github, _))) => h_resizable(if editor.is_some() { "github-split-3" } else { "github-split" })
+            (editor, Some(side)) => h_resizable(if editor.is_some() { "github-split-3" } else { "github-split" })
                 .child(resizable_panel().child(terminals))
                 .when_some(editor.as_ref(), |group, (editor, _)| group.child(resizable_panel().child(editor.clone())))
-                .child(resizable_panel().size(px(520.)).flex_none().size_range(px(340.)..px(1600.)).child(github.clone()))
+                .child(resizable_panel().size(px(520.)).flex_none().size_range(px(340.)..px(1600.)).child(side))
                 .into_any_element(),
         };
         div().size_full().bg(theme.background).child(body)

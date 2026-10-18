@@ -3,6 +3,7 @@ mod automation;
 mod changes;
 mod editor;
 mod github;
+mod graph;
 mod host_os;
 mod look;
 mod mcp;
@@ -15,6 +16,7 @@ mod sftp;
 mod store;
 mod terminal;
 mod ui;
+mod web_images;
 
 use std::sync::Arc;
 
@@ -116,7 +118,9 @@ fn main() -> anyhow::Result<()> {
         let _ = asks.unbounded_send(asked);
     }
 
-    let app = gpui_kit::application().with_assets(host_os::Assets);
+    let app = gpui_kit::application()
+        .with_assets(host_os::Assets)
+        .with_http_client(web_images::WebImages::new()?);
     // macOS sends files from Finder this way, even before the window is up.
     app.on_open_urls({
         let asks = asks.clone();

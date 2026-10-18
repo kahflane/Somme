@@ -47,6 +47,8 @@ enum Row {
 pub struct ChangesView {
     /// The folder it was opened from.
     dir: PathBuf,
+    /// The commit whose changes show, instead of the uncommitted ones.
+    commit: Option<String>,
     state: State,
     /// Reading again while the old changes still show.
     refreshing: bool,
@@ -65,8 +67,18 @@ pub struct ChangesView {
 
 impl ChangesView {
     pub fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
+        Self::of(dir, None, cx)
+    }
+
+    /// Shows what commit `sha` changed.
+    pub fn commit(dir: PathBuf, sha: String, cx: &mut Context<Self>) -> Self {
+        Self::of(dir, Some(sha), cx)
+    }
+
+    fn of(dir: PathBuf, commit: Option<String>, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             dir,
+            commit,
             state: State::Loading,
             refreshing: false,
             rows: Vec::new(),
@@ -79,6 +91,11 @@ impl ChangesView {
         };
         view.reload(cx);
         view
+    }
+
+    /// The commit this tab shows, if it shows one.
+    pub fn shown_commit(&self) -> Option<&str> {
+        self.commit.as_deref()
     }
 
     /// True when `dir` is in the repo this tab shows.
@@ -95,7 +112,10 @@ impl ChangesView {
             _ => &self.dir,
         };
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        format!("Changes · {name}").into()
+        match &self.commit {
+            Some(sha) => format!("{} · {name}", &sha[..7.min(sha.len())]).into(),
+            None => format!("Changes · {name}").into(),
+        }
     }
 
     /// Reads the changes again.
@@ -105,8 +125,16 @@ impl ChangesView {
         }
         self.refreshing = true;
         let dir = self.dir.clone();
+        let commit = self.commit.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { diff::load(&dir) }).await;
+            let result = cx
+                .background_spawn(async move {
+                    match commit {
+                        Some(sha) => diff::load_commit(&dir, &sha),
+                        None => diff::load(&dir),
+                    }
+                })
+                .await;
             let _ = this.update(cx, |view, cx| {
                 view.refreshing = false;
                 view.colors.clear();
@@ -559,9 +587,11 @@ impl Render for ChangesView {
         let message = match &self.state {
             State::Loading => Some("Reading changes…".to_owned()),
             State::Failed(reason) => Some(reason.clone()),
-            State::Ready(changes) if changes.files.is_empty() => {
-                Some("No changes. Everything matches the last commit.".to_owned())
-            }
+            State::Ready(changes) if changes.files.is_empty() => Some(if self.commit.is_some() {
+                "This commit changed no files.".to_owned()
+            } else {
+                "No changes. Everything matches the last commit.".to_owned()
+            }),
             State::Ready(_) => None,
         };
         let body = match message {

@@ -9,7 +9,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    ParentElement as _, Pixels, ScrollDelta, ScrollWheelEvent, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use super::{TerminalView, TerminalViewEvent};
@@ -42,6 +43,10 @@ pub(super) struct Picker {
     git: BranchState,
     loaded: bool,
     selected: usize,
+    /// The first row shown.
+    top: usize,
+    /// Wheel movement short of a whole row, in rows.
+    wheel: f32,
     /// Set while the box takes a commit message or a new branch name.
     asking: Option<Ask>,
     _subscription: Subscription,
@@ -181,6 +186,8 @@ impl TerminalView {
             git: BranchState::default(),
             loaded: false,
             selected: 0,
+            top: 0,
+            wheel: 0.,
             asking: None,
             _subscription: subscription,
         });
@@ -206,6 +213,7 @@ impl TerminalView {
             InputEvent::Change => {
                 if let Some(picker) = view.picker.as_mut() {
                     picker.selected = 0;
+                    picker.top = 0;
                 }
                 cx.notify();
             }
@@ -234,6 +242,7 @@ impl TerminalView {
             picker._subscription = subscription;
             picker.asking = Some(ask);
             picker.selected = 0;
+            picker.top = 0;
         }
         cx.notify();
     }
@@ -256,8 +265,26 @@ impl TerminalView {
         if count > 0 {
             picker.selected = if up { selected.saturating_sub(1) } else { (selected + 1).min(count - 1) };
         }
+        // Keeps the selected row in view.
+        picker.top = picker.top.min(picker.selected).max((picker.selected + 1).saturating_sub(ROWS));
         cx.notify();
         true
+    }
+
+    /// Scrolls the list a row at a time, `row` tall, leaving the selection.
+    fn scroll_picker(&mut self, event: &ScrollWheelEvent, row: Pixels, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.as_ref() else { return };
+        let count = picker.rows(cx).len();
+        let Some(picker) = self.picker.as_mut() else { return };
+        picker.wheel -= match event.delta {
+            ScrollDelta::Lines(lines) => lines.y,
+            ScrollDelta::Pixels(pixels) => pixels.y.as_f32() / row.as_f32(),
+        };
+        let rows = picker.wheel.trunc();
+        picker.wheel -= rows;
+        let top = (picker.top as f32 + rows).max(0.) as usize;
+        picker.top = top.min(count.saturating_sub(ROWS));
+        cx.notify();
     }
 
     /// Acts on the row at `index`: goes to a folder, opens a file, or switches branch.
@@ -339,7 +366,10 @@ impl TerminalView {
         let git = &picker.git;
         let branch = git.current.as_deref().unwrap_or_default();
         let rows = picker.rows(cx);
-        let start = picker.selected.saturating_sub(ROWS - 1).min(rows.len().saturating_sub(ROWS));
+        let start = picker.top.min(rows.len().saturating_sub(ROWS));
+        let text_size = px(settings.font_size.clamp(6., 72.) * 0.9);
+        // Text, the row's padding and the gap below it.
+        let row_height = text_size * 1.618 + px(6.);
         let list = rows.iter().enumerate().skip(start).take(ROWS).map(|(i, row)| {
             let (icon, label, color) = match row {
                 Row::Parent => (Lucide::CornerLeftUp, ".. (Parent Directory)".to_owned(), muted),
@@ -439,7 +469,11 @@ impl TerminalView {
                     v_flex()
                         .gap_0p5()
                         .font_family(settings.font_family.clone())
-                        .text_size(px(settings.font_size.clamp(6., 72.) * 0.9))
+                        .text_size(text_size)
+                        .on_scroll_wheel(cx.listener(move |view, event: &ScrollWheelEvent, _, cx| {
+                            cx.stop_propagation();
+                            view.scroll_picker(event, row_height, cx);
+                        }))
                         .children(list)
                         .when_some(empty, |list, text| {
                             list.child(div().px_1p5().py_0p5().text_color(muted).child(text))

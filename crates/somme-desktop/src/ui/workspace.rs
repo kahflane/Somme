@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::component::badge::Badge;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem};
@@ -28,6 +29,9 @@ use crate::editor::scratch::{self, OpenEntry};
 use crate::editor::system_open;
 use crate::editor::{EditorPane, EditorPaneEvent};
 use crate::github::api::Kind;
+use crate::github::counts::Counts;
+use crate::github::profile;
+use crate::github::repo::Repo;
 use crate::services::Services;
 use crate::settings::Settings;
 use crate::search::Hit;
@@ -328,6 +332,8 @@ impl Workspace {
                 workspace.open_waiting_pins(window, cx);
                 cx.notify();
             }),
+            // New numbers for the pull request and issue badges.
+            cx.observe_global::<Counts>(|_, cx| cx.notify()),
             cx.subscribe_in(&store, window, |workspace, _, event, window, cx| match event {
                 // Locking only closes the vault. Terminals stay as they are.
                 StoreEvent::VaultChanged => {
@@ -338,6 +344,7 @@ impl Workspace {
             }),
         ];
         Self::watch_idle(cx);
+        Self::watch_github(cx);
         let mut workspace = Self {
             services,
             tabs: Vec::new(),
@@ -375,6 +382,33 @@ impl Workspace {
             workspace.reopen_files(window, cx);
         }
         workspace
+    }
+
+    /// Keeps the pull request and issue badges up to date for the repository
+    /// the focused shell is in. Each check is cheap; GitHub is only asked when
+    /// the numbers are missing or old.
+    fn watch_github(cx: &mut Context<Self>) {
+        cx.spawn(async move |workspace, cx| {
+            loop {
+                let alive = workspace.update(cx, |workspace, cx| {
+                    let Some(repo) = workspace.github_repo(cx) else { return };
+                    Counts::refresh(&repo, &workspace.services, false, cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// The GitHub repository of the focused shell, when its buttons show.
+    fn github_repo(&self, cx: &App) -> Option<Repo> {
+        if !(Store::global(cx).read(cx).account.signed_in || fake_github()) {
+            return None;
+        }
+        self.active_terminal()?.read(cx).repo(cx)
     }
 
     /// Locks the vault once the user has been idle longer than the auto-lock setting.
@@ -455,7 +489,8 @@ impl Workspace {
                 cx.notify();
             }
             TerminalTabEvent::Empty => workspace.remove_tab(id, window, cx),
-            TerminalTabEvent::OpenChanges(dir) => workspace.open_changes(dir.clone(), window, cx),
+            TerminalTabEvent::OpenChanges(dir) => workspace.open_changes(dir.clone(), None, window, cx),
+            TerminalTabEvent::OpenCommit(dir, sha) => workspace.open_changes(dir.clone(), Some(sha.clone()), window, cx),
         });
         self.tabs.push(Tab {
             id,
@@ -564,10 +599,11 @@ impl Workspace {
         }
     }
 
-    /// Shows the git changes of the repo that holds `dir`, in its own tab.
-    fn open_changes(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows the git changes of the repo that holds `dir`, or what `commit`
+    /// changed there, in its own tab.
+    fn open_changes(&mut self, dir: PathBuf, commit: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.tabs.iter().position(|tab| match &tab.content {
-            TabContent::Changes(view) => view.read(cx).shows(&dir),
+            TabContent::Changes(view) => view.read(cx).shows(&dir) && view.read(cx).shown_commit() == commit.as_deref(),
             TabContent::Terminal(_) | TabContent::Editor(_) => false,
         });
         if let Some(ix) = open {
@@ -577,7 +613,10 @@ impl Workspace {
             self.activate(Some(ix), window, cx);
             return;
         }
-        let view = cx.new(|cx| ChangesView::new(dir, cx));
+        let view = cx.new(|cx| match commit {
+            Some(sha) => ChangesView::commit(dir, sha, cx),
+            None => ChangesView::new(dir, cx),
+        });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let subscription = cx.observe(&view, |_, _, cx| cx.notify());
@@ -635,6 +674,7 @@ impl Workspace {
             cx.subscribe_in(&pane, window, move |workspace, _, event, window, cx| match event {
                 EditorPaneEvent::Empty => workspace.remove_tab(id, window, cx),
                 EditorPaneEvent::FilesChanged => workspace.save_open_files(cx),
+                EditorPaneEvent::OpenCommit(dir, sha) => workspace.open_changes(dir.clone(), Some(sha.clone()), window, cx),
             }),
         ];
         self.tabs.push(Tab {
@@ -1396,6 +1436,19 @@ impl Workspace {
         self.show_page(Page::Sftp, window, cx);
     }
 
+    /// The account picture shows the user's GitHub profile, or the account
+    /// page when nobody is signed in.
+    fn show_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(login) = Store::global(cx).read(cx).account.login.clone().or_else(fake_login) else {
+            return self.show_account(window, cx);
+        };
+        let workspace = cx.entity().downgrade();
+        let on_account = move |window: &mut Window, cx: &mut App| {
+            let _ = workspace.update(cx, |workspace, cx| workspace.show_account(window, cx));
+        };
+        profile::show(login, &self.services, on_account, window, cx);
+    }
+
     fn show_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings
             .get_or_insert_with(|| cx.new(SettingsPage::new))
@@ -1659,13 +1712,16 @@ impl Workspace {
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let unlocked = Store::global(cx).read(cx).is_unlocked();
         // Pull requests and issues show for a signed-in user whose shell is in a GitHub repository.
-        let github = self
+        let github = self.github_repo(cx).zip(self.active_terminal()).map(|(repo, tab)| {
+            let shown = tab.read(cx).github_kind(cx);
+            (tab, Counts::summary(&repo, cx), repo, shown)
+        });
+        let badge = cx.theme().blue;
+        // The commit graph shows for a local shell in any git repository.
+        let graph = self
             .active_terminal()
-            .filter(|_| Store::global(cx).read(cx).account.signed_in || fake_github())
-            .and_then(|tab| {
-                let read = tab.read(cx);
-                read.repo(cx).map(|repo| (tab.clone(), repo, read.github_kind(cx)))
-            });
+            .filter(|tab| tab.read(cx).git_dir(cx).is_some())
+            .map(|tab| (tab.read(cx).graph_shown(), tab));
         TitleBar::new()
             // The kit keeps room for the window buttons, which full screen hides.
             .when(window.is_fullscreen(), |bar| bar.pl_0())
@@ -1680,29 +1736,50 @@ impl Workspace {
                     .pr_2()
                     .gap_2()
                     .child(self.render_tab_strip(cx))
-                    .when_some(github, |bar, (tab, repo, shown)| {
+                    .when_some(github, |bar, (tab, summary, repo, shown)| {
                         let issues_tab = tab.clone();
+                        let name = summary.as_ref().map_or_else(|| repo.full_name(), |summary| summary.repo.full_name());
+                        let (pulls, issues) = summary.map_or((None, None), |summary| (Some(summary.pulls), Some(summary.issues)));
+                        let tip = |count: Option<u64>, what: &str| match count {
+                            Some(count) => format!("{count} open {what} in {name}"),
+                            None => format!("Open {what} in {name}"),
+                        };
                         bar.child(
-                            Button::new("github-pulls")
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(Lucide::GitPullRequest))
-                                .selected(shown == Some(Kind::Pulls))
-                                .tooltip(format!("Pull requests of {}", repo.full_name()))
-                                .on_click(move |_, window, cx| {
-                                    tab.update(cx, |tab, cx| tab.toggle_github(Kind::Pulls, window, cx));
-                                }),
+                            Badge::new().count(pulls.unwrap_or_default() as usize).color(badge).child(
+                                Button::new("github-pulls")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(Lucide::GitPullRequest))
+                                    .selected(shown == Some(Kind::Pulls))
+                                    .tooltip(tip(pulls, "pull requests"))
+                                    .on_click(move |_, window, cx| {
+                                        tab.update(cx, |tab, cx| tab.toggle_github(Kind::Pulls, window, cx));
+                                    }),
+                            ),
                         )
                         .child(
-                            Button::new("github-issues")
+                            Badge::new().count(issues.unwrap_or_default() as usize).color(badge).child(
+                                Button::new("github-issues")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(Lucide::CircleDot))
+                                    .selected(shown == Some(Kind::Issues))
+                                    .tooltip(tip(issues, "issues"))
+                                    .on_click(move |_, window, cx| {
+                                        issues_tab.update(cx, |tab, cx| tab.toggle_github(Kind::Issues, window, cx));
+                                    }),
+                            ),
+                        )
+                    })
+                    .when_some(graph, |bar, (shown, tab)| {
+                        bar.child(
+                            Button::new("git-graph")
                                 .ghost()
                                 .xsmall()
-                                .icon(Icon::new(Lucide::CircleDot))
-                                .selected(shown == Some(Kind::Issues))
-                                .tooltip(format!("Issues of {}", repo.full_name()))
-                                .on_click(move |_, window, cx| {
-                                    issues_tab.update(cx, |tab, cx| tab.toggle_github(Kind::Issues, window, cx));
-                                }),
+                                .icon(Icon::new(Lucide::GitGraph))
+                                .selected(shown)
+                                .tooltip("Commit graph")
+                                .on_click(move |_, window, cx| tab.update(cx, |tab, cx| tab.toggle_graph(window, cx))),
                         )
                     })
                     .when(self.side_panel_fits(cx), |bar| {
@@ -1781,7 +1858,7 @@ impl Workspace {
             .hover(|el| el.bg(theme.foreground.opacity(0.05)))
             .child(avatar(store.avatar.clone(), px(22.), cx))
             .tooltip(move |window, cx| Tooltip::new(handle.clone()).build(window, cx))
-            .on_click(cx.listener(|workspace, _, window, cx| workspace.show_account(window, cx)));
+            .on_click(cx.listener(|workspace, _, window, cx| workspace.show_profile(window, cx)));
 
         v_flex()
             .flex_none()
@@ -1795,9 +1872,9 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(item("rail-cli", Lucide::SquareTerminal, Section::Cli, "Terminal", Box::new(NewLocalTerminal)))
             .child(item("rail-ssh", Lucide::Server, Section::Ssh, "SSH", Box::new(ShowHome)))
-            .child(item("rail-settings", Lucide::Settings, Section::Settings, "Settings", Box::new(OpenSettings)))
             .child(div().flex_1())
             .child(account)
+            .child(item("rail-settings", Lucide::Settings, Section::Settings, "Settings", Box::new(OpenSettings)))
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2048,6 +2125,14 @@ fn fake_github() -> bool {
     return crate::github::api::fake_api().is_some();
     #[cfg(not(feature = "snapshot"))]
     false
+}
+
+/// UI check builds show this user's profile without signing in.
+fn fake_login() -> Option<String> {
+    #[cfg(feature = "snapshot")]
+    return std::env::var("SOMME_GITHUB_LOGIN").ok().filter(|_| fake_github());
+    #[cfg(not(feature = "snapshot"))]
+    None
 }
 
 #[cfg(test)]
