@@ -304,6 +304,61 @@ mod tests {
         assert_eq!(rows.iter().map(Row::width).max(), Some(2));
     }
 
+    /// A repo's own config can ask git to check signatures with a program it
+    /// names. Reading the log must not run it.
+    #[cfg(unix)]
+    #[test]
+    fn a_repo_cannot_run_its_signature_checker() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let ran = dir.path().join("ran");
+        let checker = dir.path().join("check.sh");
+        std::fs::write(&checker, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(&checker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = |args: &[&str], input: Option<&str>| {
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            std::io::Write::write_all(&mut stdin, input.unwrap_or_default().as_bytes()).unwrap();
+            drop(stdin);
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap().trim().to_owned()
+        };
+        std::fs::create_dir(&repo).unwrap();
+        git(&["init", "-q"], None);
+        let tree = git(&["mktree"], Some(""));
+        let signed = format!(
+            "tree {tree}\nauthor Ann <ann@example.test> 1700000000 +0000\ncommitter Ann <ann@example.test> 1700000000 +0000\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n\nSigned\n"
+        );
+        let sha = git(&["hash-object", "-t", "commit", "-w", "--stdin"], Some(&signed));
+        git(&["update-ref", "refs/heads/main", &sha], None);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"], None);
+        git(&["config", "log.showSignature", "true"], None);
+        git(&["config", "gpg.program", checker.to_str().unwrap()], None);
+        // Plain git does run it.
+        git(&["log", "-1"], None);
+        assert!(ran.exists(), "the test repo should trigger the checker");
+        std::fs::remove_file(&ran).unwrap();
+
+        let log = load(&repo, 10).unwrap();
+        assert_eq!(log.commits.len(), 1);
+        let details = details(&log.root, &sha).unwrap();
+        assert_eq!(details.message, "Signed");
+        assert!(!ran.exists(), "Somme ran the repo's signature checker");
+    }
+
     #[test]
     fn a_new_branch_tip_takes_a_free_column() {
         let rows = layout(&[commit('x', &['r']), commit('y', &['r']), commit('r', &[])]);
