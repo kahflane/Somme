@@ -55,6 +55,8 @@ use crate::ui::side_panel::{SidePanel, SidePanelEvent};
 use crate::ui::sftp::SftpPage;
 use crate::ui::snippets::SnippetsPage;
 use crate::ui::terminal_tab::{TerminalTab, TerminalTabEvent};
+use crate::ui::update;
+use crate::update::Updates;
 
 actions!(
     workspace,
@@ -334,6 +336,8 @@ impl Workspace {
             }),
             // New numbers for the pull request and issue badges.
             cx.observe_global::<Counts>(|_, cx| cx.notify()),
+            // An update found, or how its download is going.
+            cx.observe_global::<Updates>(|_, cx| cx.notify()),
             cx.subscribe_in(&store, window, |workspace, _, event, window, cx| match event {
                 // Locking only closes the vault. Terminals stay as they are.
                 StoreEvent::VaultChanged => {
@@ -1339,6 +1343,11 @@ impl Workspace {
         }
     }
 
+    /// Whether any tab has files with unsaved changes.
+    fn any_unsaved(&self, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| Self::has_unsaved(tab, cx))
+    }
+
     /// Closes the tabs `which` picks around the tab at `ix`, without asking.
     /// Pinned tabs stay, and so do tabs with unsaved files, so no typing is lost.
     fn close_tabs(&mut self, ix: usize, which: CloseTabs, window: &mut Window, cx: &mut Context<Self>) {
@@ -1859,6 +1868,11 @@ impl Workspace {
             .child(avatar(store.avatar.clone(), px(22.), cx))
             .tooltip(move |window, cx| Tooltip::new(handle.clone()).build(window, cx))
             .on_click(cx.listener(|workspace, _, window, cx| workspace.show_profile(window, cx)));
+        let workspace = cx.entity().downgrade();
+        let update_button = update::rail_button(
+            move |cx| workspace.upgrade().is_some_and(|workspace| workspace.read(cx).any_unsaved(cx)),
+            cx,
+        );
 
         v_flex()
             .flex_none()
@@ -1874,6 +1888,7 @@ impl Workspace {
             .child(item("rail-ssh", Lucide::Server, Section::Ssh, "SSH", Box::new(ShowHome)))
             .child(div().flex_1())
             .child(account)
+            .children(update_button)
             .child(item("rail-settings", Lucide::Settings, Section::Settings, "Settings", Box::new(OpenSettings)))
     }
 

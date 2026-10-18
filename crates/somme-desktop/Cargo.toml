@@ -21,6 +21,8 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dashmap.workspace = true
 dirs.workspace = true
+# Checks that an update was signed by Somme's release key.
+ed25519-dalek = "3.0"
 fontdb.workspace = true
 # Only one Somme opens the database: the app, or the background service.
 fs4 = "0.13"
@@ -42,6 +44,8 @@ memchr = "2"
 mermaid-rs-renderer = { version = "0.3", default-features = false }
 parking_lot = "0.12"
 percent-encoding = "2"
+# Makes the key that signs updates. Release tooling only.
+rand.workspace = true
 regex = "1"
 # GitHub's API, for pull requests and issues.
 reqwest.workspace = true
@@ -51,6 +55,8 @@ roxmltree = "0.21"
 ropey = { version = "=2.0.0-beta.1", features = ["metric_chars", "metric_lines_lf"] }
 serde.workspace = true
 serde_json.workspace = true
+# Hashes an update's download, to check it against the signed list.
+sha2.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true

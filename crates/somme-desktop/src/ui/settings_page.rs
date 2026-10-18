@@ -618,6 +618,18 @@ fn sign_in(page: WeakEntity<SettingsPage>, window: &mut Window, cx: &mut App) {
     );
 }
 
+fn updates_page() -> SettingPage {
+    SettingPage::new("Updates").icon(Icon::new(Lucide::CircleArrowDown)).group(
+        SettingGroup::new()
+            .title("Updates")
+            .description(format!("You have {APP_NAME} {}.", env!("CARGO_PKG_VERSION")))
+            .item(
+                SettingItem::new("Check for updates", switch(|s| s.check_updates, |s, v| s.check_updates = v))
+                    .description("Asks GitHub for a new version every few hours. Nothing is downloaded until you choose to update."),
+            ),
+    )
+}
+
 fn credits_page() -> SettingPage {
     // One group, so the sidebar shows Credits alone, without sub items.
     SettingPage::new("Credits").icon(Icon::new(Lucide::Heart)).group(
@@ -668,6 +680,7 @@ impl Render for SettingsPage {
                     privacy_page(),
                     account_page(page.clone()),
                     agents_page(page),
+                    updates_page(),
                     credits_page(),
                 ]),
         );

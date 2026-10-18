@@ -16,6 +16,7 @@ mod sftp;
 mod store;
 mod terminal;
 mod ui;
+mod update;
 mod web_images;
 
 use std::sync::Arc;
@@ -97,6 +98,11 @@ fn main() -> anyhow::Result<()> {
         // Keeps agents working while the app is closed.
         Some(mcp::SERVICE_ARG) => std::process::exit(mcp::run_service()),
         Some(mcp::WORKER_ARG) => std::process::exit(mcp::run_worker()),
+        // Release tools: make the update key, sign a release.
+        Some(update::verify::KEYGEN_ARG | update::verify::SIGN_ARG) => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            std::process::exit(update::verify::run_tool(&args))
+        }
         _ => {}
     }
     tracing_subscriber::fmt()
@@ -146,6 +152,7 @@ fn main() -> anyhow::Result<()> {
         host_os::init(&services.data_dir, cx);
         look::init(services.clone(), cx);
         mcp::init(services.clone(), cx);
+        update::init(services.data_dir.clone(), cx);
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1200.), px(780.)), cx)),
