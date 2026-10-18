@@ -24,6 +24,7 @@ use lsp_types::{
 use serde_json::{Value, json};
 
 use crate::editor::language::Language;
+use crate::editor::servers::{self, Package};
 use crate::settings::Settings;
 
 /// Where a server is in its life.
@@ -44,33 +45,71 @@ impl Global for Servers {}
 /// A language server installed on this computer, not started yet.
 #[derive(Clone, Debug)]
 pub struct Found {
+    /// The server's name, like `rust-analyzer`.
+    name: String,
     program: PathBuf,
-    args: &'static [&'static str],
+    args: Vec<String>,
     search: String,
 }
 
 impl Found {
-    /// The program's file name, like `rust-analyzer`.
+    /// The server's name, like `rust-analyzer`.
     pub fn name(&self) -> String {
-        self.program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        self.name.clone()
     }
 }
 
-/// The first installed server for `language`. Err says why there is none, like a
-/// server that is not installed, or is empty when the language has no server.
-pub fn find_server(language: &Language, shell_path: Option<&str>) -> Result<Found, String> {
+/// Why a language has no server, and what could get one.
+pub struct Missing {
+    /// Empty when the language has no server to suggest.
+    pub reason: String,
+    /// What Somme can install by itself.
+    pub package: Option<&'static Package>,
+}
+
+/// The first installed server for `language`: one on the search path, else
+/// one Somme installed in `managed`.
+pub fn find_server(language: &Language, shell_path: Option<&str>, managed: Option<&Path>) -> Result<Found, Missing> {
     let Some(first) = language.servers.first() else {
-        return Err(String::new());
+        return Err(Missing {
+            reason: String::new(),
+            package: None,
+        });
     };
     let search = search_path(shell_path);
-    let found = language
-        .servers
-        .iter()
-        .find_map(|command| find_program(command[0], &search).map(|program| (program, &command[1..])));
-    let Some((program, args)) = found else {
-        return Err(format!("Install {} for code help", first[0]));
+    let args = |command: &[&str]| command[1..].iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    let on_path = language.servers.iter().find_map(|command| {
+        find_program(command[0], &search).map(|program| Found {
+            name: command[0].to_owned(),
+            program,
+            args: args(command),
+            search: search.clone(),
+        })
+    });
+    let ours = || {
+        language.servers.iter().find_map(|command| {
+            let installed = servers::installed(managed?, command[0])?;
+            let mut all = vec![installed.script.to_string_lossy().into_owned()];
+            all.extend(args(command));
+            // Node's folder first, for servers that start `node` themselves.
+            let paths = std::iter::once(installed.bin).chain(std::env::split_paths(&search));
+            Some(Found {
+                name: command[0].to_owned(),
+                program: installed.node,
+                args: all,
+                search: std::env::join_paths(paths).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            })
+        })
     };
-    Ok(Found { program, args, search })
+    if let Some(found) = on_path.or_else(ours) {
+        return Ok(found);
+    }
+    let reason = match servers::hint(first[0]) {
+        Some(hint) => format!("For code help, run: {hint}"),
+        None => format!("Install {} for code help", first[0]),
+    };
+    let package = language.servers.iter().find_map(|command| servers::package_for(command[0]));
+    Err(Missing { reason, package })
 }
 
 /// Servers read the project and can run code from it, like build scripts, so they
@@ -82,13 +121,13 @@ pub fn is_trusted(root: &Path, cx: &App) -> bool {
 /// The server for the project at `root`, started if needed. The caller checks
 /// [`is_trusted`] first.
 pub fn server_for(found: &Found, root: &Path, cx: &mut App) -> Result<Rc<Client>, String> {
-    let key = (found.program.clone(), root.to_path_buf());
+    let key = (PathBuf::from(&found.name), root.to_path_buf());
     if let Some(client) = cx.default_global::<Servers>().0.get(&key)
         && !matches!(client.status(), Status::Stopped(_))
     {
         return Ok(client.clone());
     }
-    let client = Client::start(&found.program, found.args, root, &found.search, cx).map_err(|err| err.to_string())?;
+    let client = Client::start(found, root, cx).map_err(|err| err.to_string())?;
     cx.default_global::<Servers>().0.insert(key, client.clone());
     Ok(client)
 }
@@ -135,12 +174,13 @@ impl Drop for Client {
 }
 
 impl Client {
-    fn start(program: &Path, args: &[&str], root: &Path, search: &str, cx: &mut App) -> Result<Rc<Self>> {
+    fn start(found: &Found, root: &Path, cx: &mut App) -> Result<Rc<Self>> {
+        let program = &found.program;
         let mut child = Command::new(program)
-            .args(args)
+            .args(&found.args)
             .current_dir(root)
             // Servers run tools of their own, like cargo or node.
-            .env("PATH", search)
+            .env("PATH", &found.search)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -151,7 +191,7 @@ impl Client {
             child.stdout.take().expect("piped stdout"),
             child.stderr.take().expect("piped stderr"),
         );
-        let name = program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = found.name.clone();
         let shared = Arc::new(Mutex::new(Shared {
             status: Status::Starting,
             triggers: Vec::new(),
@@ -628,6 +668,22 @@ pub fn uri_path(uri: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn biome_helps_with_json_when_the_vscode_server_is_missing() {
+        let json = crate::editor::language::detect(Path::new("/a/package.json")).unwrap();
+        if find_program("vscode-json-language-server", &search_path(None)).is_some() {
+            return; // This computer has the first choice installed.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shell_path = dir.path().to_string_lossy().into_owned();
+        let missing = find_server(&json, Some(&shell_path), None).expect_err("nothing installed");
+        assert_eq!(missing.reason, "For code help, run: npm i -g vscode-langservers-extracted");
+        std::fs::write(dir.path().join(format!("biome{}", std::env::consts::EXE_SUFFIX)), "").unwrap();
+        let found = find_server(&json, Some(&shell_path), None).ok().expect("biome");
+        assert_eq!(found.name(), "biome");
+        assert_eq!(found.args, ["lsp-proxy"]);
+    }
 
     #[test]
     fn file_links_round_trip() {

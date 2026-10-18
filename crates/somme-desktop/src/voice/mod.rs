@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use gpui_kit::{App, AppContext as _, Context, Entity, EntityId, Global, Subscription, Task};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
+use crate::download::{self, Pinned};
 use crate::runtime;
 use crate::settings::Settings;
 
@@ -36,31 +36,35 @@ pub enum VoiceModel {
 /// A file to download, pinned to one version so its hash never changes.
 struct ModelFile {
     name: &'static str,
-    url: &'static str,
-    size: u64,
-    sha256: &'static str,
+    pinned: Pinned,
 }
 
 const BEST: ModelFile = ModelFile {
     name: "ggml-large-v3-turbo-q5_0.bin",
-    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin",
-    size: 574_041_195,
-    sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+    pinned: Pinned {
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin",
+        size: 574_041_195,
+        sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+    },
 };
 
 const SMALL: ModelFile = ModelFile {
     name: "ggml-small-q5_1.bin",
-    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin",
-    size: 190_085_487,
-    sha256: "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
+    pinned: Pinned {
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin",
+        size: 190_085_487,
+        sha256: "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
+    },
 };
 
 /// Silero, which finds where in a recording someone speaks.
 const VAD: ModelFile = ModelFile {
     name: "ggml-silero-v5.1.2.bin",
-    url: "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v5.1.2.bin",
-    size: 885_098,
-    sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+    pinned: Pinned {
+        url: "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v5.1.2.bin",
+        size: 885_098,
+        sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+    },
 };
 
 impl VoiceModel {
@@ -73,13 +77,11 @@ impl VoiceModel {
 
     /// The download size, like "574 MB".
     pub fn size(self) -> String {
-        megabytes(self.file().size + VAD.size)
+        megabytes(self.file().pinned.size + VAD.pinned.size)
     }
 }
 
-pub fn megabytes(bytes: u64) -> String {
-    format!("{} MB", bytes.div_ceil(1_000_000))
-}
+pub use crate::download::megabytes;
 
 /// The languages offered, by Whisper's code. Whisper knows about 100; these
 /// are the common ones. "auto" lets it guess from the speech.
@@ -202,7 +204,7 @@ impl Voice {
     pub fn ready(&self, model: VoiceModel) -> bool {
         [model.file(), &VAD]
             .iter()
-            .all(|file| std::fs::metadata(self.path(file)).is_ok_and(|meta| meta.len() == file.size))
+            .all(|file| std::fs::metadata(self.path(file)).is_ok_and(|meta| meta.len() == file.pinned.size))
     }
 
     /// Downloads `model` and the speech finder, checking each against its hash.
@@ -213,10 +215,10 @@ impl Voice {
         self.download_error = None;
         let files: Vec<(&'static ModelFile, PathBuf)> = [&VAD, model.file()]
             .into_iter()
-            .filter(|file| !std::fs::metadata(self.path(file)).is_ok_and(|meta| meta.len() == file.size))
+            .filter(|file| !std::fs::metadata(self.path(file)).is_ok_and(|meta| meta.len() == file.pinned.size))
             .map(|file| (file, self.path(file)))
             .collect();
-        let total = files.iter().map(|(file, _)| file.size).sum();
+        let total = files.iter().map(|(file, _)| file.pinned.size).sum();
         let progress = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let (seen, stop) = (progress.clone(), cancel.clone());
@@ -360,73 +362,9 @@ async fn fetch_all(
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     tokio::fs::create_dir_all(dir).await.map_err(|err| format!("Could not make the voice folder: {err}"))?;
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("somme/", env!("CARGO_PKG_VERSION")))
-        .https_only(true)
-        .connect_timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|err| err.to_string())?;
+    let client = download::client()?;
     for (file, path) in files {
-        fetch(&client, file, &path, progress, cancel).await?;
+        download::fetch(&client, &file.pinned, &path, "the voice model", progress, cancel).await?;
     }
     Ok(())
-}
-
-/// Downloads `file` to `path`, next to it first, and moves it in only once
-/// its size and hash match.
-async fn fetch(
-    client: &reqwest::Client,
-    file: &ModelFile,
-    path: &Path,
-    progress: &AtomicU64,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt as _;
-
-    let partial = path.with_extension("part");
-    let failed = |err: String| {
-        let partial = partial.clone();
-        async move {
-            let _ = tokio::fs::remove_file(&partial).await;
-            Err(err)
-        }
-    };
-    let mut response = match client.get(file.url).send().await.and_then(reqwest::Response::error_for_status) {
-        Ok(response) => response,
-        Err(err) => return failed(format!("Could not download the voice model: {err}")).await,
-    };
-    let mut out = match tokio::fs::File::create(&partial).await {
-        Ok(out) => out,
-        Err(err) => return failed(format!("Could not save the voice model: {err}")).await,
-    };
-    let mut hash = Sha256::new();
-    let mut got = 0u64;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return failed("Download stopped.".to_owned()).await;
-        }
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(err) => return failed(format!("The download broke off: {err}")).await,
-        };
-        got += chunk.len() as u64;
-        if got > file.size {
-            return failed("The voice model is bigger than it should be.".to_owned()).await;
-        }
-        hash.update(&chunk);
-        if let Err(err) = out.write_all(&chunk).await {
-            return failed(format!("Could not save the voice model: {err}")).await;
-        }
-        progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-    }
-    if let Err(err) = out.flush().await {
-        return failed(format!("Could not save the voice model: {err}")).await;
-    }
-    drop(out);
-    let digest: String = hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
-    if got != file.size || digest != file.sha256 {
-        return failed("The voice model didn't match its checksum, so it was thrown away.".to_owned()).await;
-    }
-    tokio::fs::rename(&partial, path).await.map_err(|err| format!("Could not save the voice model: {err}"))
 }

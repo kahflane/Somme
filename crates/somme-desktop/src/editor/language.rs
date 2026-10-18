@@ -32,6 +32,10 @@ const PYTHON_SERVERS: &[&[&str]] = &[
     &["pylsp"],
 ];
 const C_SERVERS: &[&[&str]] = &[&["clangd"]];
+// Biome is one program, with no Node, for people who have it but not the
+// servers from VS Code. It checks and formats, but knows no JSON schemas.
+const JSON_SERVERS: &[&[&str]] = &[&["vscode-json-language-server", "--stdio"], &["biome", "lsp-proxy"]];
+const CSS_SERVERS: &[&[&str]] = &[&["vscode-css-language-server", "--stdio"], &["biome", "lsp-proxy"]];
 const C_ROOTS: &[&str] = &["compile_commands.json", "CMakeLists.txt", "Makefile"];
 
 /// Finds the language from the file name, or None for plain text.
@@ -52,7 +56,7 @@ pub fn detect(path: &Path) -> Option<Language> {
     Some(match ext {
         "rs" => RUST,
         "toml" => toml(),
-        "json" | "jsonc" => lang("json", "JSON", "json", &[&["vscode-json-language-server", "--stdio"]], &[]),
+        "json" | "jsonc" => lang("json", "JSON", "json", JSON_SERVERS, &[]),
         // A JSON value per line. The JSON server would call each new line an error.
         "jsonl" | "ndjson" => lang("json", "JSON Lines", "json", &[], &[]),
         "js" | "mjs" | "cjs" | "jsx" => lang("javascript", "JavaScript", "javascript", TYPESCRIPT_SERVERS, JS_ROOTS),
@@ -64,7 +68,7 @@ pub fn detect(path: &Path) -> Option<Language> {
         "yml" | "yaml" => lang("yaml", "YAML", "yaml", &[&["yaml-language-server", "--stdio"]], &[]),
         "md" | "markdown" | "mdx" => lang("markdown", "Markdown", "markdown", &[&["marksman", "server"]], &[]),
         "html" | "htm" => lang("html", "HTML", "html", &[&["vscode-html-language-server", "--stdio"]], &[]),
-        "css" | "scss" => lang("css", "CSS", "css", &[&["vscode-css-language-server", "--stdio"]], &[]),
+        "css" | "scss" => lang("css", "CSS", "css", CSS_SERVERS, &[]),
         "c" | "h" => lang("c", "C", "c", C_SERVERS, C_ROOTS),
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => lang("cpp", "C++", "cpp", C_SERVERS, C_ROOTS),
         "cs" => lang("csharp", "C#", "csharp", &[], &[]),

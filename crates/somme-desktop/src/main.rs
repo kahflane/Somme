@@ -1,6 +1,7 @@
 #[cfg(feature = "snapshot")]
 mod automation;
 mod changes;
+mod download;
 mod editor;
 mod github;
 mod graph;
@@ -152,6 +153,7 @@ fn main() -> anyhow::Result<()> {
         Store::init(services.clone(), cx);
         host_os::init(&services.data_dir, cx);
         voice::Voice::init(&services.data_dir, cx);
+        editor::servers::Installer::init(&services.data_dir, cx);
         look::init(services.clone(), cx);
         mcp::init(services.clone(), cx);
         update::init(services.data_dir.clone(), cx);

@@ -1,0 +1,48 @@
+# Runs the tests on macOS, Windows and Linux. The language server test
+# downloads Node.js and a server for real, so it shows Somme can install
+# them on each system.
+
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake clang libssl-dev libdbus-1-dev libasound2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev \
+            libxcb1-dev libvulkan-dev libfontconfig1-dev libfreetype6-dev libzstd-dev
+
+      - name: Install language servers for real
+        run: cargo test --locked -p somme-desktop -- editor::servers editor::lsp --include-ignored

@@ -16,7 +16,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TextAlign, TextRun, Window, actions, canvas, div,
     font, point, prelude::FluentBuilder as _, px,
@@ -25,7 +25,9 @@ use gpui_kit::{
 use crate::editor::big::{BigText, BigTextEvent};
 use crate::editor::blame::{self, Blame, Change};
 use crate::editor::language::{self, Language};
-use crate::editor::lsp::{self, Client, DocProvider, Status};
+use crate::download::megabytes;
+use crate::editor::lsp::{self, Client, DocProvider, Missing, Status};
+use crate::editor::servers::{Installer, Package, State as InstallState};
 use crate::editor::markdown::MarkdownPreview;
 use crate::settings::Settings;
 use crate::editor::sudo;
@@ -80,6 +82,12 @@ enum Help {
     Untrusted { root: PathBuf, found: lsp::Found },
     /// Why there is none, empty when the language has no server to suggest.
     None(String),
+    /// No server is installed, but Somme can install one.
+    Installable {
+        package: &'static Package,
+        reason: String,
+        shell_path: Option<String>,
+    },
 }
 
 /// A file's text, as [`read_text`] reads it.
@@ -288,6 +296,9 @@ pub struct EditorPane {
     focus_handle: FocusHandle,
     /// How the last Markdown file was shown, for the next one.
     markdown_view: View,
+    /// Installs of language servers, the last finished one seen.
+    seen_installs: u64,
+    _installs: Option<Subscription>,
     _quit: Option<Subscription>,
 }
 
@@ -295,12 +306,24 @@ impl EventEmitter<EditorPaneEvent> for EditorPane {}
 
 impl EditorPane {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let installs = Installer::global(cx).map(|installer| {
+            cx.observe(&installer, |pane: &mut Self, installer, cx| {
+                let finished = installer.read(cx).finished;
+                if finished != pane.seen_installs {
+                    pane.seen_installs = finished;
+                    pane.retry_installable(cx);
+                }
+                cx.notify();
+            })
+        });
         Self {
             files: Vec::new(),
             active: 0,
             own_tab: false,
             focus_handle: cx.focus_handle(),
             markdown_view: View::Preview,
+            seen_installs: Installer::global(cx).map_or(0, |installer| installer.read(cx).finished),
+            _installs: installs,
             _quit: None,
         }
     }
@@ -574,9 +597,17 @@ impl EditorPane {
         shell_path: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Help {
-        let found = match lsp::find_server(language, shell_path) {
+        let managed = Installer::global(cx).map(|installer| installer.read(cx).dir().to_path_buf());
+        let found = match lsp::find_server(language, shell_path, managed.as_deref()) {
             Ok(found) => found,
-            Err(reason) => return Help::None(reason),
+            Err(Missing {
+                reason,
+                package: Some(package),
+            }) => {
+                let shell_path = shell_path.map(str::to_owned);
+                return Help::Installable { package, reason, shell_path };
+            }
+            Err(Missing { reason, .. }) => return Help::None(reason),
         };
         let root = language::project_root(path, language.roots);
         if !lsp::is_trusted(&root, cx) {
@@ -692,7 +723,7 @@ impl EditorPane {
                     let reason = format!("{language} files are formatted by their language server. Turn on code help for this folder first.");
                     return done(Err(reason), self, window, cx);
                 }
-                Help::None(why) => {
+                Help::None(why) | Help::Installable { reason: why, .. } => {
                     let reason = format!("{language} files are formatted by their language server. {why}");
                     return done(Err(reason.trim_end().to_owned()), self, window, cx);
                 }
@@ -1021,7 +1052,11 @@ impl EditorPane {
                 Status::Stopped(reason) => (format!("{} stopped: {reason}", client.name), theme.warning),
             },
             Help::None(reason) => (reason.clone(), theme.muted_foreground),
-            Help::Untrusted { .. } => (String::new(), theme.muted_foreground),
+            Help::Untrusted { .. } | Help::Installable { .. } => (String::new(), theme.muted_foreground),
+        };
+        let install = match &file.help {
+            Help::Installable { package, reason, .. } => self.render_install(package, reason, cx),
+            _ => None,
         };
         let trust = match &file.help {
             Help::Untrusted { root, found } => Some((root.clone(), found.name())),
@@ -1061,6 +1096,7 @@ impl EditorPane {
             .when(!server.is_empty(), |bar| {
                 bar.child(div().min_w_0().truncate().text_color(server_color).child(server))
             })
+            .children(install)
             .when_some(trust, |bar, (root, server)| {
                 bar.child(
                     Button::new("trust-folder")
@@ -1075,6 +1111,72 @@ impl EditorPane {
             })
             .child(div().flex_none().child(language))
             .when(file.is_markdown(), |bar| bar.child(self.render_views(file, cx)))
+    }
+
+    /// What to do about a missing server: install it, or see it getting installed.
+    fn render_install(&self, package: &'static Package, reason: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let installer = Installer::global(cx)?;
+        let theme = cx.theme();
+        let state = installer.read(cx);
+        let button = |id: &'static str, label: &'static str| Button::new(id).ghost().xsmall().label(label).tab_stop(false);
+        let start = {
+            let installer = installer.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                installer.update(cx, |installer, cx| installer.start(package, cx));
+            }
+        };
+        let (text, color, action) = match state.state(package) {
+            InstallState::Idle => {
+                let tip = match state.download_size() {
+                    Some(size) => format!(
+                        "Gets Node.js ({}) and the {} servers, into Somme's own folder. Nothing else on this computer changes.",
+                        megabytes(size),
+                        package.label
+                    ),
+                    None => format!("Gets the {} servers from npm, into Somme's own folder.", package.label),
+                };
+                let action = button("install-server", "Install it for me").tooltip(tip).on_click(start);
+                (reason.to_owned(), theme.muted_foreground, Some(action))
+            }
+            InstallState::Node { done, total } => {
+                let text = if done >= total && total > 0 {
+                    "Unpacking Node.js…".to_owned()
+                } else {
+                    format!("Getting Node.js… {} of {}", megabytes(done), megabytes(total))
+                };
+                let installer = installer.clone();
+                let action = button("stop-install", "Stop").on_click(move |_, _, cx| {
+                    installer.update(cx, |installer, _| installer.cancel(package));
+                });
+                (text, theme.muted_foreground, Some(action))
+            }
+            InstallState::Npm => (format!("Installing the {} servers…", package.label), theme.muted_foreground, None),
+            InstallState::Failed(error) => {
+                (error.to_owned(), theme.warning, Some(button("retry-install", "Try again").on_click(start)))
+            }
+        };
+        Some(
+            h_flex()
+                .min_w_0()
+                .gap_1()
+                .items_center()
+                .child(div().min_w_0().truncate().text_color(color).child(text))
+                .children(action)
+                .into_any_element(),
+        )
+    }
+
+    /// Looks again for servers for files that had none, once an install is done.
+    fn retry_installable(&mut self, cx: &mut Context<Self>) {
+        for ix in 0..self.files.len() {
+            let file = &self.files[ix];
+            let (Help::Installable { shell_path, .. }, Some(language), Body::Code(editor)) = (&file.help, file.language, &file.body)
+            else {
+                continue;
+            };
+            let (path, editor, shell_path) = (file.path.clone(), editor.clone(), shell_path.clone());
+            self.files[ix].help = Self::help_for(&path, &language, &editor, shell_path.as_deref(), cx);
+        }
     }
 
     /// Who last changed the cursor's line, and a switch for showing it.
