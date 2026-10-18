@@ -34,11 +34,7 @@ struct NoCloud;
 
 #[async_trait]
 impl CloudAccounts for NoCloud {
-    async fn register(&self, _: &str, _: &str) -> Result<CloudSession, CloudError> {
-        unimplemented!()
-    }
-
-    async fn login(&self, _: &str, _: &str) -> Result<CloudSession, CloudError> {
+    async fn sign_in_with_github(&self) -> Result<CloudSession, CloudError> {
         unimplemented!()
     }
 
@@ -47,6 +43,10 @@ impl CloudAccounts for NoCloud {
     }
 
     async fn credentials(&self, _: &CloudSession) -> Result<SyncCredentials, CloudError> {
+        unimplemented!()
+    }
+
+    async fn avatar(&self, _: &str) -> Result<Vec<u8>, CloudError> {
         unimplemented!()
     }
 }

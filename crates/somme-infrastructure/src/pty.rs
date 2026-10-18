@@ -30,6 +30,7 @@ struct LocalTerminal {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     shell: Option<u32>,
+    hooks: bool,
 }
 
 /// The current folder of a process, asked from the OS.
@@ -78,6 +79,10 @@ impl Terminal for LocalTerminal {
         let front = None;
         front.and_then(process_cwd).or_else(|| process_cwd(self.shell?))
     }
+
+    fn has_hooks(&self) -> bool {
+        self.hooks
+    }
 }
 
 const ZSHENV: &str = include_str!("../shell/zsh/zshenv");
@@ -104,17 +109,18 @@ fn zsh_hooks_dir() -> std::io::Result<PathBuf> {
 }
 
 /// Makes zsh load the hooks: zsh reads `.zshenv` from ZDOTDIR first, and ours
-/// loads the user's own config before adding the hooks. Other shells start plain.
-fn add_shell_hooks(cmd: &mut CommandBuilder, token: &str) {
+/// loads the user's own config before adding the hooks. Other shells start
+/// plain. Returns whether the hooks will load.
+fn add_shell_hooks(cmd: &mut CommandBuilder, token: &str) -> bool {
     let shell = cmd.get_shell();
     if Path::new(&shell).file_name().and_then(|name| name.to_str()) != Some("zsh") {
-        return;
+        return false;
     }
     let dir = match zsh_hooks_dir() {
         Ok(dir) => dir,
         Err(err) => {
             tracing::warn!(%err, "could not write the shell hooks");
-            return;
+            return false;
         }
     };
     if let Some(user_dir) = std::env::var_os("ZDOTDIR") {
@@ -124,6 +130,7 @@ fn add_shell_hooks(cmd: &mut CommandBuilder, token: &str) {
     cmd.env("SOMME_SHELL_HOOKS", &dir);
     // Our .zshenv moves this into a shell variable before anything else runs.
     cmd.env("SOMME_MARK_TOKEN", token);
+    true
 }
 
 impl PtyGateway for NativePtyGateway {
@@ -139,9 +146,7 @@ impl PtyGateway for NativePtyGateway {
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        if let Some(token) = options.marks {
-            add_shell_hooks(&mut cmd, token);
-        }
+        let hooks = options.marks.is_some_and(|token| add_shell_hooks(&mut cmd, token));
         let dir = options.dir.filter(|d| d.is_dir()).map(Path::to_path_buf).or_else(dirs::home_dir);
         if let Some(dir) = dir {
             cmd.cwd(dir);
@@ -172,6 +177,7 @@ impl PtyGateway for NativePtyGateway {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             shell,
+            hooks,
         }))
     }
 }

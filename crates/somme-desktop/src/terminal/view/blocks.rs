@@ -171,16 +171,14 @@ impl TerminalView {
         });
     }
 
-    /// Copies a block's command or its output, from the right-click menu.
-    pub(super) fn copy_block(&mut self, output: bool, cx: &mut Context<Self>) {
-        let Some(index) = self.menu_block else { return };
-        let text = self
-            .session
-            .read(cx)
-            .blocks
-            .as_ref()
-            .and_then(|blocks| blocks.list.get(index))
-            .map(|block| if output { block.output_text() } else { block.command.clone() });
+    /// Copies a block's command or its output: block `index`, or the newest
+    /// command when there is no index.
+    pub(super) fn copy_block(&mut self, index: Option<usize>, output: bool, cx: &mut Context<Self>) {
+        let text = self.session.read(cx).blocks.as_ref().and_then(|blocks| match index {
+            Some(index) => blocks.list.get(index),
+            None => blocks.list.iter().rev().find(|block| !block.command.is_empty()),
+        });
+        let text = text.map(|block| if output { block.output_text() } else { block.command.clone() });
         if let Some(text) = text {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }

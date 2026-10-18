@@ -25,7 +25,7 @@ use crate::services::Services;
 use crate::settings::Settings;
 use crate::store::{Store, StoreEvent, mutate};
 use crate::terminal::SessionTarget;
-use crate::ui::common::{APP_NAME, Lucide, logo, notify_error, parse_color};
+use crate::ui::common::{APP_NAME, Lucide, avatar, logo, notify_error, parse_color};
 use crate::ui::native;
 use crate::ui::fields::host_input;
 use crate::ui::filter::parse_quick_connect;
@@ -61,6 +61,13 @@ actions!(
         TogglePalette,
         ToggleSidePanel,
         Quit,
+        RenameTab,
+        ShowHosts,
+        ShowKeychain,
+        ShowSnippets,
+        ShowForwarding,
+        ShowKnownHosts,
+        ShowLogs,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -1048,21 +1055,42 @@ impl Workspace {
                                 .tooltip("Search and connect (⌘P)")
                                 .on_click(cx.listener(|workspace, _, window, cx| workspace.toggle_palette(window, cx))),
                         )
-                        .child(
+                    })
+                    // Locking is part of the vault, so the button only shows there.
+                    .when(unlocked && self.active.is_none(), |bar| {
+                        bar.child(
                             Button::new("lock")
                                 .ghost()
                                 .xsmall()
                                 .icon(Icon::new(Lucide::Lock))
-                                .tooltip("Lock vault")
+                                .tooltip("Lock vault (⌘⇧L)")
                                 .on_click(cx.listener(|workspace, _, window, cx| workspace.on_lock(&LockVault, window, cx))),
                         )
-                    }),
+                    })
+                    .when(unlocked, |bar| bar.child(self.render_account_button(cx))),
             )
     }
 
+    /// The GitHub picture of the signed-in user. It opens the account settings.
+    fn render_account_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = Store::global(cx).read(cx);
+        let tooltip = match &store.account.login {
+            Some(login) => format!("Signed in as @{login}"),
+            None => "Sign in with GitHub".to_owned(),
+        };
+        let button = Button::new("account").ghost().xsmall();
+        let button = match store.avatar.clone() {
+            Some(picture) => button.child(avatar(Some(picture), px(18.), cx)),
+            None => button.icon(Icon::new(Lucide::CircleUser)),
+        };
+        button
+            .tooltip(tooltip)
+            .on_click(cx.listener(|workspace, _, window, cx| workspace.show_account(window, cx)))
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let store = Store::global(cx);
-        let account = store.read(cx).account.clone();
+        let store = Store::global(cx).read(cx);
+        let (account, picture) = (store.account.clone(), store.avatar.clone());
         let items = Page::ALL.into_iter().map(|page| {
             SidebarMenuItem::new(page.label())
                 .icon(page.icon())
@@ -1070,9 +1098,8 @@ impl Workspace {
                 .on_click(cx.listener(move |workspace, _, window, cx| workspace.show_page(page, window, cx)))
         });
         let account_label: SharedString = account
-            .email
-            .clone()
-            .unwrap_or_else(|| "Not signed in".to_owned())
+            .login
+            .map_or_else(|| "Not signed in".to_owned(), |login| format!("@{login}"))
             .into();
         Sidebar::new("nav")
             .collapsible(false)
@@ -1093,7 +1120,7 @@ impl Workspace {
                         .gap_2()
                         .cursor_pointer()
                         .on_click(cx.listener(|workspace, _, window, cx| workspace.show_account(window, cx)))
-                        .child(Icon::new(Lucide::CircleUser).size(px(18.)))
+                        .child(avatar(picture, px(18.), cx))
                         .child(div().text_sm().truncate().child(account_label)),
                 ),
             )
@@ -1238,6 +1265,17 @@ impl Render for Workspace {
             .on_action(cx.listener(|w, _: &TogglePalette, window, cx| w.toggle_palette(window, cx)))
             .on_action(cx.listener(|w, _: &ToggleSidePanel, window, cx| w.toggle_side_panel(window, cx)))
             .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
+            .on_action(cx.listener(|w, _: &RenameTab, window, cx| {
+                if let Some(ix) = w.active {
+                    w.start_rename(ix, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|w, _: &ShowHosts, window, cx| w.show_page(Page::Hosts, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowKeychain, window, cx| w.show_page(Page::Keychain, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowSnippets, window, cx| w.show_page(Page::Snippets, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowForwarding, window, cx| w.show_page(Page::Forwarding, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowKnownHosts, window, cx| w.show_page(Page::KnownHosts, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowLogs, window, cx| w.show_page(Page::Logs, window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab1, window, cx| w.activate(Some(0), window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab2, window, cx| w.activate(Some(1), window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab3, window, cx| w.activate(Some(2), window, cx)))

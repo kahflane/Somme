@@ -102,19 +102,15 @@ impl KeyStore for MemoryKeyStore {
 }
 
 #[derive(Default)]
-struct MemorySessionStore(parking_lot::Mutex<Option<(String, String)>>);
+struct MemorySessionStore(parking_lot::Mutex<Option<CloudSession>>);
 
 impl SessionStore for MemorySessionStore {
     fn load(&self) -> Option<CloudSession> {
-        let (token, email) = self.0.lock().clone()?;
-        Some(CloudSession {
-            token: token.into(),
-            email,
-        })
+        self.0.lock().clone()
     }
 
     fn save(&self, session: &CloudSession) -> Result<(), GatewayError> {
-        *self.0.lock() = Some((session.token.to_string(), session.email.clone()));
+        *self.0.lock() = Some(session.clone());
         Ok(())
     }
 

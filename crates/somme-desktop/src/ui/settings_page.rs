@@ -1,5 +1,4 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::setting::{
     NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsView,
 };
@@ -8,13 +7,13 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Focusable as _, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, WeakEntity, Window, div, prelude::FluentBuilder as _,
+    AnyElement, App, Context, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::settings::{Appearance, BellSetting, CursorShapeSetting, Settings};
 use crate::store::{Store, mutate_weak, report};
-use crate::ui::common::{APP_NAME, Lucide, ago, form_dialog, labeled, notify_error, notify_ok};
+use crate::ui::common::{APP_NAME, Lucide, ago, avatar, notify_error, notify_ok};
 use crate::ui::native;
 use crate::ui::theme_picker::{self, section};
 
@@ -373,36 +372,46 @@ fn account_page(page: WeakEntity<SettingsPage>) -> SettingPage {
     SettingPage::new("Account").icon(Icon::new(Lucide::CircleUser)).group(
         SettingGroup::new()
             .title("Sync")
-            .description("Sign in to keep hosts, keys, snippets and themes in sync across your devices. Passwords and keys are encrypted with your master password before they leave this device.")
+            .description("Sign in with GitHub to keep hosts, keys, snippets and themes in sync across your devices. Passwords and keys are encrypted with your master password before they leave this device.")
             .item(SettingItem::render(move |_, window, cx| account_panel(page.clone(), window, cx))),
     )
 }
 
 fn account_panel(page: WeakEntity<SettingsPage>, _: &mut Window, cx: &mut App) -> AnyElement {
     let store = Store::global(cx);
-    let (account, sync) = {
+    let (account, sync, picture, signing_in) = {
         let store = store.read(cx);
-        (store.account.clone(), store.sync.clone())
+        (store.account.clone(), store.sync.clone(), store.avatar.clone(), store.signing_in)
     };
     let muted = cx.theme().muted_foreground;
     let danger = cx.theme().danger;
     if !account.signed_in {
-        let sign_in = page.clone();
-        let register = page;
-        return h_flex()
-            .w_full()
-            .justify_between()
-            .items_center()
+        let row = h_flex().w_full().justify_between().items_center();
+        if signing_in {
+            return row
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Spinner::new().small())
+                        .child(div().text_sm().child("Waiting for GitHub in your browser…")),
+                )
+                .child(
+                    Button::new("cancel-sign-in")
+                        .small()
+                        .label("Cancel")
+                        .on_click(|_, _, cx| Store::services(cx).sync.cancel_sign_in()),
+                )
+                .into_any_element();
+        }
+        return row
             .child(div().text_sm().child("Not signed in"))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(Button::new("create-account").small().label("Create Account").on_click(
-                        move |_, window, cx| open_auth(register.clone(), true, window, cx),
-                    ))
-                    .child(Button::new("sign-in").small().primary().label("Sign In").on_click(
-                        move |_, window, cx| open_auth(sign_in.clone(), false, window, cx),
-                    )),
+                Button::new("sign-in")
+                    .small()
+                    .primary()
+                    .icon(Icon::new(Lucide::Github))
+                    .label("Sign in with GitHub")
+                    .on_click(move |_, window, cx| sign_in(page.clone(), window, cx)),
             )
             .into_any_element();
     }
@@ -414,6 +423,7 @@ fn account_panel(page: WeakEntity<SettingsPage>, _: &mut Window, cx: &mut App) -
     } else {
         "Not synced yet".to_owned()
     };
+    let login = account.login.clone().unwrap_or_default();
     let sync_page = page.clone();
     let out_page = page;
     v_flex()
@@ -425,10 +435,16 @@ fn account_panel(page: WeakEntity<SettingsPage>, _: &mut Window, cx: &mut App) -
                 .justify_between()
                 .items_center()
                 .child(
-                    v_flex()
+                    h_flex()
                         .min_w_0()
-                        .child(div().text_sm().font_medium().truncate().child(account.email.unwrap_or_default()))
-                        .child(div().text_xs().text_color(muted).child(status)),
+                        .gap_3()
+                        .child(avatar(picture, px(32.), cx))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .child(div().text_sm().font_medium().truncate().child(account.name.unwrap_or_else(|| login.clone())))
+                                .child(div().text_xs().text_color(muted).truncate().child(format!("@{login} · {status}"))),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -483,74 +499,33 @@ fn sign_out(page: WeakEntity<SettingsPage>, window: &mut Window, cx: &mut App) {
     );
 }
 
-fn open_auth(page: WeakEntity<SettingsPage>, register: bool, window: &mut Window, cx: &mut App) {
-    let email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com"));
-    let password = cx.new(|cx| InputState::new(window, cx).placeholder("Password").masked(true));
-    let focus = email.focus_handle(cx);
-    let (title, ok) = if register { ("Create Account", "Create Account") } else { ("Sign In", "Sign In") };
-    form_dialog(
-        title,
-        ok,
-        400.,
-        Some(focus),
-        {
-            let email = email.clone();
-            let password = password.clone();
-            move |_, cx| {
-                v_flex()
-                    .gap_3()
-                    .child(labeled("Email", Input::new(&email)))
-                    .child(labeled("Password", Input::new(&password).mask_toggle()))
-                    .when(register, |form| {
-                        form.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("This is your sync account password. Your vault stays locked by your master password."),
-                        )
-                    })
-                    .into_any_element()
-            }
-        },
-        move |window, cx| {
-            let address = email.read(cx).value().trim().to_owned();
-            let secret = password.read(cx).value().to_string();
-            if address.is_empty() || secret.is_empty() {
-                return false;
-            }
-            mutate_weak(
-                &page,
-                window,
-                cx,
-                move |services| async move {
-                    if register {
-                        services.sync.register(&address, &secret).await
-                    } else {
-                        services.sync.login(&address, &secret).await
-                    }
-                },
-                move |_, result, window, cx| match result {
-                    Ok(account) => {
-                        // Joining an account that already has a vault locks this one until its
-                        // master password is entered.
-                        Store::global(cx).update(cx, |store, cx| {
-                            store.refresh_account(cx);
-                            store.check_vault(cx);
-                        });
-                        notify_ok(cx, format!("Signed in as {}", account.email.unwrap_or_default()));
-                    }
-                    Err(err) => notify_error(
-                        window,
-                        cx,
-                        if register { "Could not create account" } else { "Could not sign in" },
-                        err,
-                    ),
-                },
-            );
-            true
-        },
+fn sign_in(page: WeakEntity<SettingsPage>, window: &mut Window, cx: &mut App) {
+    Store::global(cx).update(cx, |store, cx| {
+        store.signing_in = true;
+        cx.notify();
+    });
+    mutate_weak(
+        &page,
         window,
         cx,
+        |services| async move { services.sync.sign_in_with_github().await },
+        |_, result, window, cx| {
+            // Joining an account that already has a vault locks this one until its
+            // master password is entered.
+            Store::global(cx).update(cx, |store, cx| {
+                store.signing_in = false;
+                store.refresh_account(cx);
+                store.check_vault(cx);
+            });
+            match result {
+                Ok(account) => {
+                    cx.activate(true);
+                    notify_ok(cx, format!("Signed in as {}", account.login.unwrap_or_default()));
+                }
+                Err(err) if err.kind() == "cancelled" => {}
+                Err(err) => notify_error(window, cx, "Could not sign in", err),
+            }
+        },
     );
 }
 

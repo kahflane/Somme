@@ -2,18 +2,18 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use somme_domain::{
-    DomainError, Group, Host, Id, Identity, KnownHost, PortForward, Repository, Sealed, Snippet,
+    Group, Host, Id, Identity, KnownHost, PortForward, Repository, Sealed, Snippet,
     SshKey, VaultRepository,
 };
+use tokio::sync::oneshot;
 
 use crate::dto::{AccountStatus, MergeReport, SyncStatusView};
 use crate::error::{AppError, AppResult};
 use crate::ports::{
-    CloudAccounts, CloudSession, EventPublisher, MasterKey, SessionStore, SyncGateway, SyncOutcome, VaultData,
+    CloudAccounts, CloudSession, EventPublisher, GatewayError, MasterKey, SessionStore, SyncGateway, SyncOutcome,
+    VaultData,
 };
 use crate::services::VaultService;
-
-const MIN_PASSWORD_LEN: usize = 10;
 
 pub struct SyncService {
     gateway: Arc<dyn SyncGateway>,
@@ -23,6 +23,8 @@ pub struct SyncService {
     events: Arc<dyn EventPublisher>,
     data: Arc<dyn VaultData>,
     previous_key: Mutex<Option<MasterKey>>,
+    /// Stops the GitHub sign-in that is waiting on the browser.
+    cancel_sign_in: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl SyncService {
@@ -42,6 +44,7 @@ impl SyncService {
             events,
             data,
             previous_key: Mutex::new(None),
+            cancel_sign_in: Mutex::new(None),
         }
     }
 
@@ -50,23 +53,40 @@ impl SyncService {
     }
 
     pub fn account(&self) -> AccountStatus {
-        let session = self.sessions.load();
+        let profile = self.sessions.load().map(|s| s.profile);
         AccountStatus {
-            signed_in: session.is_some(),
-            email: session.map(|s| s.email),
+            signed_in: profile.is_some(),
+            login: profile.as_ref().map(|p| p.login.clone()),
+            name: profile.as_ref().and_then(|p| p.name.clone()),
+            avatar_url: profile.and_then(|p| p.avatar_url),
         }
     }
 
-    pub async fn register(&self, email: &str, password: &str) -> AppResult<AccountStatus> {
-        let (email, password) = validate(email, password)?;
-        let session = self.cloud.register(&email, password).await?;
-        self.start(session).await
+    /// Signs in with GitHub in the browser. Starting another sign-in, or
+    /// `cancel_sign_in`, stops this one.
+    pub async fn sign_in_with_github(&self) -> AppResult<AccountStatus> {
+        let (cancel, cancelled) = oneshot::channel();
+        *self.cancel_sign_in.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
+        let session = tokio::select! {
+            session = self.cloud.sign_in_with_github() => session,
+            _ = cancelled => return Err(GatewayError::Cancelled.into()),
+        };
+        self.cancel_sign_in.lock().unwrap_or_else(PoisonError::into_inner).take();
+        self.start(session?).await
     }
 
-    pub async fn login(&self, email: &str, password: &str) -> AppResult<AccountStatus> {
-        let (email, password) = validate(email, password)?;
-        let session = self.cloud.login(&email, password).await?;
-        self.start(session).await
+    pub fn cancel_sign_in(&self) {
+        if let Some(cancel) = self.cancel_sign_in.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            let _ = cancel.send(());
+        }
+    }
+
+    /// The signed-in user's GitHub picture.
+    pub async fn avatar(&self) -> AppResult<Option<Vec<u8>>> {
+        let Some(url) = self.sessions.load().and_then(|s| s.profile.avatar_url) else {
+            return Ok(None);
+        };
+        Ok(Some(self.cloud.avatar(&url).await?))
     }
 
     pub async fn logout(&self) -> AppResult<AccountStatus> {
@@ -187,16 +207,3 @@ where
     Ok(added)
 }
 
-fn validate<'a>(email: &str, password: &'a str) -> AppResult<(String, &'a str)> {
-    let email = email.trim().to_lowercase();
-    if !email.contains('@') {
-        return Err(DomainError::Invalid("enter a valid email address".into()).into());
-    }
-    if password.chars().count() < MIN_PASSWORD_LEN {
-        return Err(DomainError::Invalid(format!(
-            "password must have at least {MIN_PASSWORD_LEN} characters"
-        ))
-        .into());
-    }
-    Ok((email, password))
-}

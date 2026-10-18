@@ -5,13 +5,14 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use somme_application::ports::{
-    CloudAccounts, CloudError, CloudSession, GatewayError, SessionStore, SyncCredentials,
+    CloudAccounts, CloudError, CloudProfile, CloudSession, GatewayError, SessionStore, SyncCredentials,
 };
 use somme_domain::now;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use crate::db::TokenSource;
+use crate::github_login;
 use crate::keystore::KeyringStore;
 
 const SESSION_USER: &str = "cloud-session";
@@ -19,17 +20,32 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
 /// The hosted Somme Cloud. Set `SOMME_CLOUD_URL` to use a local one.
 pub const DEFAULT_CLOUD_URL: &str = "https://somme-cloud.fly.dev";
+/// Profile pictures only come from GitHub.
+const AVATAR_HOST: &str = "avatars.githubusercontent.com";
+const AVATAR_SIZE: &str = "96";
+const MAX_AVATAR: usize = 2 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubConfig {
+    client_id: String,
+}
 
 #[derive(Serialize)]
-struct AuthBody<'a> {
-    email: &'a str,
-    password: &'a str,
+#[serde(rename_all = "camelCase")]
+struct GitHubBody<'a> {
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionBody {
     token: String,
-    email: String,
+    login: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -79,12 +95,30 @@ impl HttpCloudClient {
             CloudError::Rejected(message)
         }
     }
+}
 
-    async fn auth(&self, path: &str, email: &str, password: &str) -> Result<CloudSession, CloudError> {
+#[async_trait]
+impl CloudAccounts for HttpCloudClient {
+    async fn sign_in_with_github(&self) -> Result<CloudSession, CloudError> {
         let response = self
             .http
-            .post(format!("{}{path}", self.base))
-            .json(&AuthBody { email, password })
+            .get(format!("{}/v1/auth/github", self.base))
+            .send()
+            .await
+            .map_err(unreachable)?;
+        if !response.status().is_success() {
+            return Err(Self::rejection(response).await);
+        }
+        let config: GitHubConfig = response.json().await.map_err(unreachable)?;
+        let grant = github_login::sign_in(&config.client_id, |page: &str| open::that_detached(page)).await?;
+        let response = self
+            .http
+            .post(format!("{}/v1/sessions/github", self.base))
+            .json(&GitHubBody {
+                code: &grant.code,
+                redirect_uri: &grant.redirect_uri,
+                code_verifier: &grant.code_verifier,
+            })
             .send()
             .await
             .map_err(unreachable)?;
@@ -94,19 +128,12 @@ impl HttpCloudClient {
         let body: SessionBody = response.json().await.map_err(unreachable)?;
         Ok(CloudSession {
             token: Zeroizing::new(body.token),
-            email: body.email,
+            profile: CloudProfile {
+                login: body.login,
+                name: body.name,
+                avatar_url: body.avatar_url,
+            },
         })
-    }
-}
-
-#[async_trait]
-impl CloudAccounts for HttpCloudClient {
-    async fn register(&self, email: &str, password: &str) -> Result<CloudSession, CloudError> {
-        self.auth("/v1/accounts", email, password).await
-    }
-
-    async fn login(&self, email: &str, password: &str) -> Result<CloudSession, CloudError> {
-        self.auth("/v1/sessions", email, password).await
     }
 
     async fn logout(&self, session: &CloudSession) -> Result<(), CloudError> {
@@ -145,12 +172,37 @@ impl CloudAccounts for HttpCloudClient {
             expires_at: body.expires_at,
         })
     }
+
+    async fn avatar(&self, url: &str) -> Result<Vec<u8>, CloudError> {
+        let mut url = reqwest::Url::parse(url).map_err(unreachable)?;
+        if url.scheme() != "https" || url.host_str() != Some(AVATAR_HOST) {
+            return Err(CloudError::Rejected("profile picture is not from GitHub".into()));
+        }
+        url.query_pairs_mut().append_pair("s", AVATAR_SIZE);
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(unreachable)?;
+        let bytes = response.bytes().await.map_err(unreachable)?;
+        if bytes.len() > MAX_AVATAR {
+            return Err(CloudError::Rejected("profile picture is too big".into()));
+        }
+        Ok(bytes.to_vec())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StoredSession {
     token: String,
-    email: String,
+    login: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 
 pub struct KeyringSessionStore {
@@ -168,10 +220,15 @@ impl Default for KeyringSessionStore {
 impl SessionStore for KeyringSessionStore {
     fn load(&self) -> Option<CloudSession> {
         let raw = self.keyring.get_secret()?;
+        // Sessions saved before GitHub sign-in have no login and are dropped.
         let stored: StoredSession = serde_json::from_str(&raw).ok()?;
         Some(CloudSession {
             token: Zeroizing::new(stored.token),
-            email: stored.email,
+            profile: CloudProfile {
+                login: stored.login,
+                name: stored.name,
+                avatar_url: stored.avatar_url,
+            },
         })
     }
 
@@ -179,7 +236,9 @@ impl SessionStore for KeyringSessionStore {
         let raw = Zeroizing::new(
             serde_json::to_string(&StoredSession {
                 token: session.token.to_string(),
-                email: session.email.clone(),
+                login: session.profile.login.clone(),
+                name: session.profile.name.clone(),
+                avatar_url: session.profile.avatar_url.clone(),
             })
             .map_err(|e| GatewayError::Io(e.to_string()))?,
         );

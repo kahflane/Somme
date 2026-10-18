@@ -25,6 +25,17 @@ pub fn logo(size: Pixels) -> Img {
     img(LOGO.clone()).size(size)
 }
 
+/// A round profile picture, or a person icon until there is one.
+pub fn avatar(picture: Option<Arc<Image>>, size: Pixels, cx: &App) -> AnyElement {
+    match picture {
+        Some(picture) => img(picture).size(size).rounded_full().into_any_element(),
+        None => Icon::new(Lucide::CircleUser)
+            .size(size)
+            .text_color(cx.theme().muted_foreground)
+            .into_any_element(),
+    }
+}
+
 /// Shows a backend error in the system's alert.
 pub fn notify_error(window: &mut Window, cx: &mut App, title: &str, err: impl std::fmt::Display) {
     native::error(title, &err.to_string(), window, cx);

@@ -18,6 +18,8 @@ pub enum Mark {
     Command(String),
     /// The shell's PATH, sent when it changes.
     Path(String),
+    /// The user's home folder where the shell runs.
+    Home(PathBuf),
 }
 
 pub enum Piece<'a> {
@@ -142,6 +144,7 @@ fn parse(payload: &[u8], token: &str) -> Option<Mark> {
         "B" => Some(Mark::Accepted),
         "C" => Some(Mark::Command(decode(rest))),
         "P" => Some(Mark::Path(decode(rest))),
+        "H" => Some(Mark::Home(PathBuf::from(decode(rest)))),
         _ => None,
     }
 }

@@ -13,7 +13,7 @@ use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::domain::{AuthRequest, CloudError, SessionView, SyncCredentials};
+use crate::domain::{CloudError, GitHubConfig, GitHubSignIn, SessionView, SyncCredentials};
 use crate::service::AccountService;
 
 const BODY_LIMIT: usize = 16 * 1024;
@@ -24,10 +24,9 @@ impl IntoResponse for CloudError {
     fn into_response(self) -> Response {
         let status = match &self {
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
-            Self::EmailTaken => StatusCode::CONFLICT,
             Self::BadCredentials | Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Provisioning(_) => StatusCode::BAD_GATEWAY,
+            Self::Provisioning(_) | Self::GitHub(_) => StatusCode::BAD_GATEWAY,
         };
         let message = if status.is_server_error() {
             tracing::error!(error = %self, "request failed");
@@ -48,12 +47,12 @@ fn bearer(headers: &HeaderMap) -> Result<&str, CloudError> {
         .ok_or(CloudError::Unauthorized)
 }
 
-async fn register(State(svc): State<Shared>, Json(req): Json<AuthRequest>) -> Result<(StatusCode, Json<SessionView>), CloudError> {
-    Ok((StatusCode::CREATED, Json(svc.register(&req.email, &req.password).await?)))
+async fn github_config(State(svc): State<Shared>) -> Json<GitHubConfig> {
+    Json(svc.github_config())
 }
 
-async fn login(State(svc): State<Shared>, Json(req): Json<AuthRequest>) -> Result<Json<SessionView>, CloudError> {
-    Ok(Json(svc.login(&req.email, &req.password).await?))
+async fn sign_in_with_github(State(svc): State<Shared>, Json(req): Json<GitHubSignIn>) -> Result<Json<SessionView>, CloudError> {
+    Ok(Json(svc.sign_in_with_github(&req).await?))
 }
 
 async fn logout(State(svc): State<Shared>, headers: HeaderMap) -> Result<StatusCode, CloudError> {
@@ -71,8 +70,8 @@ async fn health() -> &'static str {
 
 pub fn routes(svc: Shared) -> Router {
     Router::new()
-        .route("/v1/accounts", post(register))
-        .route("/v1/sessions", post(login))
+        .route("/v1/auth/github", get(github_config))
+        .route("/v1/sessions/github", post(sign_in_with_github))
         .route("/v1/sessions/current", delete(logout))
         .route("/v1/sync/credentials", post(credentials))
         .with_state(svc)
@@ -121,7 +120,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::service::tests::service;
+    use crate::service::tests::{service, sign_in};
 
     async fn call(app: &Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         let res = app.clone().oneshot(req).await.unwrap();
@@ -141,10 +140,19 @@ mod tests {
     async fn full_flow_over_http() {
         let (_dir, svc, _) = service().await;
         let app = routes(Arc::new(svc));
-        let (status, body) = call(&app, post_json("/v1/accounts", json!({"email": "a@b.co", "password": "long enough pw"}))).await;
-        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = call(&app, Request::get("/v1/auth/github").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["clientId"], "fake-client");
+        let good = sign_in("user-3");
+        let body_for = |code: &str| {
+            json!({"code": code, "redirectUri": good.redirect_uri, "codeVerifier": good.code_verifier})
+        };
+        let (status, body) = call(&app, post_json("/v1/sessions/github", body_for(&good.code))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["login"], "user3");
+        assert!(body["avatarUrl"].as_str().unwrap().starts_with("https://"));
         let token = body["token"].as_str().unwrap().to_owned();
-        let (status, _) = call(&app, post_json("/v1/sessions", json!({"email": "a@b.co", "password": "nope nope nope"}))).await;
+        let (status, _) = call(&app, post_json("/v1/sessions/github", body_for("forged"))).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let req = Request::post("/v1/sync/credentials")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))

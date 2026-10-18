@@ -16,6 +16,8 @@ pub struct Config {
     pub turso_org: String,
     pub turso_group: String,
     pub token_ttl_days: u32,
+    pub github_client_id: String,
+    pub github_client_secret: String,
     /// Header holding the real client IP when running behind a proxy (Fly sets
     /// `Fly-Client-IP`). Only set it when a proxy overwrites the header, or
     /// clients could fake it to dodge rate limits.
@@ -42,6 +44,8 @@ impl Config {
                 .transpose()
                 .context("SOMME_TOKEN_TTL_DAYS must be a number")?
                 .unwrap_or(DEFAULT_TOKEN_TTL_DAYS),
+            github_client_id: var("GITHUB_CLIENT_ID").context("GITHUB_CLIENT_ID is required")?,
+            github_client_secret: var("GITHUB_CLIENT_SECRET").context("GITHUB_CLIENT_SECRET is required")?,
             client_ip_header: var("SOMME_CLOUD_CLIENT_IP_HEADER")
                 .map(|v| v.parse())
                 .transpose()

@@ -4,13 +4,16 @@ use tokio::sync::Mutex;
 use turso::{Connection, Value};
 use uuid::Uuid;
 
-use crate::domain::{Account, CloudError, Email};
+use crate::domain::{Account, CloudError, GitHubUser};
 
+/// `accounts` held the old email accounts and is no longer read.
 const SCHEMA: &str = r"
-CREATE TABLE IF NOT EXISTS accounts (
+CREATE TABLE IF NOT EXISTS github_accounts (
     id TEXT PRIMARY KEY NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
+    github_id INTEGER NOT NULL UNIQUE,
+    login TEXT NOT NULL,
+    name TEXT,
+    avatar_url TEXT,
     database_name TEXT NOT NULL,
     database_host TEXT,
     created_at INTEGER NOT NULL
@@ -22,6 +25,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL
 );
 ";
+
+const COLUMNS: &str = "id, github_id, login, name, avatar_url, database_name, database_host, created_at";
 
 fn storage(err: impl std::fmt::Display) -> CloudError {
     CloudError::Storage(err.to_string())
@@ -50,6 +55,28 @@ fn int(row: &turso::Row, idx: usize) -> Result<i64, CloudError> {
         .ok_or_else(|| storage("expected integer"))
 }
 
+fn optional(value: &Option<String>) -> Value {
+    value.clone().map_or(Value::Null, Value::Text)
+}
+
+async fn find(conn: &Connection, clause: &str, param: Value) -> Result<Option<Account>, CloudError> {
+    let sql = format!("SELECT {COLUMNS} FROM github_accounts WHERE {clause}");
+    let mut rows = conn.query(sql, vec![param]).await.map_err(storage)?;
+    let Some(row) = rows.next().await.map_err(storage)? else {
+        return Ok(None);
+    };
+    Ok(Some(Account {
+        id: text(&row, 0)?.unwrap_or_default().parse().map_err(storage)?,
+        github_id: int(&row, 1)?,
+        login: text(&row, 2)?.unwrap_or_default(),
+        name: text(&row, 3)?,
+        avatar_url: text(&row, 4)?,
+        database_name: text(&row, 5)?.unwrap_or_default(),
+        database_host: text(&row, 6)?,
+        created_at: int(&row, 7)?,
+    }))
+}
+
 impl AccountStore {
     pub async fn open(dir: &Path) -> Result<Self, CloudError> {
         std::fs::create_dir_all(dir).map_err(storage)?;
@@ -64,55 +91,59 @@ impl AccountStore {
         })
     }
 
-    pub async fn insert_account(&self, account: &Account) -> Result<(), CloudError> {
-        self.conn
-            .lock()
-            .await
-            .execute(
-                "INSERT INTO accounts (id, email, password_hash, database_name, database_host, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    /// Finds the account for a GitHub user, making one the first time they sign
+    /// in. Their name and picture are refreshed every time.
+    pub async fn sign_in(&self, user: &GitHubUser, now: i64) -> Result<Account, CloudError> {
+        let conn = self.conn.lock().await;
+        let github_id = Value::Integer(user.id);
+        if let Some(mut account) = find(&conn, "github_id = ?", github_id.clone()).await? {
+            conn.execute(
+                "UPDATE github_accounts SET login = ?, name = ?, avatar_url = ? WHERE id = ?",
                 vec![
+                    Value::Text(user.login.clone()),
+                    optional(&user.name),
+                    optional(&user.avatar_url),
                     Value::Text(account.id.to_string()),
-                    Value::Text(account.email.as_str().to_owned()),
-                    Value::Text(account.password_hash.clone()),
-                    Value::Text(account.database_name.clone()),
-                    account.database_host.clone().map_or(Value::Null, Value::Text),
-                    Value::Integer(account.created_at),
                 ],
             )
             .await
-            .map_err(|e| match e {
-                turso::Error::Constraint(_) => CloudError::EmailTaken,
-                other => storage(other),
-            })?;
-        Ok(())
-    }
-
-    async fn find(&self, clause: &str, param: String) -> Result<Option<Account>, CloudError> {
-        let sql = format!(
-            "SELECT id, email, password_hash, database_name, database_host, created_at FROM accounts WHERE {clause}"
-        );
-        let conn = self.conn.lock().await;
-        let mut rows = conn.query(sql, vec![Value::Text(param)]).await.map_err(storage)?;
-        let Some(row) = rows.next().await.map_err(storage)? else {
-            return Ok(None);
+            .map_err(storage)?;
+            account.login.clone_from(&user.login);
+            account.name.clone_from(&user.name);
+            account.avatar_url.clone_from(&user.avatar_url);
+            return Ok(account);
+        }
+        let id = Uuid::now_v7();
+        let account = Account {
+            id,
+            github_id: user.id,
+            login: user.login.clone(),
+            name: user.name.clone(),
+            avatar_url: user.avatar_url.clone(),
+            database_name: Account::database_name_for(id),
+            database_host: None,
+            created_at: now,
         };
-        let id = text(&row, 0)?.unwrap_or_default();
-        Ok(Some(Account {
-            id: id.parse().map_err(storage)?,
-            email: Email::parse(&text(&row, 1)?.unwrap_or_default())?,
-            password_hash: text(&row, 2)?.unwrap_or_default(),
-            database_name: text(&row, 3)?.unwrap_or_default(),
-            database_host: text(&row, 4)?,
-            created_at: int(&row, 5)?,
-        }))
-    }
-
-    pub async fn find_by_email(&self, email: &Email) -> Result<Option<Account>, CloudError> {
-        self.find("email = ?", email.as_str().to_owned()).await
+        conn.execute(
+            &format!("INSERT INTO github_accounts ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
+            vec![
+                Value::Text(account.id.to_string()),
+                github_id,
+                Value::Text(account.login.clone()),
+                optional(&account.name),
+                optional(&account.avatar_url),
+                Value::Text(account.database_name.clone()),
+                Value::Null,
+                Value::Integer(account.created_at),
+            ],
+        )
+        .await
+        .map_err(storage)?;
+        Ok(account)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> Result<Option<Account>, CloudError> {
-        self.find("id = ?", id.to_string()).await
+        find(&*self.conn.lock().await, "id = ?", Value::Text(id.to_string())).await
     }
 
     pub async fn set_database_host(&self, id: Uuid, host: &str) -> Result<(), CloudError> {
@@ -120,7 +151,7 @@ impl AccountStore {
             .lock()
             .await
             .execute(
-                "UPDATE accounts SET database_host = ? WHERE id = ?",
+                "UPDATE github_accounts SET database_host = ? WHERE id = ?",
                 vec![Value::Text(host.to_owned()), Value::Text(id.to_string())],
             )
             .await
@@ -200,5 +231,26 @@ mod tests {
         for task in tasks {
             assert!(task.await.unwrap().unwrap().is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn the_same_github_user_keeps_one_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountStore::open(dir.path()).await.unwrap();
+        let mut user = GitHubUser {
+            id: 42,
+            login: "octo".into(),
+            name: None,
+            avatar_url: None,
+        };
+        let first = store.sign_in(&user, 1).await.unwrap();
+        user.login = "octocat".into();
+        user.name = Some("The Octocat".into());
+        let second = store.sign_in(&user, 2).await.unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.database_name, second.database_name);
+        let saved = store.find_by_id(first.id).await.unwrap().unwrap();
+        assert_eq!((saved.login.as_str(), saved.name.as_deref()), ("octocat", Some("The Octocat")));
+        assert_eq!(saved.created_at, 1);
     }
 }

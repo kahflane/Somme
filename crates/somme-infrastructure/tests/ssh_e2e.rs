@@ -111,7 +111,7 @@ impl OutputSink for CollectSink {
 async fn run_shell(plan: ConnectPlan, ctx: ConnectContext) -> String {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let terminal = RusshGateway
-        .shell(plan, ctx, TermSize { cols: 80, rows: 24 }, Arc::new(CollectSink { tx }))
+        .shell(plan, ctx, TermSize { cols: 80, rows: 24 }, None, Arc::new(CollectSink { tx }))
         .await
         .unwrap();
     terminal.write(b"echo hello-$((40+2)); exit\n").await.unwrap();
@@ -225,6 +225,56 @@ async fn sftp_round_trip() {
     fs.remove(&remote_dir, true).await.unwrap();
     assert!(!PathBuf::from(&remote_dir).exists());
     fs.close().await;
+}
+
+/// The shell loads Somme's hooks on the server, and the server's files open
+/// over the same connection.
+#[tokio::test]
+#[ignore = "needs SOMME_TEST_SSHD_DIR with a running sshd on 127.0.0.1:2222"]
+async fn shell_with_hooks_marks_prompts_and_shares_files() {
+    let Some(dir) = fixtures() else { return };
+    let (ctx, _, _) = ctx(true, None);
+    let plan = ConnectPlan {
+        hops: vec![hop(vec![key(&dir, "client_key", None)])],
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let terminal = RusshGateway
+        .shell(plan, ctx, TermSize { cols: 80, rows: 24 }, Some("t0k3n"), Arc::new(CollectSink { tx }))
+        .await
+        .unwrap();
+    assert!(terminal.has_hooks());
+
+    let work = dir.join("hooks-work");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let files = terminal.files().await.expect("files beside the shell");
+    let note = format!("{}/note.txt", work.display());
+    files.write(&note, b"a longer first version").await.unwrap();
+    files.write(&note, b"from somme").await.unwrap();
+    assert_eq!(files.read(&note, 1024).await.unwrap(), b"from somme");
+    assert!(files.read(&note, 3).await.is_err(), "over the limit");
+    assert!(!files.stat(&note).await.unwrap().is_dir);
+    assert!(files.stat(&work.display().to_string()).await.unwrap().is_dir);
+
+    terminal
+        .write(format!("cd '{}'; cat note.txt; exit\n", work.display()).as_bytes())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let collected = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(Some(chunk)) = rx.recv().await {
+            out.extend(chunk);
+        }
+    })
+    .await;
+    assert!(collected.is_ok(), "shell did not close in time");
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.contains("\x1b]6973;t0k3n;H;"), "{out:?}");
+    assert!(out.contains("\x1b]6973;t0k3n;A;0;"), "{out:?}");
+    assert!(out.contains("\x1b]6973;t0k3n;C;cd "), "{out:?}");
+    assert!(out.contains("from somme"), "{out:?}");
+    terminal.close().await;
+    std::fs::remove_dir_all(&work).unwrap();
 }
 
 async fn free_port() -> u16 {

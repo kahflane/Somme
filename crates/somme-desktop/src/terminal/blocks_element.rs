@@ -1,4 +1,4 @@
-//! Draws a local shell's command blocks: a header with the folder, branch and
+//! Draws a shell's command blocks: a header with the folder, branch and
 //! time, the command, then what it printed. The newest block sits at the bottom.
 
 use std::time::Duration;
@@ -238,13 +238,17 @@ impl Element for BlocksElement {
         let session = self.session.read(cx);
         let empty = Vec::new();
         let list = session.blocks.as_ref().map_or(&empty, |blocks| &blocks.list);
+        let home = session.blocks.as_ref().and_then(|blocks| blocks.home.as_deref());
 
         // Heights first, so the newest block can sit at the bottom.
         let heights: Vec<(Vec<String>, usize, Pixels)> = list
             .iter()
             .map(|block| {
-                let command = command_rows(&block.command, columns);
                 let rows = output_rows(block);
+                if block.startup {
+                    return (Vec::new(), rows, GAP * 2. + line_height * rows as f32 + px(1.));
+                }
+                let command = command_rows(&block.command, columns);
                 let mut height = GAP * 2. + line_height * (1 + command.len()) as f32 + px(1.);
                 if rows > 0 {
                     height += GAP / 2. + line_height * rows as f32;
@@ -274,7 +278,11 @@ impl Element for BlocksElement {
             y = bottom;
             let header_y = top + GAP;
             let command_y = header_y + line_height;
-            let output_y = command_y + line_height * command.len() as f32 + GAP / 2.;
+            let output_y = if block.startup {
+                top + GAP
+            } else {
+                command_y + line_height * command.len() as f32 + GAP / 2.
+            };
             geoms.push(BlockGeom {
                 top,
                 bottom,
@@ -298,7 +306,7 @@ impl Element for BlocksElement {
             ));
 
             // Header: folder, branch, and how long it took.
-            let mut header = block.cwd.as_deref().map(short_path).unwrap_or_default();
+            let mut header = block.cwd.as_deref().map(|cwd| short_path(cwd, home)).unwrap_or_default();
             let mut header_runs = vec![run(header.len(), &small_font, muted)];
             if let Some(branch) = &block.branch {
                 let text = format!(" git:({branch})");
@@ -315,7 +323,7 @@ impl Element for BlocksElement {
                 header_runs.push(run(status.len(), &small_font, color));
                 header.push_str(&status);
             }
-            if !header.is_empty() && visible(header_y, line_height) {
+            if !block.startup && !header.is_empty() && visible(header_y, line_height) {
                 let line = text_system.shape_line(header.into(), small_size, &header_runs, None);
                 // Sits on the same baseline area as a full row.
                 texts.push(Text {

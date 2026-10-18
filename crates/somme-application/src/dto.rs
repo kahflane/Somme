@@ -330,7 +330,10 @@ pub struct MergeReport {
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {
     pub signed_in: bool,
-    pub email: Option<String>,
+    /// The GitHub username.
+    pub login: Option<String>,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

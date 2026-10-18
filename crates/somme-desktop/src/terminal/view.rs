@@ -53,6 +53,8 @@ actions!(
         Reconnect,
         CopyCommand,
         CopyOutput,
+        CopyLastCommand,
+        CopyLastOutput,
     ]
 );
 
@@ -186,7 +188,10 @@ impl TerminalView {
             cx.subscribe_in(&session, window, |view, _, event, window, cx| match event {
                 SessionEvent::Bell => view.ring_bell(window, cx),
                 SessionEvent::TitleChanged => cx.emit(TerminalViewEvent::TitleChanged),
-                SessionEvent::StatusChanged => cx.emit(TerminalViewEvent::StatusChanged),
+                SessionEvent::StatusChanged => {
+                    view.load_server_history(cx);
+                    cx.emit(TerminalViewEvent::StatusChanged);
+                }
                 SessionEvent::PhaseChanged => view.phase_changed(window, cx),
             }),
             cx.on_focus(&focus_handle, window, |view, window, cx| {
@@ -197,7 +202,8 @@ impl TerminalView {
                 cx.emit(TerminalViewEvent::Focused);
             }),
         ];
-        let prompt = session.read(cx).blocks.is_some().then(|| Prompt::new(window, cx));
+        let (has_blocks, local) = (session.read(cx).blocks.is_some(), session.read(cx).is_local());
+        let prompt = has_blocks.then(|| Prompt::new(local, window, cx));
         let mut view = Self {
             session,
             focus_handle,
@@ -897,8 +903,10 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
             .on_action(cx.listener(Self::reconnect))
-            .on_action(cx.listener(|view, _: &CopyCommand, _, cx| view.copy_block(false, cx)))
-            .on_action(cx.listener(|view, _: &CopyOutput, _, cx| view.copy_block(true, cx)))
+            .on_action(cx.listener(|view, _: &CopyCommand, _, cx| view.copy_block(view.menu_block, false, cx)))
+            .on_action(cx.listener(|view, _: &CopyOutput, _, cx| view.copy_block(view.menu_block, true, cx)))
+            .on_action(cx.listener(|view, _: &CopyLastCommand, _, cx| view.copy_block(None, false, cx)))
+            .on_action(cx.listener(|view, _: &CopyLastOutput, _, cx| view.copy_block(None, true, cx)))
             .on_action(cx.listener(|view, _: &ZoomIn, _, cx| view.zoom(1., cx)))
             .on_action(cx.listener(|view, _: &ZoomOut, _, cx| view.zoom(-1., cx)))
             .on_action(cx.listener(|view, _: &ZoomReset, _, cx| view.zoom(0., cx)))

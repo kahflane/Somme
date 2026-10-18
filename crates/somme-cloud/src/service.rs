@@ -5,10 +5,9 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
-use crate::domain::{Account, CloudError, Email, SessionView, SyncCredentials, check_password};
-use crate::passwords;
+use crate::domain::{Account, CloudError, GitHubConfig, GitHubSignIn, SessionView, SyncCredentials};
+use crate::github::GitHub;
 use crate::platform::Provisioner;
 use crate::store::AccountStore;
 
@@ -33,60 +32,50 @@ fn new_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, CloudError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| CloudError::Storage(e.to_string()))
-}
-
 pub struct AccountService {
     store: AccountStore,
     provisioner: Arc<dyn Provisioner>,
+    github: Arc<dyn GitHub>,
     token_ttl_days: u32,
 }
 
+/// The app listens on the loopback address, at a port of its choosing.
+fn is_loopback_callback(uri: &str) -> bool {
+    uri.strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.strip_suffix("/callback"))
+        .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port != 0))
+}
+
 impl AccountService {
-    pub fn new(store: AccountStore, provisioner: Arc<dyn Provisioner>, token_ttl_days: u32) -> Self {
+    pub fn new(
+        store: AccountStore,
+        provisioner: Arc<dyn Provisioner>,
+        github: Arc<dyn GitHub>,
+        token_ttl_days: u32,
+    ) -> Self {
         Self {
             store,
             provisioner,
+            github,
             token_ttl_days,
         }
     }
 
-    pub async fn register(&self, email: &str, password: &str) -> Result<SessionView, CloudError> {
-        let email = Email::parse(email)?;
-        check_password(password)?;
-        if self.store.find_by_email(&email).await?.is_some() {
-            return Err(CloudError::EmailTaken);
+    pub fn github_config(&self) -> GitHubConfig {
+        GitHubConfig {
+            client_id: self.github.client_id().to_owned(),
         }
-        let owned = password.to_owned();
-        let password_hash = blocking(move || passwords::hash(&owned)).await??;
-        let id = Uuid::now_v7();
-        let account = Account {
-            id,
-            email,
-            password_hash,
-            database_name: Account::database_name_for(id),
-            database_host: None,
-            created_at: now(),
-        };
-        self.store.insert_account(&account).await?;
-        self.open_session(&account).await
     }
 
-    pub async fn login(&self, email: &str, password: &str) -> Result<SessionView, CloudError> {
-        let email = Email::parse(email).map_err(|_| CloudError::BadCredentials)?;
-        let account = self.store.find_by_email(&email).await?;
-        let owned = password.to_owned();
-        let Some(account) = account else {
-            blocking(move || passwords::dummy_verify(&owned)).await?;
-            return Err(CloudError::BadCredentials);
-        };
-        let stored = account.password_hash.clone();
-        if !blocking(move || passwords::verify(&owned, &stored)).await? {
-            return Err(CloudError::BadCredentials);
+    pub async fn sign_in_with_github(&self, request: &GitHubSignIn) -> Result<SessionView, CloudError> {
+        if request.code.is_empty() || request.code_verifier.is_empty() || !is_loopback_callback(&request.redirect_uri) {
+            return Err(CloudError::Invalid("bad sign-in request".into()));
         }
+        let user = self
+            .github
+            .user(&request.code, &request.redirect_uri, &request.code_verifier)
+            .await?;
+        let account = self.store.sign_in(&user, now()).await?;
         self.open_session(&account).await
     }
 
@@ -140,7 +129,9 @@ impl AccountService {
             .await?;
         Ok(SessionView {
             token,
-            email: account.email.as_str().to_owned(),
+            login: account.login.clone(),
+            name: account.name.clone(),
+            avatar_url: account.avatar_url.clone(),
         })
     }
 }
@@ -152,6 +143,7 @@ pub mod tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::domain::GitHubUser;
 
     #[derive(Default)]
     pub struct FakeProvisioner {
@@ -170,42 +162,75 @@ pub mod tests {
         }
     }
 
+    pub struct FakeGitHub;
+
+    #[async_trait]
+    impl GitHub for FakeGitHub {
+        fn client_id(&self) -> &str {
+            "fake-client"
+        }
+
+        /// Code `user-N` signs in GitHub user N. Any other code is refused.
+        async fn user(&self, code: &str, _: &str, _: &str) -> Result<GitHubUser, CloudError> {
+            let id = code.strip_prefix("user-").and_then(|id| id.parse().ok()).ok_or(CloudError::BadCredentials)?;
+            Ok(GitHubUser {
+                id,
+                login: format!("user{id}"),
+                name: None,
+                avatar_url: Some(format!("https://avatars.githubusercontent.com/u/{id}")),
+            })
+        }
+    }
+
+    pub fn sign_in(code: &str) -> GitHubSignIn {
+        GitHubSignIn {
+            code: code.into(),
+            redirect_uri: "http://127.0.0.1:50123/callback".into(),
+            code_verifier: "verifier".into(),
+        }
+    }
+
     pub async fn service() -> (tempfile::TempDir, AccountService, Arc<FakeProvisioner>) {
         let dir = tempfile::tempdir().unwrap();
         let store = AccountStore::open(dir.path()).await.unwrap();
         let fake = Arc::new(FakeProvisioner::default());
-        (dir, AccountService::new(store, fake.clone(), 7), fake)
+        (dir, AccountService::new(store, fake.clone(), Arc::new(FakeGitHub), 7), fake)
     }
 
     #[tokio::test]
-    async fn register_login_credentials_logout() {
+    async fn sign_in_credentials_logout() {
         let (_dir, svc, fake) = service().await;
-        let session = svc.register("Dev@Example.com", "long enough pw").await.unwrap();
-        assert_eq!(session.email, "dev@example.com");
-        assert!(matches!(
-            svc.register("dev@example.com", "long enough pw").await,
-            Err(CloudError::EmailTaken)
-        ));
-        assert!(matches!(
-            svc.login("dev@example.com", "wrong password!").await,
-            Err(CloudError::BadCredentials)
-        ));
-        let again = svc.login("dev@example.com", "long enough pw").await.unwrap();
+        let session = svc.sign_in_with_github(&sign_in("user-7")).await.unwrap();
+        assert_eq!(session.login, "user7");
+        let again = svc.sign_in_with_github(&sign_in("user-7")).await.unwrap();
         let first = svc.credentials(&session.token).await.unwrap();
         let second = svc.credentials(&again.token).await.unwrap();
         assert_eq!(first.url, second.url);
         assert!(first.url.starts_with("libsql://somme-"));
         assert_eq!(fake.created.lock().unwrap().len(), 1);
+        let other = svc.sign_in_with_github(&sign_in("user-8")).await.unwrap();
+        assert_ne!(svc.credentials(&other.token).await.unwrap().url, first.url);
         svc.logout(&session.token).await.unwrap();
         assert!(matches!(svc.credentials(&session.token).await, Err(CloudError::Unauthorized)));
         assert!(svc.credentials(&again.token).await.is_ok());
     }
 
     #[tokio::test]
-    async fn rejects_weak_input() {
+    async fn rejects_bad_sign_ins() {
         let (_dir, svc, _) = service().await;
-        assert!(matches!(svc.register("x@y.z", "short").await, Err(CloudError::Invalid(_))));
-        assert!(matches!(svc.login("unknown@y.z", "whatever123").await, Err(CloudError::BadCredentials)));
+        assert!(matches!(svc.sign_in_with_github(&sign_in("stolen")).await, Err(CloudError::BadCredentials)));
+        let mut elsewhere = sign_in("user-1");
+        elsewhere.redirect_uri = "https://evil.example/callback".into();
+        assert!(matches!(svc.sign_in_with_github(&elsewhere).await, Err(CloudError::Invalid(_))));
         assert!(matches!(svc.credentials("bogus").await, Err(CloudError::Unauthorized)));
+    }
+
+    #[test]
+    fn only_loopback_callbacks_are_allowed() {
+        assert!(is_loopback_callback("http://127.0.0.1:8123/callback"));
+        assert!(!is_loopback_callback("http://127.0.0.1:0/callback"));
+        assert!(!is_loopback_callback("http://127.0.0.1.evil.example:80/callback"));
+        assert!(!is_loopback_callback("http://localhost:8123/callback"));
+        assert!(!is_loopback_callback("http://127.0.0.1:8123/callback/x"));
     }
 }

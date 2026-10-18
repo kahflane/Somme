@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use somme_cloud::config::Config;
+use somme_cloud::github::GitHubApp;
 use somme_cloud::http::router;
 use somme_cloud::platform::TursoPlatform;
 use somme_cloud::service::AccountService;
@@ -18,7 +19,13 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let store = AccountStore::open(&config.data_dir).await?;
     let platform = TursoPlatform::new(&config)?;
-    let service = Arc::new(AccountService::new(store, Arc::new(platform), config.token_ttl_days));
+    let github = GitHubApp::new(config.github_client_id.clone(), config.github_client_secret.clone())?;
+    let service = Arc::new(AccountService::new(
+        store,
+        Arc::new(platform),
+        Arc::new(github),
+        config.token_ttl_days,
+    ));
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
         .with_context(|| format!("cannot listen on {}", config.addr))?;

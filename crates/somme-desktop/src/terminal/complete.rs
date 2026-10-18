@@ -1,9 +1,11 @@
 //! Tab completion for the command editor: command names from the shell's PATH,
-//! and files and folders.
+//! and files and folders, wherever the shell runs.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+
+use crate::terminal::disk::Disk;
 
 /// Most choices kept, so a huge folder stays quick.
 const MAX_CHOICES: usize = 500;
@@ -64,17 +66,18 @@ pub fn finished(choice: &Choice) -> String {
     }
 }
 
-/// Completes the word before `cursor` (a byte offset into `line`).
-pub fn complete(line: &str, cursor: usize, cwd: &Path, path_var: Option<&str>) -> Option<Completion> {
+/// Completes the word before `cursor` (a byte offset into `line`). Reads
+/// `disk`, so it may block.
+pub fn complete(line: &str, cursor: usize, cwd: &Path, path_var: Option<&str>, disk: &Disk) -> Option<Completion> {
     let cursor = cursor.min(line.len());
     let start = word_start(line, cursor);
     let word = &line[start..cursor];
     let before = line[..start].trim_end();
     let command_spot = before.is_empty() || before.ends_with(['|', ';', '&', '(']);
     let choices = if command_spot && !word.contains('/') && !word.is_empty() {
-        commands(word, path_var)
+        commands(word, path_var, disk)
     } else {
-        paths(word, cwd)
+        paths(word, cwd, disk)
     };
     (!choices.is_empty()).then_some(Completion {
         range: start..cursor,
@@ -132,21 +135,22 @@ pub fn escape(text: &str) -> String {
     out
 }
 
-fn commands(prefix: &str, path_var: Option<&str>) -> Vec<Choice> {
+fn commands(prefix: &str, path_var: Option<&str>, disk: &Disk) -> Vec<Choice> {
     let mut names: BTreeSet<String> = BUILTINS
         .iter()
         .filter(|name| name.starts_with(prefix))
         .map(|name| (*name).to_owned())
         .collect();
-    let path_var = path_var.map(str::to_owned).or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else { continue };
-            if name.starts_with(prefix) && can_escape(&name) && !names.contains(&name) && is_executable(&entry.path()) {
-                names.insert(name);
-            }
-        }
+    // This app's own PATH only says something about this computer.
+    let path_var = path_var
+        .map(str::to_owned)
+        .or_else(|| disk.is_local().then(|| std::env::var("PATH").ok()).flatten())
+        .unwrap_or_default();
+    // PATH on a server is a list of server folders, so split it the server's way.
+    for dir in path_var.split(if disk.is_local() { PATH_SEPARATOR } else { ':' }).filter(|dir| !dir.is_empty()) {
+        let keep = |name: &str| name.starts_with(prefix) && can_escape(name) && !names.contains(name);
+        let Some(entries) = disk.list(Path::new(dir), usize::MAX, keep) else { continue };
+        names.extend(entries.into_iter().filter(|entry| entry.runnable).map(|entry| entry.name));
     }
     names
         .into_iter()
@@ -160,17 +164,11 @@ fn commands(prefix: &str, path_var: Option<&str>) -> Vec<Choice> {
 }
 
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
+const PATH_SEPARATOR: char = ':';
 #[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-}
+const PATH_SEPARATOR: char = ';';
 
-fn paths(word: &str, cwd: &Path) -> Vec<Choice> {
+fn paths(word: &str, cwd: &Path, disk: &Disk) -> Vec<Choice> {
     // Keep what the user typed for the folder part, and only replace the name.
     let (typed_dir, typed_name) = match word.rfind('/') {
         Some(slash) => word.split_at(slash + 1),
@@ -179,7 +177,8 @@ fn paths(word: &str, cwd: &Path) -> Vec<Choice> {
     let dir_text = unescape(typed_dir);
     let name = unescape(typed_name);
     let base: PathBuf = if let Some(rest) = dir_text.strip_prefix("~/") {
-        dirs::home_dir().unwrap_or_default().join(rest)
+        let Some(home) = disk.home() else { return Vec::new() };
+        home.join(rest)
     } else if dir_text == "~" || (dir_text.is_empty() && name == "~") {
         return vec![Choice {
             label: "~/".into(),
@@ -191,19 +190,9 @@ fn paths(word: &str, cwd: &Path) -> Vec<Choice> {
     } else {
         cwd.join(&dir_text)
     };
-    let Ok(entries) = std::fs::read_dir(&base) else { return Vec::new() };
-    let mut found: Vec<(String, bool)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let file = entry.file_name().into_string().ok()?;
-            if !file.starts_with(&name) || (file.starts_with('.') && !name.starts_with('.')) || !can_escape(&file) {
-                return None;
-            }
-            // Follows links, so a link to a folder counts as a folder.
-            let dir = entry.path().is_dir();
-            Some((file, dir))
-        })
-        .collect();
+    let keep = |file: &str| file.starts_with(&name) && (!file.starts_with('.') || name.starts_with('.')) && can_escape(file);
+    let Some(entries) = disk.list(&base, usize::MAX, keep) else { return Vec::new() };
+    let mut found: Vec<(String, bool)> = entries.into_iter().map(|entry| (entry.name, entry.dir)).collect();
     found.sort();
     found.truncate(MAX_CHOICES);
     found
@@ -236,7 +225,7 @@ mod tests {
     #[test]
     fn completes_a_folder_name() {
         let dir = folder();
-        let done = complete("cd s", 4, dir.path(), None).unwrap();
+        let done = complete("cd s", 4, dir.path(), None, &Disk::Local).unwrap();
         assert_eq!(done.range, 3..4);
         assert_eq!(done.common().as_deref(), Some("src/"));
     }
@@ -251,9 +240,9 @@ mod tests {
     #[test]
     fn escapes_spaces_and_keeps_the_typed_folder() {
         let dir = folder();
-        let done = complete("ls my", 5, dir.path(), None).unwrap();
+        let done = complete("ls my", 5, dir.path(), None, &Disk::Local).unwrap();
         assert_eq!(done.common().as_deref(), Some("my\\ docs/"));
-        let done = complete("cat src/m", 9, dir.path(), None).unwrap();
+        let done = complete("cat src/m", 9, dir.path(), None, &Disk::Local).unwrap();
         assert_eq!(done.choices.len(), 2);
         assert_eq!(done.common().as_deref(), Some("src/m"));
     }
@@ -261,9 +250,9 @@ mod tests {
     #[test]
     fn hides_dot_files_unless_asked() {
         let dir = folder();
-        let all = complete("ls ", 3, dir.path(), None).unwrap();
+        let all = complete("ls ", 3, dir.path(), None, &Disk::Local).unwrap();
         assert!(all.choices.iter().all(|c| !c.label.starts_with('.')));
-        let dots = complete("ls .h", 5, dir.path(), None).unwrap();
+        let dots = complete("ls .h", 5, dir.path(), None, &Disk::Local).unwrap();
         assert_eq!(dots.common().as_deref(), Some(".hidden "));
     }
 
@@ -280,7 +269,7 @@ mod tests {
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let path = bin.to_string_lossy().into_owned();
-        let done = complete("echo hi | sommet", 16, dir.path(), Some(&path)).unwrap();
+        let done = complete("echo hi | sommet", 16, dir.path(), Some(&path), &Disk::Local).unwrap();
         assert_eq!(done.common().as_deref(), Some("sommetool "));
     }
 

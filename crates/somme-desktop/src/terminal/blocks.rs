@@ -34,6 +34,9 @@ pub struct Block {
     pub skip: usize,
     /// Rows in use, kept for finished blocks.
     rows: usize,
+    /// Text the shell printed before its first prompt, like a server's
+    /// welcome message. It has no header or command.
+    pub startup: bool,
 }
 
 impl Block {
@@ -47,7 +50,18 @@ impl Block {
             term,
             skip: 0,
             rows: 0,
+            startup: false,
         }
+    }
+
+    /// A block for what the shell printed before its first prompt. None when
+    /// that was nothing.
+    pub fn startup(term: Term<Listener>, size: GridSize) -> Option<Self> {
+        // Accepted, so finishing it drops blank rows at the top as well.
+        let mut block = Self::new(String::new(), None, None, BlockState::Accepted, term);
+        block.startup = true;
+        block.finish(0, size);
+        (block.rows() > 0).then_some(block)
     }
 
     pub fn is_live(&self) -> bool {
@@ -166,9 +180,9 @@ pub fn clears_screen(command: &str) -> bool {
 }
 
 /// `~/Downloads/somme` instead of `/Users/me/Downloads/somme`.
-pub fn short_path(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir()
-        && let Ok(rest) = path.strip_prefix(&home)
+pub fn short_path(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home
+        && let Ok(rest) = path.strip_prefix(home)
     {
         return if rest.as_os_str().is_empty() {
             "~".to_owned()

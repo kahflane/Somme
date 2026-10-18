@@ -3,10 +3,18 @@ use zeroize::Zeroizing;
 
 use crate::ports::GatewayError;
 
+/// The GitHub user behind a Somme Cloud account.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CloudProfile {
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct CloudSession {
     pub token: Zeroizing<String>,
-    pub email: String,
+    pub profile: CloudProfile,
 }
 
 #[derive(Clone)]
@@ -34,10 +42,12 @@ impl From<CloudError> for GatewayError {
 
 #[async_trait]
 pub trait CloudAccounts: Send + Sync {
-    async fn register(&self, email: &str, password: &str) -> Result<CloudSession, CloudError>;
-    async fn login(&self, email: &str, password: &str) -> Result<CloudSession, CloudError>;
+    /// Opens GitHub in the browser and waits for the user to sign in there.
+    async fn sign_in_with_github(&self) -> Result<CloudSession, CloudError>;
     async fn logout(&self, session: &CloudSession) -> Result<(), CloudError>;
     async fn credentials(&self, session: &CloudSession) -> Result<SyncCredentials, CloudError>;
+    /// Downloads a profile picture.
+    async fn avatar(&self, url: &str) -> Result<Vec<u8>, CloudError>;
 }
 
 pub trait SessionStore: Send + Sync {

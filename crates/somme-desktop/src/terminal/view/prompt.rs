@@ -24,6 +24,7 @@ use crate::terminal::complete::{self, Completion, finished};
 use crate::terminal::element::PADDING;
 use crate::terminal::history::{self, Entry};
 use crate::terminal::log::now_secs;
+use crate::terminal::session::Status;
 use crate::ui::common::{Lucide, ago};
 
 actions!(terminal_prompt, [ClearLine, ClearBlocks, SendEof]);
@@ -59,8 +60,10 @@ struct Menu {
 
 pub(super) struct Prompt {
     pub editor: Entity<TextareaState>,
-    /// The user's zsh history file, oldest first.
+    /// The user's history file, oldest first. For an SSH shell, the one on the server.
     file_history: Vec<Entry>,
+    /// The history file was asked for.
+    history_asked: bool,
     /// Commands run from this editor, oldest first.
     ran: Vec<Entry>,
     browse: Option<Browse>,
@@ -74,7 +77,8 @@ pub(super) struct Prompt {
 }
 
 impl Prompt {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<TerminalView>) -> Self {
+    /// `local` loads this computer's history now. A server's waits for the shell.
+    pub(super) fn new(local: bool, window: &mut Window, cx: &mut Context<TerminalView>) -> Self {
         let editor = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -103,18 +107,21 @@ impl Prompt {
             }
             _ => {}
         });
-        cx.spawn(async move |this, cx| {
-            let loaded = cx.background_spawn(async { history::load_zsh_history() }).await;
-            let _ = this.update(cx, |view, _| {
-                if let Some(prompt) = view.prompt.as_mut() {
-                    prompt.file_history = loaded;
-                }
-            });
-        })
-        .detach();
+        if local {
+            cx.spawn(async move |this, cx| {
+                let loaded = cx.background_spawn(async { history::load_zsh_history() }).await;
+                let _ = this.update(cx, |view, _| {
+                    if let Some(prompt) = view.prompt.as_mut() {
+                        prompt.file_history = loaded;
+                    }
+                });
+            })
+            .detach();
+        }
         Self {
             editor,
             file_history: Vec::new(),
+            history_asked: local,
             ran: Vec::new(),
             browse: None,
             menu: None,
@@ -126,6 +133,29 @@ impl Prompt {
 }
 
 impl TerminalView {
+    /// Loads the server's history once an SSH shell is up.
+    pub(super) fn load_server_history(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        if session.status != Status::Connected {
+            return;
+        }
+        let disk = session.disk();
+        let Some(prompt) = self.prompt.as_mut() else { return };
+        if std::mem::replace(&mut prompt.history_asked, true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let Some(disk) = disk.await else { return };
+            let loaded = disk.run(history::load_server_history).await;
+            let _ = this.update(cx, |view, _| {
+                if let Some(prompt) = view.prompt.as_mut() {
+                    prompt.file_history = loaded;
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn prompt_focused(&self, window: &Window, cx: &App) -> bool {
         self.prompt
             .as_ref()
@@ -331,12 +361,32 @@ impl TerminalView {
             let editor = prompt.editor.read(cx);
             (editor.value().to_string(), editor.cursor())
         };
-        let (cwd, path_var) = {
-            let blocks = self.session.read(cx).blocks.as_ref();
-            (blocks.and_then(|b| b.cwd.clone()), blocks.and_then(|b| b.path.clone()))
-        };
-        let cwd = cwd.or_else(dirs::home_dir).unwrap_or_default();
-        let Some(found) = complete::complete(&line, cursor, &cwd, path_var.as_deref()) else { return };
+        let session = self.session.read(cx);
+        let blocks = session.blocks.as_ref();
+        let (cwd, path_var) = (blocks.and_then(|b| b.cwd.clone()), blocks.and_then(|b| b.path.clone()));
+        let disk = session.disk();
+        // Names are read off the UI thread: the folder may be on a server.
+        cx.spawn_in(window, async move |view, cx| {
+            let Some(disk) = disk.await else { return };
+            let typed = line.clone();
+            let cwd = cwd.or_else(|| disk.home()).unwrap_or_default();
+            let found = disk
+                .run(move |disk| complete::complete(&line, cursor, &cwd, path_var.as_deref(), disk))
+                .await;
+            let Some(found) = found else { return };
+            let _ = view.update_in(cx, |view, window, cx| {
+                // Typing went on while the names were read.
+                let Some(editor) = view.prompt.as_ref().map(|prompt| prompt.editor.read(cx)) else { return };
+                if editor.value().as_str() == typed && editor.cursor() == cursor {
+                    view.show_completion(found, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Fills in the only choice, or what all choices share, and lists the rest.
+    fn show_completion(&mut self, found: Completion, window: &mut Window, cx: &mut Context<Self>) {
         if let [only] = found.choices.as_slice() {
             let text = finished(only);
             self.replace_in_prompt(found.range, &text, window, cx);
@@ -426,7 +476,7 @@ impl TerminalView {
                     .cursor_pointer()
                     .when(open, |chip| chip.bg(foreground.opacity(0.14)).text_color(foreground))
                     .hover(|chip| chip.bg(foreground.opacity(0.12)).text_color(foreground))
-                    .child(short_path(cwd))
+                    .child(short_path(cwd, blocks.and_then(|b| b.home.as_deref())))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, _, window, cx| {

@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use somme_domain::{Id, new_id};
 
 use crate::error::{AppError, AppResult};
-use crate::ports::{ConnectContext, OutputSink, PtyGateway, ShellOptions, SshGateway, TermSize, Terminal};
+use crate::ports::{ConnectContext, OutputSink, PtyGateway, RemoteFs, ShellOptions, SshGateway, TermSize, Terminal};
 use crate::services::{ConnectionPlanner, SnippetService};
 
 type Sessions = Arc<DashMap<Id, Arc<dyn Terminal>>>;
@@ -54,14 +54,15 @@ impl SessionService {
         }
     }
 
-    pub async fn open_ssh<F>(&self, host_id: Id, size: TermSize, make_sink: F) -> AppResult<Id>
+    /// Opens a shell on a host. `marks` is the secret for Somme's shell hooks.
+    pub async fn open_ssh<F>(&self, host_id: Id, size: TermSize, marks: Option<&str>, make_sink: F) -> AppResult<Id>
     where
         F: FnOnce(Id) -> Arc<dyn OutputSink>,
     {
         let (host, plan) = self.planner.plan(host_id).await?;
         let id = new_id();
         let sink = self.track(id, make_sink(id));
-        let terminal = self.ssh.shell(plan, self.ctx.clone(), size, sink).await?;
+        let terminal = self.ssh.shell(plan, self.ctx.clone(), size, marks, sink).await?;
         self.sessions.insert(id, Arc::clone(&terminal));
         if let Some(snippet_id) = host.startup_snippet_id
             && let Some(snippet) = self.snippets.get(snippet_id).await? {
@@ -84,6 +85,17 @@ impl SessionService {
     /// The folder a local shell is in now.
     pub fn cwd(&self, id: Id) -> Option<PathBuf> {
         self.sessions.get(&id)?.cwd()
+    }
+
+    /// Whether the session's shell loads Somme's hooks, so marks will come.
+    pub fn has_hooks(&self, id: Id) -> bool {
+        self.sessions.get(&id).is_some_and(|terminal| terminal.has_hooks())
+    }
+
+    /// Files on the server an SSH session runs on.
+    pub async fn files(&self, id: Id) -> Option<Arc<dyn RemoteFs>> {
+        let terminal = self.get(id).ok()?;
+        terminal.files().await
     }
 
     pub async fn write(&self, id: Id, data: &[u8]) -> AppResult<()> {

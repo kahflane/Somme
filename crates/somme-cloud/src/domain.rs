@@ -1,50 +1,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const MIN_PASSWORD_LEN: usize = 10;
-pub const MAX_PASSWORD_LEN: usize = 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Email(String);
-
-impl Email {
-    pub fn parse(raw: &str) -> Result<Self, CloudError> {
-        let email = raw.trim().to_lowercase();
-        let valid = email.len() <= 254
-            && email.split_once('@').is_some_and(|(local, domain)| {
-                !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
-            })
-            && !email.chars().any(char::is_whitespace);
-        if valid {
-            Ok(Self(email))
-        } else {
-            Err(CloudError::Invalid("enter a valid email address".into()))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-pub fn check_password(password: &str) -> Result<(), CloudError> {
-    let len = password.chars().count();
-    if len < MIN_PASSWORD_LEN {
-        return Err(CloudError::Invalid(format!(
-            "password must have at least {MIN_PASSWORD_LEN} characters"
-        )));
-    }
-    if len > MAX_PASSWORD_LEN {
-        return Err(CloudError::Invalid("password is too long".into()));
-    }
-    Ok(())
-}
-
+/// A Somme Cloud account. Each one is a GitHub user with their own Turso database.
 #[derive(Debug, Clone)]
 pub struct Account {
     pub id: Uuid,
-    pub email: Email,
-    pub password_hash: String,
+    pub github_id: i64,
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
     pub database_name: String,
     pub database_host: Option<String>,
     pub created_at: i64,
@@ -56,11 +20,22 @@ impl Account {
     }
 }
 
+/// The GitHub user who just signed in.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GitHubUser {
+    pub id: i64,
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionView {
     pub token: String,
-    pub email: String,
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,19 +46,26 @@ pub struct SyncCredentials {
     pub expires_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubConfig {
+    pub client_id: String,
+}
+
+/// What the app gets back from GitHub after the user signs in in the browser.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AuthRequest {
-    pub email: String,
-    pub password: String,
+#[serde(rename_all = "camelCase")]
+pub struct GitHubSignIn {
+    pub code: String,
+    pub redirect_uri: String,
+    pub code_verifier: String,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
     #[error("{0}")]
     Invalid(String),
-    #[error("an account with this email already exists")]
-    EmailTaken,
-    #[error("wrong email or password")]
+    #[error("GitHub sign-in failed, try again")]
     BadCredentials,
     #[error("session expired, sign in again")]
     Unauthorized,
@@ -91,19 +73,13 @@ pub enum CloudError {
     Storage(String),
     #[error("database provisioning failed: {0}")]
     Provisioning(String),
+    #[error("GitHub error: {0}")]
+    GitHub(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn email_is_normalised_and_checked() {
-        assert_eq!(Email::parse(" Me@Example.COM ").unwrap().as_str(), "me@example.com");
-        assert!(Email::parse("nope").is_err());
-        assert!(Email::parse("a@b").is_err());
-        assert!(Email::parse("a b@c.d").is_err());
-    }
 
     #[test]
     fn database_names_are_valid_turso_names() {

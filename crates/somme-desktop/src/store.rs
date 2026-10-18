@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
-use gpui_kit::{App, AppContext as _, Context, Entity, EventEmitter, Global};
+use gpui_kit::{App, AppContext as _, Context, Entity, EventEmitter, Global, Image, ImageFormat};
 use somme_application::AppResult;
 use somme_application::dto::{
     AccountStatus, GroupView, HostView, IdentityView, KeyView, KnownHostView, PortForwardView, SnippetView,
@@ -27,6 +27,10 @@ pub struct Store {
     pub known_hosts: Vec<KnownHostView>,
     pub sync: SyncStatusView,
     pub account: AccountStatus,
+    /// The signed-in user's GitHub picture, once downloaded.
+    pub avatar: Option<Arc<Image>>,
+    /// A GitHub sign-in is waiting on the browser.
+    pub signing_in: bool,
     pub load_error: Option<String>,
     refresh_generation: usize,
 }
@@ -81,10 +85,13 @@ impl Store {
                 known_hosts: Vec::new(),
                 sync,
                 account,
+                avatar: None,
+                signing_in: false,
                 load_error: None,
                 refresh_generation: 0,
             };
             store.check_vault(cx);
+            store.load_avatar(cx);
             store
         });
         cx.set_global(GlobalStore(store.clone()));
@@ -179,8 +186,33 @@ impl Store {
     /// Re-reads the signed-in account. This touches the system keychain, so it
     /// only runs at start and after signing in or out.
     pub fn refresh_account(&mut self, cx: &mut Context<Self>) {
-        self.account = self.services.sync.account();
+        let account = self.services.sync.account();
+        let new_picture = account.avatar_url != self.account.avatar_url;
+        self.account = account;
+        if new_picture {
+            self.avatar = None;
+            self.load_avatar(cx);
+        }
         cx.notify();
+    }
+
+    fn load_avatar(&mut self, cx: &mut Context<Self>) {
+        if self.account.avatar_url.is_none() {
+            return;
+        }
+        let sync = self.services.sync.clone();
+        cx.spawn(async move |this, cx| match runtime::io(async move { sync.avatar().await }).await {
+            Ok(Some(bytes)) => {
+                let avatar = image_format(&bytes).map(|format| Arc::new(Image::from_bytes(format, bytes)));
+                let _ = this.update(cx, |store, cx| {
+                    store.avatar = avatar;
+                    cx.notify();
+                });
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(%err, "could not load the GitHub picture"),
+        })
+        .detach();
     }
 
     pub fn lock(&mut self, cx: &mut Context<Self>) {
@@ -220,6 +252,16 @@ impl Store {
         tags.sort_by_key(|t| t.to_lowercase());
         tags.dedup();
         tags
+    }
+}
+
+fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some(ImageFormat::Png),
+        [0xFF, 0xD8, 0xFF, ..] => Some(ImageFormat::Jpeg),
+        [b'G', b'I', b'F', b'8', ..] => Some(ImageFormat::Gif),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some(ImageFormat::Webp),
+        _ => None,
     }
 }
 

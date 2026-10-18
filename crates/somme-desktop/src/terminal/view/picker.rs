@@ -17,6 +17,7 @@ use crate::settings::Settings;
 use crate::terminal::blocks::{self, Branch, BranchState};
 use crate::terminal::colors::{self, to_hsla};
 use crate::terminal::complete;
+use crate::terminal::disk::Disk;
 use crate::ui::common::Lucide;
 
 /// Rows shown at once.
@@ -141,7 +142,9 @@ impl TerminalView {
             self.close_picker(window, cx);
             return;
         }
-        let Some(dir) = self.session.read(cx).blocks.as_ref().and_then(|b| b.cwd.clone()) else { return };
+        let session = self.session.read(cx);
+        let Some(dir) = session.blocks.as_ref().and_then(|b| b.cwd.clone()) else { return };
+        let disk = session.disk();
         let placeholder = match kind {
             PickerKind::Folders => "Search directories…",
             PickerKind::Branches => "Search or create a branch…",
@@ -149,15 +152,14 @@ impl TerminalView {
         let (search, subscription) = self.picker_input(placeholder, None, window, cx);
         let read_dir = dir.clone();
         cx.spawn(async move |this, cx| {
-            let (entries, git) = cx
-                .background_spawn(async move {
-                    match kind {
-                        PickerKind::Folders => (read_folder(&read_dir), BranchState::default()),
-                        PickerKind::Branches => {
-                            let mut git = blocks::git_branch_state(&read_dir);
-                            let branches = std::mem::take(&mut git.branches);
-                            (branches.into_iter().map(PickEntry::Branch).collect(), git)
-                        }
+            let Some(disk) = disk.await else { return };
+            let (entries, git) = disk
+                .run(move |disk| match kind {
+                    PickerKind::Folders => (read_folder(&read_dir, disk), BranchState::default()),
+                    PickerKind::Branches => {
+                        let mut git = blocks::git_branch_state(&read_dir);
+                        let branches = std::mem::take(&mut git.branches);
+                        (branches.into_iter().map(PickEntry::Branch).collect(), git)
                     }
                 })
                 .await;
@@ -484,15 +486,9 @@ pub(super) fn cd_target(name: &str) -> String {
 }
 
 /// Folders first, then files. Hidden ones come after the rest in each group.
-fn read_folder(dir: &Path) -> Vec<PickEntry> {
-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut entries: Vec<(bool, String)> = read
-        .filter_map(Result::ok)
-        .filter(|entry| complete::can_escape(&entry.file_name().to_string_lossy()))
-        .take(MAX_ENTRIES)
-        // Follows links, so a link to a folder counts as a folder.
-        .map(|entry| (entry.path().is_dir(), entry.file_name().to_string_lossy().into_owned()))
-        .collect();
+fn read_folder(dir: &Path, disk: &Disk) -> Vec<PickEntry> {
+    let Some(read) = disk.list(dir, MAX_ENTRIES, complete::can_escape) else { return Vec::new() };
+    let mut entries: Vec<(bool, String)> = read.into_iter().map(|entry| (entry.dir, entry.name)).collect();
     entries.sort_by_cached_key(|(dir, name)| (!dir, name.starts_with('.'), name.to_lowercase()));
     entries
         .into_iter()
@@ -535,7 +531,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "").unwrap();
         std::fs::write(dir.join(".env"), "").unwrap();
         std::fs::create_dir_all(dir.join("x\nevil")).unwrap();
-        let names: Vec<_> = read_folder(&dir).iter().map(|e| e.name().to_owned()).collect();
+        let names: Vec<_> = read_folder(&dir, &Disk::Local).iter().map(|e| e.name().to_owned()).collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(names, ["b-dir", ".hidden-dir", "a.txt", ".env"]);
     }
