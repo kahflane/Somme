@@ -240,10 +240,13 @@ fn git_command(dir: &Path) -> Option<Command> {
     let mut command = Command::new(git_program()?);
     // A repo's own config can name programs for git to run. Turn off the ones
     // these lookups could reach, so opening a folder never runs its code.
+    // Checking signatures runs the gpg programs; Somme never signs anything.
     command
         .arg("-C")
         .arg(dir)
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "log.showSignature=false", "-c", "gpg.program=false"])
+        .args(["-c", "gpg.ssh.program=false", "-c", "gpg.x509.program=false"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .stdin(std::process::Stdio::null());

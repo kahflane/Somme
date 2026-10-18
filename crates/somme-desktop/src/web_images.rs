@@ -3,7 +3,7 @@
 //! internet are fetched, never this computer or the local network, and only
 //! so much of each.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +31,8 @@ impl WebImages {
             .user_agent(AGENT)
             .timeout(TIMEOUT)
             .dns_resolver(Arc::new(PublicOnly))
+            // A proxy would look the name up itself, past `PublicOnly`.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= REDIRECTS {
                     attempt.error("too many redirects")
@@ -63,24 +65,46 @@ fn allowed(url: &reqwest::Url) -> bool {
 fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            let [a, b, ..] = ip.octets();
+            let [a, b, c, _] = ip.octets();
             // 100.64.0.0/10 is shared by carriers, like a local network.
             let shared = a == 100 && (b & 0xc0) == 64;
+            // 0.0.0.0/8 can mean this computer, 192.0.0.0/24 is for protocols,
+            // 198.18.0.0/15 for test networks, and 240.0.0.0/4 is not given out.
+            let reserved = a == 0 || (a, b, c) == (192, 0, 0) || (a == 198 && (b & 0xfe) == 18) || a >= 240;
             !(ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
+                || ip.is_multicast()
                 || ip.is_documentation()
-                || shared)
+                || shared
+                || reserved)
         }
         IpAddr::V6(ip) => {
-            if let Some(v4) = ip.to_ipv4_mapped() {
-                return public(IpAddr::V4(v4));
+            let parts = ip.segments();
+            let v4 = |high: u16, low: u16| {
+                let [a, b] = high.to_be_bytes();
+                let [c, d] = low.to_be_bytes();
+                IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+            };
+            match parts {
+                // These carry an IPv4 address and lead where it does: mapped,
+                // the old compatible form (with :: and ::1), NAT64, and 6to4.
+                [0, 0, 0, 0, 0, 0xffff, high, low]
+                | [0, 0, 0, 0, 0, 0, high, low]
+                | [0x64, 0xff9b, 0, 0, 0, 0, high, low]
+                | [0x2002, high, low, ..] => public(v4(high, low)),
+                // fc00::/7 is local to a site and fe80::/10 to a link. 2001::/32
+                // (Teredo) and 64:ff9b:1::/48 hide where they lead, and
+                // 2001:db8::/32 is for examples.
+                [first, second, third, ..] => {
+                    !(ip.is_multicast()
+                        || (first & 0xfe00) == 0xfc00
+                        || (first & 0xffc0) == 0xfe80
+                        || (first, second) == (0x2001, 0)
+                        || (first, second) == (0x2001, 0xdb8)
+                        || (first, second, third) == (0x64, 0xff9b, 1))
+                }
             }
-            let first = ip.segments()[0];
-            // fc00::/7 is local to a site, fe80::/10 to a link.
-            !(ip.is_loopback() || ip.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
         }
     }
 }
@@ -254,6 +278,8 @@ mod tests {
         let ok = |url: &str| allowed(&reqwest::Url::parse(url).unwrap());
         assert!(ok("https://img.shields.io/badge/x.svg"));
         assert!(ok("https://8.8.8.8/a.png"));
+        assert!(ok("https://[2606:4700:4700::1111]/a.png"));
+        assert!(ok("https://[64:ff9b::808:808]/a.png"), "NAT64 to a public address");
         for url in [
             "http://img.shields.io/a.svg",
             "file:///etc/hosts",
@@ -267,6 +293,17 @@ mod tests {
             "https://[::1]/a.png",
             "https://[fd00::1]/a.png",
             "https://[::ffff:192.168.1.1]/a.png",
+            "https://0.0.0.0/a.png",
+            "https://0.1.2.3/a.png",
+            "https://198.18.0.1/a.png",
+            "https://224.0.0.1/a.png",
+            "https://250.1.1.1/a.png",
+            "https://[::]/a.png",
+            "https://[::7f00:1]/a.png",
+            "https://[64:ff9b::a00:1]/a.png",
+            "https://[2002:c0a8:101::1]/a.png",
+            "https://[2001:0:4136:e378::1]/a.png",
+            "https://[ff02::1]/a.png",
         ] {
             assert!(!ok(url), "{url}");
         }
