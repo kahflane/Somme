@@ -22,4 +22,5 @@ pub mod snippets;
 pub mod terminal_tab;
 pub mod theme_picker;
 pub mod themes;
+pub mod update;
 pub mod workspace;

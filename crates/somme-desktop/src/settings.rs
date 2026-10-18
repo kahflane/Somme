@@ -79,6 +79,10 @@ pub struct Settings {
     pub agent_access: bool,
     /// Keeps a background service taking agents while the app is closed.
     pub agent_service: bool,
+    /// Asks GitHub for a new version of Somme every few hours.
+    pub check_updates: bool,
+    /// The version put off with Later. Only a newer one shows again.
+    pub update_later: Option<String>,
 }
 
 impl Default for Settings {
@@ -113,6 +117,8 @@ impl Default for Settings {
             line_blame: true,
             agent_access: false,
             agent_service: false,
+            check_updates: true,
+            update_later: None,
         }
     }
 }

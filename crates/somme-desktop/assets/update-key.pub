@@ -1,0 +1,5 @@
+# The public key Somme checks updates with, built into the app.
+# Make one with `cargo run -p somme-desktop -- --update-keygen ~/somme-update.key`
+# and put the line it prints below. Keep the private key out of the repo.
+# With no key here, Somme still says when an update is out, but only offers
+# its release page.
