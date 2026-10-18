@@ -87,8 +87,13 @@ async fn accept(listener: Listener, shared: Shared) {
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok(Some(stream)) => {
-                    connections.spawn(connection(stream, shared.clone()));
+                Ok(Some(incoming)) => {
+                    let shared = shared.clone();
+                    connections.spawn(async move {
+                        if let Some(stream) = incoming.admit().await {
+                            connection(stream, shared).await;
+                        }
+                    });
                 }
                 Ok(None) => {}
                 Err(err) => {
