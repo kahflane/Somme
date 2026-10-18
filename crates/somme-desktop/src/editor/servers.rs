@@ -1,7 +1,8 @@
 //! Language servers Somme installs by itself, for people who don't have them.
 //! Many are written for Node.js, so Somme gets Node first, then the servers
 //! from npm, all in `servers` under its data folder. Node is checked against
-//! its known hash, and each npm package is pinned to one version.
+//! its known hash, and npm checks every package against a lockfile that ships
+//! with Somme, so nothing newer or changed gets in.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -99,8 +100,10 @@ pub struct Package {
     pub id: &'static str,
     /// What it helps with, like "JSON, HTML and CSS".
     pub label: &'static str,
-    /// What npm installs, each at a fixed version.
-    npm: &'static [&'static str],
+    /// The `package.json` npm installs from, and its lockfile, with the
+    /// version and hash of every package down the tree.
+    manifest: &'static str,
+    lock: &'static str,
     /// The command that installs it by hand.
     pub hint: &'static str,
 }
@@ -108,31 +111,36 @@ pub struct Package {
 pub const LANGSERVERS: Package = Package {
     id: "vscode-langservers",
     label: "JSON, HTML and CSS",
-    npm: &["vscode-langservers-extracted@4.10.0"],
+    manifest: include_str!("../../assets/servers/vscode-langservers/package.json"),
+    lock: include_str!("../../assets/servers/vscode-langservers/package-lock.json"),
     hint: "npm i -g vscode-langservers-extracted",
 };
 const TYPESCRIPT: Package = Package {
     id: "typescript",
     label: "JavaScript and TypeScript",
-    npm: &["typescript-language-server@6.0.2", "typescript@6.0.3"],
+    manifest: include_str!("../../assets/servers/typescript/package.json"),
+    lock: include_str!("../../assets/servers/typescript/package-lock.json"),
     hint: "npm i -g typescript typescript-language-server",
 };
 const YAML: Package = Package {
     id: "yaml",
     label: "YAML",
-    npm: &["yaml-language-server@2.0.0"],
+    manifest: include_str!("../../assets/servers/yaml/package.json"),
+    lock: include_str!("../../assets/servers/yaml/package-lock.json"),
     hint: "npm i -g yaml-language-server",
 };
 const PYRIGHT: Package = Package {
     id: "pyright",
     label: "Python",
-    npm: &["pyright@1.1.414"],
+    manifest: include_str!("../../assets/servers/pyright/package.json"),
+    lock: include_str!("../../assets/servers/pyright/package-lock.json"),
     hint: "npm i -g pyright",
 };
 const BASH: Package = Package {
     id: "bash",
     label: "shell scripts",
-    npm: &["bash-language-server@5.8.1"],
+    manifest: include_str!("../../assets/servers/bash/package.json"),
+    lock: include_str!("../../assets/servers/bash/package-lock.json"),
     hint: "npm i -g bash-language-server",
 };
 
@@ -289,24 +297,31 @@ fn unpack(archive: &Path, dir: &Path, folder: &str) -> Result<(), String> {
     result
 }
 
-/// Runs npm from Somme's Node to put `package` in `target`. Install scripts
-/// are turned off: none of these servers needs one, and they would run code
-/// from every package down the tree.
+/// Runs npm from Somme's Node to put `package` in `target`. `npm ci` takes
+/// exactly what the lockfile lists, and checks each download's hash. Install
+/// scripts are turned off: none of these servers needs one, and they would
+/// run code from every package down the tree.
 fn npm_install(dir: &Path, node_dir: &Path, package: &Package, target: &Path) -> Result<(), String> {
     let partial = target.with_extension("part");
     let _ = std::fs::remove_dir_all(&partial);
     std::fs::create_dir_all(&partial).map_err(|err| format!("Could not make the servers folder: {err}"))?;
+    std::fs::write(partial.join("package.json"), package.manifest)
+        .and_then(|()| std::fs::write(partial.join("package-lock.json"), package.lock))
+        .map_err(|err| format!("Could not make the servers folder: {err}"))?;
+    // npm ci calls the lockfile out of date when the folder's path goes
+    // through a link, like /var on macOS. Windows's full paths start with
+    // `\\?\`, which Node handles badly, and links there are rare.
+    let prefix = if cfg!(unix) { std::fs::canonicalize(&partial).unwrap_or_else(|_| partial.clone()) } else { partial.clone() };
     let path = std::env::join_paths(
         std::iter::once(node_bin(node_dir)).chain(std::env::var_os("PATH").iter().flat_map(std::env::split_paths)),
     )
     .map_err(|err| err.to_string())?;
     let output = Command::new(node_program(node_dir))
         .arg(npm_cli(node_dir))
-        .arg("install")
+        .arg("ci")
         .arg("--prefix")
-        .arg(&partial)
-        .args(["--no-audit", "--no-fund", "--ignore-scripts", "--omit=dev", "--no-package-lock", "--loglevel=error"])
-        .args(package.npm)
+        .arg(&prefix)
+        .args(["--no-audit", "--no-fund", "--ignore-scripts", "--omit=dev", "--loglevel=error"])
         .env("PATH", path)
         .env("npm_config_cache", dir.join("npm-cache"))
         .env("npm_config_update_notifier", "false")
@@ -321,10 +336,16 @@ fn npm_install(dir: &Path, node_dir: &Path, package: &Package, target: &Path) ->
     std::fs::rename(&partial, target).map_err(|err| format!("Could not save the servers: {err}"))
 }
 
+/// The line in npm's output that says what went wrong: its first error,
+/// past the error code. npm ends with where its log is, which says nothing.
 fn last_line(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let line = text.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or("it stopped with an error");
-    line.trim_start_matches("npm error").trim().to_owned()
+    let line = text
+        .lines()
+        .map(|line| line.trim().trim_start_matches("npm error").trim())
+        .find(|line| !line.is_empty() && !line.starts_with("code ") && !line.starts_with("A complete log of this run"))
+        .unwrap_or("it stopped with an error");
+    line.to_owned()
 }
 
 /// What an install is doing, for the status bar.
@@ -461,10 +482,22 @@ mod tests {
         assert_eq!(hint("vscode-json-language-server"), Some("npm i -g vscode-langservers-extracted"));
         assert_eq!(hint("gopls"), Some("go install golang.org/x/tools/gopls@latest"));
         assert_eq!(hint("jdtls"), None);
-        // Every package is pinned to a version.
+        // Every package is pinned to one version, and every package it
+        // brings is locked with a hash, from npm's own registry.
         for program in ["vscode-json-language-server", "typescript-language-server", "yaml-language-server", "pyright-langserver", "bash-language-server"] {
-            let (package, _) = script_for(program).unwrap();
-            assert!(package.npm.iter().all(|name| name[1..].contains('@')), "{program}");
+            let (package, script) = script_for(program).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(package.manifest).unwrap();
+            let lock: serde_json::Value = serde_json::from_str(package.lock).unwrap();
+            let wanted = manifest["dependencies"].as_object().unwrap();
+            assert!(wanted.contains_key(script.split('/').next().unwrap()), "{program}");
+            for (name, version) in wanted {
+                assert!(version.as_str().unwrap().chars().all(|c| c.is_ascii_digit() || c == '.'), "{name} {version}");
+                assert_eq!(lock["packages"][format!("node_modules/{name}")]["version"], *version, "{name}");
+            }
+            for (path, entry) in lock["packages"].as_object().unwrap().iter().filter(|(path, _)| !path.is_empty()) {
+                assert!(entry["integrity"].as_str().is_some_and(|hash| hash.starts_with("sha512-")), "{path}");
+                assert!(entry["resolved"].as_str().unwrap().starts_with("https://registry.npmjs.org/"), "{path}");
+            }
         }
     }
 
