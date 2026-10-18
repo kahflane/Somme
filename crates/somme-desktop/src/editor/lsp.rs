@@ -207,6 +207,7 @@ impl Client {
                         },
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "definition": { "linkSupport": true },
+                        "formatting": {},
                         "publishDiagnostics": {}
                     },
                     "workspace": { "workspaceFolders": true, "configuration": true }
@@ -353,6 +354,19 @@ impl Client {
     pub fn saved(&self, uri: &str, text: &Rope) {
         self.sync(uri, text);
         self.notify("textDocument/didSave", json!({ "textDocument": { "uri": uri } }));
+    }
+
+    /// Asks the server how to tidy the whole file.
+    pub fn format(&self, uri: &str, text: &Rope) -> impl Future<Output = Result<Vec<lsp_types::TextEdit>>> + use<> {
+        self.sync(uri, text);
+        let answer = self.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": 4, "insertSpaces": true, "trimTrailingWhitespace": true }
+            }),
+        );
+        async move { Ok(serde_json::from_value::<Option<Vec<lsp_types::TextEdit>>>(answer.await?)?.unwrap_or_default()) }
     }
 
     pub fn close(&self, uri: &str) {

@@ -15,6 +15,7 @@ use gpui_kit::{
 use somme_application::dto::{GroupInput, GroupView, HostView};
 use somme_domain::Id;
 
+use crate::host_os;
 use crate::store::{Store, mutate};
 use crate::ui::common::{
     Lucide, card, confirm_delete, empty_state, host_badge, notify_error, notify_ok, page_header, subtle,
@@ -447,7 +448,7 @@ impl HostsPage {
             .gap_3()
             .cursor_pointer()
             .hover(|el| el.bg(theme.muted))
-            .child(host_badge(host.color.as_deref(), Icon::new(Lucide::Server), cx))
+            .child(host_os::badge(&host, cx))
             .child(
                 v_flex()
                     .flex_1()

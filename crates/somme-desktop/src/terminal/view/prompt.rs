@@ -13,7 +13,7 @@ use gpui_kit::component::input::{
 use gpui_kit::component::{Icon, Size, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement,
-    Focusable as _, KeyBinding, MouseButton, ParentElement as _, Styled as _, Subscription, Task, Window,
+    Focusable as _, KeyBinding, MouseButton, MouseDownEvent, ParentElement as _, Styled as _, Subscription, Task, Window,
     actions, div, prelude::FluentBuilder as _, px, rems, transparent_black,
 };
 
@@ -97,11 +97,20 @@ impl Prompt {
             InputEvent::PressEnter { secondary: false, shift: false } => view.prompt_enter(window, cx),
             InputEvent::Change => {
                 let value = editor.read(cx).value().to_string();
+                let cursor = editor.read(cx).cursor();
                 if let Some(prompt) = view.prompt.as_mut()
                     && prompt.expected.take().as_deref() != Some(value.as_str())
                 {
                     prompt.browse = None;
-                    prompt.menu = None;
+                    // While the same folder is typed, the list stays up until the
+                    // next lookup replaces it, so it does not blink on every key.
+                    match (complete::folder_word_start(&value, cursor), prompt.menu.as_mut()) {
+                        (Some(start), Some(menu)) if menu.completion.range.start == start => {
+                            menu.completion.range.end = cursor;
+                            menu.selected = None;
+                        }
+                        _ => prompt.menu = None,
+                    }
                 }
                 view.update_ghost(cx);
                 view.suggest_folders(window, cx);
@@ -732,6 +741,18 @@ impl TerminalView {
                 div()
                     .relative()
                     .w_full()
+                    .when(settings.paste_on_right_click, |line| {
+                        // Before the editor sees it, so its own menu stays shut.
+                        line.capture_any_mouse_down(cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                            if event.button != MouseButton::Right {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                                view.paste_text(&text, cx);
+                            }
+                        }))
+                    })
                     .child(
                         Textarea::new(&prompt.editor)
                             .appearance(false)
@@ -768,8 +789,28 @@ impl TerminalView {
             }
         };
 
+        // The lists float over the blocks, so opening or filling them moves nothing.
+        let background = to_hsla(theme.background);
+        let popups: Vec<AnyElement> = self
+            .render_picker(cx)
+            .into_iter()
+            .chain(history.map(IntoElement::into_any_element))
+            .chain(menu.map(IntoElement::into_any_element))
+            .collect();
+        let overlay = (!popups.is_empty()).then(|| {
+            v_flex()
+                .absolute()
+                .left(PADDING)
+                .right(PADDING)
+                .bottom_full()
+                .pb_1p5()
+                .gap_1p5()
+                .children(popups.into_iter().map(|popup| div().rounded_md().bg(background).shadow_md().child(popup)))
+        });
+
         v_flex()
             .key_context(KEY_CONTEXT)
+            .relative()
             .w_full()
             .flex_none()
             .gap_1p5()
@@ -845,9 +886,7 @@ impl TerminalView {
             .on_action(cx.listener(|view, _: &super::ZoomIn, _, cx| view.zoom(1., cx)))
             .on_action(cx.listener(|view, _: &super::ZoomOut, _, cx| view.zoom(-1., cx)))
             .on_action(cx.listener(|view, _: &super::ZoomReset, _, cx| view.zoom(0., cx)))
-            .children(self.render_picker(cx))
-            .children(history)
-            .children(menu)
+            .children(overlay)
             .child(chips)
             .child(line)
             .into_any_element()

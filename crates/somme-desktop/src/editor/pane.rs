@@ -3,13 +3,16 @@
 //! shell runs on.
 
 use std::io::{BufReader, BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::highlighter::LanguageRegistry;
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position, Rope};
+use gpui_kit::component::input::{
+    Copy, Cut, Editor, EditorState, GoToDefinition, InputEvent, Paste, Position, Rope, RopeExt as _, SelectAll,
+};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
@@ -22,6 +25,7 @@ use crate::editor::language::{self, Language};
 use crate::editor::lsp::{self, Client, DocProvider, Status};
 use crate::settings::Settings;
 use crate::editor::sudo;
+use crate::editor::tools::{self, Tool};
 use crate::terminal::disk::{Disk, DiskError};
 use crate::ui::common::Lucide;
 use crate::ui::native;
@@ -35,8 +39,11 @@ const LSP_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// plain editor made for big files. The code editor slows down on them.
 const BIG_BYTES: u64 = 8 * 1024 * 1024;
 const BIG_LINES: usize = 100_000;
-/// Any size at all, for reads that take a limit.
-const ANY_SIZE: u64 = 1 << 40;
+/// Room for a file to grow while it is read. It is also all that is read of
+/// a file that reports no size, like a device on a server, which may never end.
+const GROWTH: u64 = 16 * 1024 * 1024;
+/// The most read with sudo when even the file's size is hidden from the user.
+const HIDDEN_SIZE_LIMIT: u64 = 512 * 1024 * 1024;
 
 pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
@@ -125,6 +132,43 @@ impl Body {
         match self {
             Self::Code(editor) => editor.update(cx, |editor, cx| editor.focus(window, cx)),
             Self::Big(editor) => window.focus(&editor.focus_handle(cx), cx),
+        }
+    }
+
+    /// What is selected, empty at the cursor when nothing is.
+    fn selection(&self, cx: &App) -> Range<usize> {
+        match self {
+            Self::Code(editor) => editor.read(cx).selected_range(),
+            Self::Big(editor) => editor.read(cx).selected_range(),
+        }
+    }
+
+    /// Puts `new` in place of `range`, as one change to undo. New text in a
+    /// selection stays selected; a whole new file keeps the cursor's place.
+    fn replace(&self, range: Range<usize>, new: &str, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Code(editor) => editor.update(cx, |editor, cx| {
+                let whole = range == (0..editor.text().len());
+                let cursor = editor.cursor_position();
+                editor.set_selected_range(range.clone(), cx);
+                editor.replace(new.to_owned(), window, cx);
+                if whole {
+                    editor.set_cursor_position(cursor, window, cx);
+                } else {
+                    editor.set_selected_range(range.start..range.start + new.len(), cx);
+                }
+            }),
+            Self::Big(editor) => editor.update(cx, |editor, cx| editor.replace_range(range, new, cx)),
+        }
+    }
+
+    /// Moves the cursor to the start of `line`, counting from 1.
+    fn go_to_line(&self, line: u32, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Code(editor) => editor.update(cx, |editor, cx| {
+                editor.set_cursor_position(Position::new(line.saturating_sub(1), 0), window, cx);
+            }),
+            Self::Big(editor) => editor.update(cx, |editor, cx| editor.go_to_line(line as usize, cx)),
         }
     }
 
@@ -359,6 +403,25 @@ impl EditorPane {
         self.files.iter().filter(|file| file.disk.is_local()).map(|file| (file.path.as_path(), file.scratch))
     }
 
+    /// Moves the cursor in the file in front to the start of `line`, counting from 1.
+    pub fn go_to_line(&mut self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(file) = self.files.get(self.active) {
+            file.body.go_to_line(line, window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Whether a file editor in this pane has the focus.
+    pub fn has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus_handle.contains_focused(window, cx)
+    }
+
+    /// The folder of the file in front, and where it is.
+    pub fn folder(&self) -> Option<(PathBuf, Disk)> {
+        let file = self.files.get(self.active).filter(|file| !file.scratch)?;
+        Some((file.path.parent()?.to_path_buf(), file.disk.clone()))
+    }
+
     pub fn holds(&self, path: &Path) -> bool {
         self.files.iter().any(|file| file.path == path && file.disk.is_local())
     }
@@ -493,6 +556,78 @@ impl EditorPane {
             self.files[ix].help = Self::attach_server(&path, &language, &editor, &found, &root, cx);
         }
         cx.notify();
+    }
+
+    /// Runs a text tool on the selection in the file in front, or on the
+    /// whole file when nothing is selected. Format Document always takes the
+    /// whole file, and goes to the language server unless the file is JSON.
+    pub fn run_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.files.get(self.active) else { return };
+        let text = file.body.text(cx);
+        let selection = file.body.selection(cx);
+        let range = if selection.is_empty() || tool == Tool::FormatDocument { 0..text.len() } else { selection };
+        let (id, edits, part) = (file.body.id(), file.edits, range.clone());
+        let json = file.language.is_none_or(|language| language.grammar == "json");
+        let done = move |result: Result<String, String>, pane: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            pane.tool_done(tool, id, edits, range, result, window, cx);
+        };
+        if tool == Tool::FormatDocument && !json {
+            let language = file.language.map_or("", |language| language.label);
+            let answer = match &file.help {
+                Help::Server { client, uri } => client.format(uri, &text),
+                Help::Untrusted { .. } => {
+                    let reason = format!("{language} files are formatted by their language server. Turn on code help for this folder first.");
+                    return done(Err(reason), self, window, cx);
+                }
+                Help::None(why) => {
+                    let reason = format!("{language} files are formatted by their language server. {why}");
+                    return done(Err(reason.trim_end().to_owned()), self, window, cx);
+                }
+            };
+            cx.spawn_in(window, async move |pane, cx| {
+                let result = match answer.await {
+                    Ok(edits) => Ok(apply_edits(&text, edits)),
+                    Err(err) => Err(format!("The language server could not format it: {err}")),
+                };
+                let _ = pane.update_in(cx, |pane, window, cx| done(result, pane, window, cx));
+            })
+            .detach();
+            return;
+        }
+        // Off the UI thread, as a whole big file takes a while.
+        let result = cx.background_spawn(async move { tool.apply(&text.slice(part).to_string()) });
+        cx.spawn_in(window, async move |pane, cx| {
+            let result = result.await;
+            let _ = pane.update_in(cx, |pane, window, cx| done(result, pane, window, cx));
+        })
+        .detach();
+    }
+
+    /// Puts a tool's text in the file, unless the file changed meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    fn tool_done(
+        &mut self,
+        tool: Tool,
+        id: EntityId,
+        edits: u64,
+        range: Range<usize>,
+        result: Result<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = self.files.iter().find(|file| file.body.id() == id) else { return };
+        match result {
+            Err(reason) => native::error(&format!("{} didn't work", tool.label()), &reason, window, cx),
+            Ok(_) if file.edits != edits => {
+                let detail = "The file changed while it ran. Try again.";
+                native::error(&format!("{} didn't work", tool.label()), detail, window, cx);
+            }
+            Ok(new) => {
+                if file.body.text(cx).slice(range.clone()) != new.as_str() {
+                    file.body.replace(range, &new, window, cx);
+                }
+            }
+        }
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -811,6 +946,27 @@ impl EditorPane {
     }
 }
 
+/// `text` with a language server's edits made to it.
+fn apply_edits(text: &Rope, edits: Vec<lsp_types::TextEdit>) -> String {
+    let mut edits: Vec<_> = edits
+        .into_iter()
+        .map(|edit| (text.position_to_offset(&edit.range.start)..text.position_to_offset(&edit.range.end), edit.new_text))
+        .collect();
+    // Stable, so edits at one place keep their order, as the protocol asks.
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, new) in edits {
+        // Edits must not overlap; a server that sends them anyway loses the overlap.
+        let start = range.start.max(at);
+        out.push_str(&text.slice(at..start).to_string());
+        out.push_str(&new);
+        at = range.end.max(start);
+    }
+    out.push_str(&text.slice(at..).to_string());
+    out
+}
+
 /// Says a file did not open, and why.
 pub fn cant_open(path: &Path, err: &DiskError, window: &mut Window, cx: &mut App) {
     if *err == DiskError::Cancelled {
@@ -823,19 +979,23 @@ pub fn cant_open(path: &Path, err: &DiskError, window: &mut Window, cx: &mut App
 /// Reads a file as text, of any size. Err says why it can't be edited. Slow
 /// for big files and server files: run it in [`Disk::run`].
 pub fn read_text(disk: &Disk, path: &Path) -> Result<FileText, DiskError> {
-    if disk.is_local() && std::fs::metadata(path)?.len() > BIG_BYTES {
-        return read_big(path).map(FileText::Big);
+    let size = disk.size(path)?;
+    if disk.is_local() && size > BIG_BYTES {
+        return read_big(path, size + GROWTH).map(FileText::Big);
     }
-    text(disk.read(path, ANY_SIZE)?).map(FileText::sort)
+    text(disk.read(path, size + GROWTH)?).map(FileText::sort)
 }
 
 /// [`read_text`] as root, with sudo.
 pub fn read_text_as_root(disk: &Disk, path: &Path, password: Option<&str>) -> Result<FileText, DiskError> {
-    text(disk.read_as_root(path, ANY_SIZE, password)?).map(FileText::sort)
+    // Files the user can't read still show their size, unless their folder is closed too.
+    let limit = disk.size(path).map_or(HIDDEN_SIZE_LIMIT, |size| size + GROWTH);
+    text(disk.read_as_root(path, limit, password)?).map(FileText::sort)
 }
 
-/// Reads a big file on this computer straight into a rope, without a second copy.
-fn read_big(path: &Path) -> Result<Rope, DiskError> {
+/// Reads up to `limit` bytes of a big file on this computer straight into a
+/// rope, without a second copy.
+fn read_big(path: &Path, limit: u64) -> Result<Rope, DiskError> {
     let mut file = std::fs::File::open(path)?;
     let mut head = vec![0; 8192];
     let read = file.read(&mut head)?;
@@ -843,7 +1003,7 @@ fn read_big(path: &Path) -> Result<Rope, DiskError> {
         return Err(not_text());
     }
     file.seek(SeekFrom::Start(0))?;
-    Rope::from_reader(BufReader::with_capacity(1 << 20, file)).map_err(|err| match err.kind() {
+    Rope::from_reader(BufReader::with_capacity(1 << 20, file.take(limit))).map_err(|err| match err.kind() {
         std::io::ErrorKind::InvalidData => not_utf8(),
         _ => err.into(),
     })
@@ -895,6 +1055,13 @@ impl Render for EditorPane {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::on_close_file))
+            .on_action(cx.listener(|pane, _: &tools::FormatDocument, window, cx| pane.run_tool(Tool::FormatDocument, window, cx)))
+            .on_action(cx.listener(|pane, _: &tools::FormatJson, window, cx| pane.run_tool(Tool::FormatJson, window, cx)))
+            .on_action(cx.listener(|pane, _: &tools::MinifyJson, window, cx| pane.run_tool(Tool::MinifyJson, window, cx)))
+            .on_action(cx.listener(|pane, _: &tools::Base64Encode, window, cx| pane.run_tool(Tool::Base64Encode, window, cx)))
+            .on_action(cx.listener(|pane, _: &tools::Base64Decode, window, cx| pane.run_tool(Tool::Base64Decode, window, cx)))
+            .on_action(cx.listener(|pane, _: &tools::UrlEncode, window, cx| pane.run_tool(Tool::UrlEncode, window, cx)))
+            .on_action(cx.listener(|pane, _: &tools::UrlDecode, window, cx| pane.run_tool(Tool::UrlDecode, window, cx)))
             .size_full()
             .bg(theme.background)
             .when(!self.own_tab, |pane| pane.border_l_1().border_color(theme.border))
@@ -903,6 +1070,23 @@ impl Render for EditorPane {
             .when_some(file, |pane, file| {
                 let body = match &file.body {
                     Body::Code(editor) => Editor::new(editor)
+                        .context_menu({
+                            let editor = editor.downgrade();
+                            let has_server = matches!(file.help, Help::Server { .. });
+                            move |menu, _, cx| {
+                                let selected = editor.upgrade().is_some_and(|editor| !editor.read(cx).selected_range().is_empty());
+                                let menu = menu
+                                    .menu_with_disabled("Go to Definition", !has_server, Box::new(GoToDefinition))
+                                    .separator()
+                                    .menu_with_disabled("Cut", !selected, Box::new(Cut))
+                                    .menu_with_disabled("Copy", !selected, Box::new(Copy))
+                                    .menu("Paste", Box::new(Paste))
+                                    .separator()
+                                    .menu("Select All", Box::new(SelectAll))
+                                    .separator();
+                                Tool::ALL.into_iter().fold(menu, |menu, tool| menu.menu(tool.label(), tool.action()))
+                            }
+                        })
                         .appearance(false)
                         .bordered(false)
                         .size_full()
@@ -933,6 +1117,27 @@ mod tests {
         assert!(matches!(&results[0], Ok(FileText::Code(text)) if text == "hello"));
         assert!(results[1].is_err());
         assert!(results[2].is_err());
+    }
+
+    #[test]
+    fn applies_a_language_servers_edits() {
+        let edit = |start: (u32, u32), end: (u32, u32), new: &str| lsp_types::TextEdit {
+            range: lsp_types::Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1)),
+            new_text: new.to_owned(),
+        };
+        let text = Rope::from("a\nbb\nccc");
+        let edits = vec![edit((1, 0), (1, 2), "BB"), edit((0, 0), (0, 0), "x"), edit((0, 0), (0, 0), "y")];
+        assert_eq!(apply_edits(&text, edits), "xya\nBB\nccc");
+        assert_eq!(apply_edits(&text, Vec::new()), "a\nbb\nccc");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn devices_and_folders_do_not_open() {
+        // Reading these would never end, or makes no sense.
+        for path in ["/dev/zero", "/dev/urandom", "/tmp"] {
+            assert!(read_text(&Disk::Local, Path::new(path)).is_err(), "{path}");
+        }
     }
 
     #[test]

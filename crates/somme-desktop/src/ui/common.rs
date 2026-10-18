@@ -115,8 +115,10 @@ pub fn parse_color(hex: Option<&str>) -> Option<Hsla> {
 
 /// A square badge with an icon, tinted by the host color.
 pub fn host_badge(color: Option<&str>, icon: impl Into<Icon>, cx: &App) -> Div {
-    let theme = cx.theme();
-    let tint = parse_color(color).unwrap_or(theme.primary);
+    tinted_badge(parse_color(color).unwrap_or(cx.theme().primary), icon)
+}
+
+pub fn tinted_badge(tint: Hsla, icon: impl Into<Icon>) -> Div {
     div()
         .flex_none()
         .size(px(34.))
@@ -136,6 +138,7 @@ pub fn ago(timestamp: i64) -> String {
         0..60 => "just now".to_owned(),
         60..3600 => format!("{} min ago", diff / 60),
         3600..86_400 => format!("{} h ago", diff / 3600),
+        86_400..172_800 => "1 day ago".to_owned(),
         _ => format!("{} days ago", diff / 86_400),
     }
 }

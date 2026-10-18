@@ -2,8 +2,12 @@
 mod automation;
 mod changes;
 mod editor;
+mod github;
+mod host_os;
 mod look;
+mod mcp;
 mod runtime;
+mod search;
 mod services;
 mod settings;
 mod sftp;
@@ -83,14 +87,24 @@ fn pump_events(mut events: mpsc::UnboundedReceiver<BackendEvent>, window: AnyWin
 }
 
 fn main() -> anyhow::Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        // Agents start the app this way. It only passes messages to the running
+        // app, so it must print nothing else.
+        Some("--mcp") => std::process::exit(mcp::run_bridge()),
+        // Keeps agents working while the app is closed.
+        Some(mcp::SERVICE_ARG) => std::process::exit(mcp::run_service()),
+        Some(mcp::WORKER_ARG) => std::process::exit(mcp::run_worker()),
+        _ => {}
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     runtime::init()?;
+    mcp::claim();
     let (events_tx, events_rx) = mpsc::unbounded();
     let services = Arc::new(runtime::block_on(Services::build(events_tx))?);
 
-    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+    gpui_kit::application().with_assets(host_os::Assets).run(move |cx| {
         // Windows and Linux name the app in notifications by this.
         cx.set_app_identity("app.somme.desktop", ui::common::APP_NAME);
         gpui_kit::init(cx);
@@ -105,7 +119,9 @@ fn main() -> anyhow::Result<()> {
         ui::themes::apply_font(cx);
         cx.observe_global::<Settings>(ui::themes::apply_font).detach();
         Store::init(services.clone(), cx);
+        host_os::init(&services.data_dir, cx);
         look::init(services.clone(), cx);
+        mcp::init(services.clone(), cx);
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1200.), px(780.)), cx)),

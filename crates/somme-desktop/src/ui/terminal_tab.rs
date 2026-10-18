@@ -15,6 +15,9 @@ use crate::editor::pane::{cant_open, read_text, read_text_as_root};
 use crate::editor::sudo;
 use crate::editor::system_open;
 use crate::editor::{EditorPane, EditorPaneEvent};
+use crate::github::api::Kind;
+use crate::github::panel::{GitHubPanel, GitHubPanelEvent};
+use crate::github::repo::Repo;
 use crate::services::Services;
 use crate::terminal::disk::{Disk, DiskError};
 use crate::terminal::session::Status;
@@ -101,6 +104,8 @@ pub struct TerminalTab {
     subscriptions: Vec<(EntityId, Subscription)>,
     /// Files opened from the terminal, shown on the right.
     editor: Option<(Entity<EditorPane>, Subscription)>,
+    /// Pull requests or issues of the shell's GitHub repository, on the right.
+    github: Option<(Entity<GitHubPanel>, Subscription)>,
     /// Panes put away in the bar at the bottom. They keep running.
     minimized: Vec<Entity<TerminalView>>,
     /// The pane filling the whole tab, with the others kept behind it.
@@ -128,6 +133,7 @@ impl TerminalTab {
             services,
             subscriptions: Vec::new(),
             editor: None,
+            github: None,
             minimized: Vec::new(),
             maximized: None,
         };
@@ -161,11 +167,11 @@ impl TerminalTab {
                 cx.emit(TerminalTabEvent::Changed);
                 cx.notify();
             }
-            TerminalViewEvent::TitleChanged => {
+            TerminalViewEvent::TitleChanged | TerminalViewEvent::RepoChanged => {
                 cx.emit(TerminalTabEvent::Changed);
                 cx.notify();
             }
-            TerminalViewEvent::OpenFile(path) => tab.open_file(view, path.clone(), window, cx),
+            TerminalViewEvent::OpenFile(path) => tab.open_file(view, path.clone(), None, window, cx),
             TerminalViewEvent::OpenChanges(dir) => cx.emit(TerminalTabEvent::OpenChanges(dir.clone())),
             TerminalViewEvent::Typed(bytes) if tab.broadcast => {
                 for other in tab.panes() {
@@ -197,7 +203,15 @@ impl TerminalTab {
     /// Opens a file from `view`'s shell in the editor beside the terminals. For
     /// an SSH shell, the file is on the server. The editor opens only once the
     /// file is read. Images, PDFs and the like open in the system's app instead.
-    pub fn open_file(&mut self, view: &Entity<TerminalView>, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// `line`, counting from 1, is where to put the cursor.
+    pub fn open_file(
+        &mut self,
+        view: &Entity<TerminalView>,
+        path: PathBuf,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session = view.read(cx).session.read(cx);
         // Language servers run here, and are looked for on the shell's PATH.
         let shell_path = session.is_local().then(|| session.blocks.as_ref().and_then(|b| b.path.clone())).flatten();
@@ -213,7 +227,15 @@ impl TerminalTab {
                 return;
             }
             let open = tab.update_in(cx, |tab, window, cx| {
-                tab.editor.as_ref().is_some_and(|(pane, _)| pane.update(cx, |pane, cx| pane.show_open(&path, &disk, window, cx)))
+                tab.editor.as_ref().is_some_and(|(pane, _)| {
+                    pane.update(cx, |pane, cx| {
+                        let open = pane.show_open(&path, &disk, window, cx);
+                        if let Some(line) = line.filter(|_| open) {
+                            pane.go_to_line(line, window, cx);
+                        }
+                        open
+                    })
+                })
             });
             if open.unwrap_or(true) {
                 return;
@@ -242,7 +264,12 @@ impl TerminalTab {
             let _ = tab.update_in(cx, |tab, window, cx| match text {
                 Ok(text) => {
                     let pane = tab.editor_pane(window, cx);
-                    pane.update(cx, |pane, cx| pane.add(path, disk, text, as_root, shell_path.as_deref(), window, cx));
+                    pane.update(cx, |pane, cx| {
+                        pane.add(path, disk, text, as_root, shell_path.as_deref(), window, cx);
+                        if let Some(line) = line {
+                            pane.go_to_line(line, window, cx);
+                        }
+                    });
                     cx.notify();
                 }
                 Err(err) => cant_open(&path, &err, window, cx),
@@ -269,6 +296,44 @@ impl TerminalTab {
                 pane
             }
         }
+    }
+
+    /// The GitHub repository the focused shell is in.
+    pub fn repo(&self, cx: &App) -> Option<Repo> {
+        self.active.read(cx).session.read(cx).blocks.as_ref().and_then(|blocks| blocks.repo.clone())
+    }
+
+    /// What the GitHub panel shows, when it is open.
+    pub fn github_kind(&self, cx: &App) -> Option<Kind> {
+        self.github.as_ref().map(|(panel, _)| panel.read(cx).kind())
+    }
+
+    /// Opens the pull requests or issues of the shell's repository beside the
+    /// terminals. Asking again for what is already open closes it.
+    pub fn toggle_github(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo(cx) else { return };
+        match &self.github {
+            Some((panel, _)) if panel.read(cx).kind() == kind && *panel.read(cx).repo() == repo => {
+                self.github = None;
+                window.focus(&self.active.focus_handle(cx), cx);
+            }
+            Some((panel, _)) => panel.update(cx, |panel, cx| panel.show(repo, kind, cx)),
+            None => {
+                let services = self.services.clone();
+                let panel = cx.new(|cx| GitHubPanel::new(repo, kind, services, window, cx));
+                let subscription = cx.subscribe_in(&panel, window, |tab, _, event, window, cx| match event {
+                    GitHubPanelEvent::Close => {
+                        tab.github = None;
+                        window.focus(&tab.active.focus_handle(cx), cx);
+                        cx.emit(TerminalTabEvent::Changed);
+                        cx.notify();
+                    }
+                });
+                self.github = Some((panel, subscription));
+            }
+        }
+        cx.emit(TerminalTabEvent::Changed);
+        cx.notify();
     }
 
     pub fn panes(&self) -> Vec<Entity<TerminalView>> {
@@ -408,6 +473,11 @@ impl TerminalTab {
     }
 
     /// Runs `text` in the focused pane, or types it without Enter when `run` is false.
+    /// The editor beside the terminals, when one is open.
+    pub fn editor(&self) -> Option<&Entity<EditorPane>> {
+        self.editor.as_ref().map(|(pane, _)| pane)
+    }
+
     pub fn send_snippet(&mut self, text: &str, run: bool, cx: &mut Context<Self>) {
         self.active.update(cx, |view, cx| {
             if run {
@@ -579,12 +649,18 @@ impl Render for TerminalTab {
             .child(div().flex_1().min_h_0().children(panes))
             .when(!self.minimized.is_empty(), |col| col.child(self.render_minimized(cx)))
             .into_any_element();
-        let body = match &self.editor {
-            Some((editor, _)) => h_resizable("editor-split")
+        let body = match (&self.editor, &self.github) {
+            (None, None) => terminals,
+            (Some((editor, _)), None) => h_resizable("editor-split")
                 .child(resizable_panel().child(terminals))
                 .child(resizable_panel().child(editor.clone()))
                 .into_any_element(),
-            None => terminals,
+            // The group's `children` replaces the panels, so the editor goes in with `child`.
+            (editor, Some((github, _))) => h_resizable(if editor.is_some() { "github-split-3" } else { "github-split" })
+                .child(resizable_panel().child(terminals))
+                .when_some(editor.as_ref(), |group, (editor, _)| group.child(resizable_panel().child(editor.clone())))
+                .child(resizable_panel().size(px(520.)).flex_none().size_range(px(340.)..px(1600.)).child(github.clone()))
+                .into_any_element(),
         };
         div().size_full().bg(theme.background).child(body)
     }

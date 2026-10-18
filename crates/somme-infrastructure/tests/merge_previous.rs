@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use somme_application::ports::{
-    CloudAccounts, CloudError, CloudSession, CryptoError, EventPublisher, GatewayError, KeyStore, MasterKey,
-    SessionStore, SyncCredentials, SyncState,
+    CloudAccounts, CloudError, CloudSession, CryptoError, EventPublisher, GatewayError, GitHubAccess, KeyStore,
+    MasterKey, SecretStore, SessionStore, SyncCredentials, SyncState,
 };
 use somme_application::services::{SyncService, VaultService};
 use somme_domain::{Host, Id, Repository, Snippet, SshKey, new_id, now};
@@ -49,6 +49,10 @@ impl CloudAccounts for NoCloud {
     async fn avatar(&self, _: &str) -> Result<Vec<u8>, CloudError> {
         unimplemented!()
     }
+
+    async fn github_access(&self, _: &CloudSession) -> Result<GitHubAccess, CloudError> {
+        unimplemented!()
+    }
 }
 
 struct NoSessions;
@@ -59,6 +63,22 @@ impl SessionStore for NoSessions {
     }
 
     fn save(&self, _: &CloudSession) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+}
+
+struct NoSecret;
+
+impl SecretStore for NoSecret {
+    fn load(&self) -> Option<zeroize::Zeroizing<String>> {
+        None
+    }
+
+    fn save(&self, _: &str) -> Result<(), GatewayError> {
         Ok(())
     }
 
@@ -143,6 +163,7 @@ async fn joined(dir: &Path, old_db: &Path, account_password: &str) -> (Arc<SqlRe
         gateway,
         Arc::new(NoCloud),
         Arc::new(NoSessions),
+        Arc::new(NoSecret),
         vault.clone(),
         Arc::new(NoEvents),
         repo.clone(),

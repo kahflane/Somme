@@ -14,8 +14,11 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     for (ti, ch) in text.iter().enumerate() {
         if qi < query.len() && *ch == query[qi] {
             score += 10;
-            if last_match.is_some_and(|last| last + 1 == ti) {
-                score += 15;
+            match last_match {
+                Some(last) if last + 1 == ti => score += 15,
+                // Letters far apart match worse: "search files" is "Search Files…", not "Search Text in Files…".
+                Some(last) => score -= (ti - last - 1).min(10) as i32,
+                None => {}
             }
             if ti == 0 || !text[ti - 1].is_alphanumeric() {
                 score += 20;

@@ -24,6 +24,7 @@ use crate::terminal::element::{TerminalElement, grid_point};
 use crate::terminal::mouse::{self, ReportButton, ReportKind};
 use crate::terminal::session::{SessionEvent, Status, TerminalSession};
 use crate::terminal::keys;
+use crate::ui::common::logo;
 use crate::ui::workspace::{SplitDown, SplitLeft, SplitRight, SplitUp};
 
 mod blocks;
@@ -140,6 +141,8 @@ pub enum TerminalViewEvent {
     Focused,
     TitleChanged,
     StatusChanged,
+    /// The shell moved in or out of a GitHub repository.
+    RepoChanged,
     /// A file was picked to open in the editor.
     OpenFile(std::path::PathBuf),
     /// Show the uncommitted git changes of the repo that holds this folder.
@@ -194,6 +197,7 @@ impl TerminalView {
                     cx.emit(TerminalViewEvent::StatusChanged);
                 }
                 SessionEvent::PhaseChanged => view.phase_changed(window, cx),
+                SessionEvent::RepoChanged => cx.emit(TerminalViewEvent::RepoChanged),
             }),
             cx.on_focus(&focus_handle, window, |view, window, cx| {
                 view.reset_blink(cx);
@@ -887,6 +891,9 @@ impl Render for TerminalView {
             self.session.read(cx).term().selection.is_some()
         };
         let paste_on_right_click = Settings::get(cx).paste_on_right_click;
+        // A shell with nothing run yet shows the app's logo instead of a blank panel.
+        let empty = blocks_mode
+            && self.session.read(cx).blocks.as_ref().is_some_and(|blocks| blocks.ready && blocks.list.is_empty());
         let element = if blocks_mode {
             BlocksElement::new(cx.entity(), self.session.clone(), focused, self.cursor_visible).into_any_element()
         } else {
@@ -933,12 +940,10 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                    // With a command box, only a right-click on the box pastes; the
+                    // rest of the panel shows the menu.
                     if blocks_mode {
                         view.menu_block = view.blocks_layout.as_ref().and_then(|layout| layout.block_at(event.position.y));
-                        if paste_on_right_click {
-                            view.paste(&Paste, window, cx);
-                            cx.stop_propagation();
-                        }
                         return;
                     }
                     let mode = view.session.read(cx).mode();
@@ -958,6 +963,17 @@ impl Render for TerminalView {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(element)
+            .when(empty, |surface| {
+                surface.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(logo(px(112.)).opacity(0.9)),
+                )
+            })
             .when(flashing, |surface| {
                 surface.child(div().absolute().inset_0().border_2().border_color(cx.theme().warning.opacity(0.7)))
             })

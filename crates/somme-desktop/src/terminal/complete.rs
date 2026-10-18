@@ -132,6 +132,11 @@ pub fn typing_folder(line: &str, cursor: usize) -> bool {
     }
 }
 
+/// Where the folder word being typed starts, while a `cd` is typed.
+pub fn folder_word_start(line: &str, cursor: usize) -> Option<usize> {
+    typing_folder(line, cursor).then(|| word_start(line, cursor))
+}
+
 /// Folders for the `cd` being typed: ones in the folder the word points at
 /// first, then ones from past `cd` commands. `recent` holds those commands'
 /// folders as typed, newest first. Reads `disk`, so it may block.

@@ -52,6 +52,16 @@ pub struct GitHubConfig {
     pub client_id: String,
 }
 
+/// A GitHub token for the app to keep. The server does not store it, and
+/// it has no `Debug`, so it cannot end up in a log.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubToken {
+    pub token: String,
+    /// The scopes the user granted, comma separated.
+    pub scope: String,
+}
+
 /// What the app gets back from GitHub after the user signs in in the browser.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

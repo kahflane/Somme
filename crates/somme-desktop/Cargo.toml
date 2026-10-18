@@ -17,11 +17,16 @@ somme-infrastructure.workspace = true
 alacritty_terminal = "0.26"
 anyhow.workspace = true
 async-trait.workspace = true
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dashmap.workspace = true
 dirs.workspace = true
 fontdb.workspace = true
+# Only one Somme opens the database: the app, or the background service.
+fs4 = "0.13"
 futures = "0.3"
+# ripgrep's folder walker, for searching files.
+ignore = "0.4"
 # Syntax colours for the file editor. SQL is left out: its grammar needs an older `cc`
 # than Turso's build allows.
 gpui-kit = { version = "0.7.3", features = [
@@ -30,16 +35,21 @@ gpui-kit = { version = "0.7.3", features = [
 lsp-types = { version = "0.97", features = ["proposed"] }
 memchr = "2"
 parking_lot = "0.12"
+percent-encoding = "2"
 regex = "1"
+# GitHub's API, for pull requests and issues.
+reqwest.workspace = true
 # The same version the editor kit uses, so its `Rope` is this one.
 ropey = { version = "=2.0.0-beta.1", features = ["metric_chars", "metric_lines_lf"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [features]
 snapshot = ["gpui-kit/test-support"]

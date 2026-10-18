@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Rope};
+use gpui_kit::component::input::{Copy, Cut, Escape, Input, InputEvent, InputState, Paste, Rope, SelectAll};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementInputHandler, Entity,
@@ -19,6 +20,7 @@ use gpui_kit::{
 use regex::bytes::{Regex, RegexBuilder};
 use ropey::LineType;
 
+use crate::editor::tools::Tool;
 use crate::settings::Settings;
 use crate::terminal::element::{search_color, terminal_font};
 
@@ -468,6 +470,51 @@ impl BigText {
         }
     }
 
+    fn cut(&mut self, cx: &mut Context<Self>) {
+        self.copy(cx);
+        if !self.selection().is_empty() {
+            self.delete_to(self.cursor, cx);
+        }
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.typing = false;
+            self.insert(&text, cx);
+        }
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.anchor = 0;
+        self.cursor = self.text.len();
+        cx.notify();
+    }
+
+    /// What is selected, empty at the cursor when nothing is.
+    pub fn selected_range(&self) -> Range<usize> {
+        self.selection()
+    }
+
+    /// Puts `new` in place of `range` as one change to undo, from a tool.
+    /// A selection stays selected; a whole file keeps the cursor near where it was.
+    pub fn replace_range(&mut self, range: Range<usize>, new: &str, cx: &mut Context<Self>) {
+        let whole = range == (0..self.text.len());
+        let cursor = self.cursor;
+        self.typing = false;
+        self.replace(range.clone(), new, cx);
+        if whole {
+            let mut at = cursor.min(self.text.len());
+            while !self.text.is_char_boundary(at) {
+                at -= 1;
+            }
+            (self.cursor, self.anchor) = (at, at);
+        } else {
+            (self.anchor, self.cursor) = (range.start, range.start + new.len());
+        }
+        self.reveal();
+        cx.notify();
+    }
+
     // ---- finding ----
 
     fn query(&self, cx: &App) -> Option<String> {
@@ -600,12 +647,18 @@ impl BigText {
     fn go_to_typed_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(bar) = &self.bar else { return };
         let Ok(line) = bar.input.read(cx).value().trim().parse::<usize>() else { return };
+        self.go_to_line(line, cx);
+        self.close_bar(window, cx);
+    }
+
+    /// Puts the cursor at the start of `line`, counting from 1, in the middle of the view.
+    pub fn go_to_line(&mut self, line: usize, cx: &mut Context<Self>) {
         let line = line.clamp(1, self.lines()) - 1;
         self.cursor = self.line_start(line);
         self.anchor = self.cursor;
         self.goal = None;
         self.center();
-        self.close_bar(window, cx);
+        cx.notify();
     }
 
     // ---- input ----
@@ -670,24 +723,10 @@ impl BigText {
             "tab" if !command => self.insert("\t", cx),
             "escape" if self.bar.is_some() => self.close_bar(window, cx),
             "escape" if !selected.is_empty() => self.move_to(self.cursor, false, cx),
-            "a" if command => {
-                self.anchor = 0;
-                self.cursor = self.text.len();
-                cx.notify();
-            }
+            "a" if command => self.select_all(cx),
             "c" if command => self.copy(cx),
-            "x" if command => {
-                self.copy(cx);
-                if !selected.is_empty() {
-                    self.delete_to(self.cursor, cx);
-                }
-            }
-            "v" if command => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.typing = false;
-                    self.insert(&text, cx);
-                }
-            }
+            "x" if command => self.cut(cx),
+            "v" if command => self.paste(cx),
             "z" if command && shift => self.redo(cx),
             "z" if command => self.undo(cx),
             "f" if command => self.open_bar(BarMode::Find, window, cx),
@@ -1074,6 +1113,8 @@ impl Render for BigText {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = Settings::get(cx);
         let font_size = px(settings.font_size.clamp(6., 72.));
+        let menu_focus = self.focus_handle.clone();
+        let has_selection = !self.selection().is_empty();
         let theme = cx.theme();
         let snapshot = Snapshot {
             text: self.text.clone(),
@@ -1153,7 +1194,22 @@ impl Render for BigText {
                     .on_mouse_move(cx.listener(Self::mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = Drag::None))
                     .on_scroll_wheel(cx.listener(Self::scroll_wheel))
-                    .child(surface),
+                    .on_action(cx.listener(|this, _: &Cut, _, cx| this.cut(cx)))
+                    .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
+                    .on_action(cx.listener(|this, _: &Paste, _, cx| this.paste(cx)))
+                    .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
+                    .child(surface)
+                    .context_menu(move |menu, _, _| {
+                        let menu = menu
+                            .action_context(menu_focus.clone())
+                            .menu_with_disabled("Cut", Box::new(Cut), !has_selection)
+                            .menu_with_disabled("Copy", Box::new(Copy), !has_selection)
+                            .menu("Paste", Box::new(Paste))
+                            .separator()
+                            .menu("Select All", Box::new(SelectAll))
+                            .separator();
+                        Tool::ALL.into_iter().fold(menu, |menu, tool| menu.menu(tool.label(), tool.action()))
+                    }),
             )
     }
 }

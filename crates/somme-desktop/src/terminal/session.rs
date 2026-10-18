@@ -17,6 +17,7 @@ use somme_application::ports::{OutputSink, ShellOptions, TermSize};
 use somme_domain::Id;
 use tokio::sync::mpsc as io_mpsc;
 
+use crate::github::repo::{self, Repo};
 use crate::runtime;
 use crate::services::Services;
 use crate::settings::Settings;
@@ -94,6 +95,8 @@ pub enum SessionEvent {
     StatusChanged,
     /// A command started, or the shell is back at its prompt.
     PhaseChanged,
+    /// The shell moved in or out of a GitHub repository.
+    RepoChanged,
 }
 
 /// Command blocks for a shell that runs Somme's hooks.
@@ -105,6 +108,8 @@ pub struct Blocks {
     /// The shell's folder at its last prompt. On a server it is the server's folder.
     pub cwd: Option<PathBuf>,
     pub git: Option<GitInfo>,
+    /// The GitHub repository `origin` points at, for the shell's folder.
+    pub repo: Option<Repo>,
     /// The shell's PATH, for completing command names.
     pub path: Option<String>,
     /// The user's home folder where the shell runs.
@@ -392,6 +397,9 @@ impl TerminalSession {
                         if session.status == Status::Connecting {
                             session.status = Status::Connected;
                         }
+                        if let SessionTarget::Ssh { host_id, .. } = &session.target {
+                            crate::host_os::check(*host_id, session.disk(), cx);
+                        }
                         session.wait_for_hooks(services.sessions.has_hooks(id), cx);
                         runtime::handle().spawn(write_loop(services, id, io_rx));
                     }
@@ -545,6 +553,7 @@ impl TerminalSession {
                     blocks.git = None;
                     // The tab names the folder, so it changes too.
                     cx.emit(SessionEvent::TitleChanged);
+                    self.refresh_repo(cx);
                 }
                 self.refresh_git(cx);
             }
@@ -608,6 +617,30 @@ impl TerminalSession {
                     && blocks.cwd.as_ref() == Some(&dir)
                 {
                     blocks.git = git;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Looks up the GitHub repository of the shell's folder, here or on the server.
+    fn refresh_repo(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.blocks.as_ref().and_then(|b| b.cwd.clone()) else { return };
+        let disk = self.disk();
+        cx.spawn(async move |this, cx| {
+            let lookup = dir.clone();
+            let found = match disk.await {
+                Some(disk) => disk.run(move |disk| repo::find(disk, &lookup)).await,
+                None => None,
+            };
+            let _ = this.update(cx, |session, cx| {
+                if let Some(blocks) = session.blocks.as_mut()
+                    && blocks.cwd.as_ref() == Some(&dir)
+                    && blocks.repo != found
+                {
+                    blocks.repo = found;
+                    cx.emit(SessionEvent::RepoChanged);
                     cx.notify();
                 }
             });
