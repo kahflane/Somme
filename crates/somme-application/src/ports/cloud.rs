@@ -24,6 +24,14 @@ pub struct SyncCredentials {
     pub expires_at: i64,
 }
 
+/// A GitHub token for the signed-in user's repositories, kept on this
+/// computer only.
+pub struct GitHubAccess {
+    pub token: Zeroizing<String>,
+    /// The scopes the user granted, comma separated.
+    pub scope: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CloudError {
     #[error("{0}")]
@@ -48,6 +56,16 @@ pub trait CloudAccounts: Send + Sync {
     async fn credentials(&self, session: &CloudSession) -> Result<SyncCredentials, CloudError>;
     /// Downloads a profile picture.
     async fn avatar(&self, url: &str) -> Result<Vec<u8>, CloudError>;
+    /// Opens GitHub in the browser to let Somme read and act on the user's
+    /// repositories, and waits for the token.
+    async fn github_access(&self, session: &CloudSession) -> Result<GitHubAccess, CloudError>;
+}
+
+/// Keeps one secret, like the GitHub token, in the system keychain.
+pub trait SecretStore: Send + Sync {
+    fn load(&self) -> Option<Zeroizing<String>>;
+    fn save(&self, secret: &str) -> Result<(), GatewayError>;
+    fn clear(&self) -> Result<(), GatewayError>;
 }
 
 pub trait SessionStore: Send + Sync {

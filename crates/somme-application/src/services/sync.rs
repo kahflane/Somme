@@ -6,12 +6,13 @@ use somme_domain::{
     SshKey, VaultRepository,
 };
 use tokio::sync::oneshot;
+use zeroize::Zeroizing;
 
 use crate::dto::{AccountStatus, MergeReport, SyncStatusView};
 use crate::error::{AppError, AppResult};
 use crate::ports::{
-    CloudAccounts, CloudSession, EventPublisher, GatewayError, MasterKey, SessionStore, SyncGateway, SyncOutcome,
-    VaultData,
+    CloudAccounts, CloudError, CloudSession, EventPublisher, GatewayError, MasterKey, SecretStore, SessionStore,
+    SyncGateway, SyncOutcome, VaultData,
 };
 use crate::services::VaultService;
 
@@ -19,6 +20,8 @@ pub struct SyncService {
     gateway: Arc<dyn SyncGateway>,
     cloud: Arc<dyn CloudAccounts>,
     sessions: Arc<dyn SessionStore>,
+    /// The GitHub token for pull requests and issues.
+    github: Arc<dyn SecretStore>,
     vault: Arc<VaultService>,
     events: Arc<dyn EventPublisher>,
     data: Arc<dyn VaultData>,
@@ -32,6 +35,7 @@ impl SyncService {
         gateway: Arc<dyn SyncGateway>,
         cloud: Arc<dyn CloudAccounts>,
         sessions: Arc<dyn SessionStore>,
+        github: Arc<dyn SecretStore>,
         vault: Arc<VaultService>,
         events: Arc<dyn EventPublisher>,
         data: Arc<dyn VaultData>,
@@ -40,6 +44,7 @@ impl SyncService {
             gateway,
             cloud,
             sessions,
+            github,
             vault,
             events,
             data,
@@ -83,6 +88,36 @@ impl SyncService {
         self.start(session?).await
     }
 
+    /// The saved GitHub token for repositories, if the user gave one. This
+    /// can ask the system keychain.
+    pub fn github_token(&self) -> Option<Zeroizing<String>> {
+        self.github.load()
+    }
+
+    /// Asks GitHub in the browser to let Somme use the user's repositories,
+    /// and saves the token. Needs a Somme sign-in. `cancel_sign_in` stops it.
+    pub async fn connect_github(&self) -> AppResult<Zeroizing<String>> {
+        let session = self.sessions.load().ok_or(CloudError::SessionExpired)?;
+        let (cancel, cancelled) = oneshot::channel();
+        *self.cancel_sign_in.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel);
+        let access = tokio::select! {
+            access = self.cloud.github_access(&session) => access,
+            _ = cancelled => return Err(GatewayError::Cancelled.into()),
+        };
+        self.cancel_sign_in.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let access = access?;
+        if !access.scope.split(',').any(|scope| scope.trim() == "repo") {
+            return Err(CloudError::Rejected("GitHub did not give access to your repositories".into()).into());
+        }
+        self.github.save(&access.token)?;
+        Ok(access.token)
+    }
+
+    /// Forgets the GitHub token, as when GitHub stops taking it.
+    pub fn forget_github(&self) -> AppResult<()> {
+        Ok(self.github.clear()?)
+    }
+
     pub fn cancel_sign_in(&self) {
         if let Some(cancel) = self.cancel_sign_in.lock().unwrap_or_else(PoisonError::into_inner).take() {
             let _ = cancel.send(());
@@ -104,6 +139,7 @@ impl SyncService {
                 tracing::warn!(%err, "remote sign out failed");
             }
         self.sessions.clear()?;
+        self.github.clear()?;
         Ok(self.account())
     }
 

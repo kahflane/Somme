@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,11 +10,12 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, TitleBar, WindowExt as _, h_flex,
     v_flex,
 };
+use futures::FutureExt as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Axis, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, KeyBinding, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
     StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, actions, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, WeakEntity, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
@@ -26,10 +27,13 @@ use crate::editor::pane::{FileText, cant_open, read_text};
 use crate::editor::scratch::{self, OpenEntry};
 use crate::editor::system_open;
 use crate::editor::{EditorPane, EditorPaneEvent};
+use crate::github::api::Kind;
 use crate::services::Services;
 use crate::settings::Settings;
+use crate::search::Hit;
 use crate::store::{Store, StoreEvent, mutate};
 use crate::terminal::SessionTarget;
+use crate::terminal::view::TerminalView;
 use crate::terminal::disk::Disk;
 use crate::ui::common::{Lucide, avatar, notify_error, parse_color};
 use crate::ui::native;
@@ -40,8 +44,8 @@ use crate::ui::hosts::HostsPage;
 use crate::ui::keychain::KeychainPage;
 use crate::ui::lock::LockScreen;
 use crate::ui::known_hosts::KnownHostsPage;
-use crate::ui::logs::LogsPage;
-use crate::ui::palette::{CommandPalette, PaletteAction, PaletteEvent};
+use crate::ui::palette::{CommandPalette, Here, PaletteAction, PaletteContext, PaletteEvent};
+use crate::ui::pinned::{self, Pinned};
 use crate::ui::settings_page::SettingsPage;
 use crate::ui::side_panel::{SidePanel, SidePanelEvent};
 use crate::ui::sftp::SftpPage;
@@ -72,6 +76,7 @@ actions!(
         ToggleSidePanel,
         Quit,
         RenameTab,
+        TogglePinTab,
         ShowHosts,
         ShowKeychain,
         ShowSnippets,
@@ -146,30 +151,27 @@ pub enum Page {
     Forwarding,
     Snippets,
     KnownHosts,
-    Logs,
     Settings,
 }
 
 impl Page {
     /// The pages in the SSH section, in sidebar order.
-    const VAULT: [Page; 7] = [
+    const VAULT: [Page; 6] = [
         Page::Hosts,
         Page::Sftp,
         Page::Keychain,
         Page::Forwarding,
         Page::Snippets,
         Page::KnownHosts,
-        Page::Logs,
     ];
 
-    pub(crate) const ALL: [Page; 8] = [
+    pub(crate) const ALL: [Page; 7] = [
         Page::Hosts,
         Page::Sftp,
         Page::Keychain,
         Page::Forwarding,
         Page::Snippets,
         Page::KnownHosts,
-        Page::Logs,
         Page::Settings,
     ];
 
@@ -181,7 +183,6 @@ impl Page {
             Page::Forwarding => "Port Forwarding",
             Page::Snippets => "Snippets",
             Page::KnownHosts => "Known Hosts",
-            Page::Logs => "Logs",
             Page::Settings => "Settings",
         }
     }
@@ -194,7 +195,6 @@ impl Page {
             Page::Forwarding => Icon::new(Lucide::ArrowLeftRight),
             Page::Snippets => Icon::new(Lucide::SquareCode),
             Page::KnownHosts => Icon::new(Lucide::ShieldCheck),
-            Page::Logs => Icon::new(Lucide::Clock),
             Page::Settings => Icon::new(Lucide::Settings),
         }
     }
@@ -207,8 +207,19 @@ enum TabContent {
     Editor(Entity<EditorPane>),
 }
 
+/// What the command palette's picks act on.
+#[derive(Default)]
+struct PaletteTarget {
+    /// The file editor that had the focus, for text tools.
+    editor: Option<WeakEntity<EditorPane>>,
+    /// The terminal whose folder a search looked in.
+    terminal: Option<(WeakEntity<TerminalTab>, WeakEntity<TerminalView>)>,
+}
+
 struct Tab {
     id: usize,
+    /// Kept on the left, safe from ⌘W, and opened again at the next start.
+    pinned: bool,
     content: TabContent,
     _subscriptions: Vec<Subscription>,
 }
@@ -267,16 +278,21 @@ pub struct Workspace {
     forwards: Option<Entity<ForwardsPage>>,
     snippets: Option<Entity<SnippetsPage>>,
     known_hosts: Option<Entity<KnownHostsPage>>,
-    logs: Option<Entity<LogsPage>>,
     settings: Option<Entity<SettingsPage>>,
     sftp: Option<Entity<SftpPage>>,
     focus_handle: FocusHandle,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
+    /// What was in front when the palette opened, for its picks to act on.
+    palette_target: PaletteTarget,
     /// Snippets and themes next to the terminal. Made the first time it shows.
     side_panel: Option<(Entity<SidePanel>, Subscription)>,
     /// Last key press, click or scroll. Auto-lock counts idle time from here.
     last_activity: Instant,
     renaming: Option<Renaming>,
+    /// The pinned tabs as last saved, so they are written only when they change.
+    pinned_saved: Vec<Pinned>,
+    /// Pinned servers waiting for the vault to open before they connect.
+    waiting_pins: Vec<Id>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -285,7 +301,10 @@ impl Workspace {
         let store = Store::global(cx);
         let lock_screen = cx.new(|cx| LockScreen::new(window, cx));
         let subscriptions = vec![
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe_in(&store, window, |workspace, _, window, cx| {
+                workspace.open_waiting_pins(window, cx);
+                cx.notify();
+            }),
             cx.subscribe_in(&store, window, |workspace, _, event, window, cx| match event {
                 // Locking only closes the vault. Terminals stay as they are.
                 StoreEvent::VaultChanged => {
@@ -311,18 +330,23 @@ impl Workspace {
             forwards: None,
             snippets: None,
             known_hosts: None,
-            logs: None,
             settings: None,
             sftp: None,
             focus_handle: cx.focus_handle(),
             palette: None,
+            palette_target: PaletteTarget::default(),
             side_panel: None,
             last_activity: Instant::now(),
             renaming: None,
+            pinned_saved: Vec::new(),
+            waiting_pins: Vec::new(),
             _subscriptions: subscriptions,
         };
-        // The app starts on a local terminal, without waiting for the vault.
-        workspace.open_terminal(SessionTarget::Local, window, cx);
+        // The app starts on a local terminal, without waiting for the vault:
+        // the pinned ones, or else a new one.
+        if !workspace.restore_pinned(window, cx) {
+            workspace.open_terminal(SessionTarget::Local, window, cx);
+        }
         if Settings::get(cx).reopen_files {
             workspace.reopen_files(window, cx);
         }
@@ -384,22 +408,136 @@ impl Workspace {
     // ---- tabs ----
 
     pub fn open_terminal(&mut self, target: SessionTarget, window: &mut Window, cx: &mut Context<Self>) {
-        let services = self.services.clone();
         let dir = matches!(target, SessionTarget::Local).then(|| self.previous_local_dir(cx)).flatten();
+        self.open_terminal_in(target, dir, window, cx);
+    }
+
+    /// Opens a terminal starting in `dir`, a folder on this computer.
+    fn open_terminal_in(&mut self, target: SessionTarget, dir: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_terminal(target, dir, window, cx);
+        self.activate(Some(self.tabs.len() - 1), window, cx);
+    }
+
+    /// Adds a terminal tab at the end without bringing it to the front.
+    fn add_terminal(&mut self, target: SessionTarget, dir: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let services = self.services.clone();
         let tab = cx.new(|cx| TerminalTab::new(target, dir, services, window, cx));
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let subscription = cx.subscribe_in(&tab, window, move |workspace, _, event, window, cx| match event {
-            TerminalTabEvent::Changed => cx.notify(),
+            TerminalTabEvent::Changed => {
+                // A pinned shell that moved reopens in its new folder.
+                workspace.save_pinned(cx);
+                cx.notify();
+            }
             TerminalTabEvent::Empty => workspace.remove_tab(id, window, cx),
             TerminalTabEvent::OpenChanges(dir) => workspace.open_changes(dir.clone(), window, cx),
         });
         self.tabs.push(Tab {
             id,
+            pinned: false,
             content: TabContent::Terminal(tab),
             _subscriptions: vec![subscription],
         });
-        self.activate(Some(self.tabs.len() - 1), window, cx);
+    }
+
+    // ---- pinned tabs ----
+
+    /// Opens the tabs pinned when the app last ran. Servers wait for the
+    /// vault. Returns whether a local terminal was opened.
+    fn restore_pinned(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let saved = pinned::load(&self.services.data_dir);
+        for entry in &saved {
+            match entry {
+                Pinned::Local { dir } => {
+                    let dir = dir.clone().filter(|dir| dir.is_dir());
+                    self.add_terminal(SessionTarget::Local, dir, window, cx);
+                    if let Some(tab) = self.tabs.last_mut() {
+                        tab.pinned = true;
+                    }
+                }
+                Pinned::Ssh { host } => self.waiting_pins.push(*host),
+            }
+        }
+        self.pinned_saved = saved;
+        let opened = !self.tabs.is_empty();
+        if opened {
+            self.activate(Some(0), window, cx);
+        }
+        self.open_waiting_pins(window, cx);
+        opened
+    }
+
+    /// Connects the pinned servers once the vault is open and its hosts are in.
+    fn open_waiting_pins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.waiting_pins.is_empty() {
+            return;
+        }
+        let store = Store::global(cx).read(cx);
+        if !store.is_unlocked() || store.hosts.is_empty() {
+            return;
+        }
+        // Hosts deleted since are dropped.
+        let hosts: Vec<(Id, String)> = std::mem::take(&mut self.waiting_pins)
+            .into_iter()
+            .filter_map(|id| store.host(id).map(|host| (id, host.label.clone())))
+            .collect();
+        for (host_id, label) in hosts {
+            self.add_terminal(SessionTarget::Ssh { host_id, label }, None, window, cx);
+            if let Some(tab) = self.tabs.last_mut() {
+                tab.pinned = true;
+            }
+        }
+        self.sort_pinned();
+        self.save_pinned(cx);
+        cx.notify();
+    }
+
+    fn toggle_pin(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(ix) else { return };
+        tab.pinned = !tab.pinned;
+        self.sort_pinned();
+        self.save_pinned(cx);
+        self.save_open_files(cx);
+        cx.notify();
+    }
+
+    /// Puts the pinned tabs first, each group keeping its order.
+    fn sort_pinned(&mut self) {
+        let front = self.active.and_then(|ix| self.tabs.get(ix)).map(|tab| tab.id);
+        self.tabs.sort_by_key(|tab| !tab.pinned);
+        self.active = front.and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
+    }
+
+    fn is_pinned(&self, ix: usize) -> bool {
+        self.tabs.get(ix).is_some_and(|tab| tab.pinned)
+    }
+
+    /// Writes the pinned terminals down for the next start.
+    fn save_pinned(&mut self, cx: &App) {
+        let mut pins: Vec<Pinned> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.pinned)
+            .filter_map(|tab| {
+                let TabContent::Terminal(term) = &tab.content else { return None };
+                let term = term.read(cx);
+                match &term.target {
+                    SessionTarget::Local => {
+                        let session = term.active().read(cx).session.read(cx);
+                        let dir = session.blocks.as_ref().and_then(|b| b.cwd.clone()).or_else(|| session.current_dir());
+                        Some(Pinned::Local { dir })
+                    }
+                    SessionTarget::Ssh { host_id, .. } => Some(Pinned::Ssh { host: *host_id }),
+                    SessionTarget::Replay { .. } => None,
+                }
+            })
+            .collect();
+        pins.extend(self.waiting_pins.iter().map(|host| Pinned::Ssh { host: *host }));
+        if pins != self.pinned_saved {
+            pinned::save(&self.services.data_dir, &pins);
+            self.pinned_saved = pins;
+        }
     }
 
     /// Shows the git changes of the repo that holds `dir`, in its own tab.
@@ -421,6 +559,7 @@ impl Workspace {
         let subscription = cx.observe(&view, |_, _, cx| cx.notify());
         self.tabs.push(Tab {
             id,
+            pinned: false,
             content: TabContent::Changes(view),
             _subscriptions: vec![subscription],
         });
@@ -476,6 +615,7 @@ impl Workspace {
         ];
         self.tabs.push(Tab {
             id,
+            pinned: false,
             content: TabContent::Editor(pane),
             _subscriptions: subscriptions,
         });
@@ -626,7 +766,9 @@ impl Workspace {
             self.close_palette(window, cx);
             return;
         }
-        let palette = cx.new(|cx| CommandPalette::new(window, cx));
+        let (context, target) = self.palette_context(window, cx);
+        self.palette_target = target;
+        let palette = cx.new(|cx| CommandPalette::new(context, window, cx));
         let subscription = cx.subscribe_in(&palette, window, |workspace, _, event, window, cx| match event {
             PaletteEvent::Dismiss => workspace.close_palette(window, cx),
             PaletteEvent::Pick(action) => {
@@ -661,7 +803,126 @@ impl Workspace {
             PaletteAction::Page(page) => self.show_page(page, window, cx),
             PaletteAction::Lock => Store::global(cx).update(cx, |store, cx| store.lock(cx)),
             PaletteAction::Unlock => self.show_page(Page::Hosts, window, cx),
+            PaletteAction::Tool(tool) => {
+                let Some(pane) = self.palette_target.editor.take().and_then(|pane| pane.upgrade()) else { return };
+                window.focus(&pane.focus_handle(cx), cx);
+                pane.update(cx, |pane, cx| pane.run_tool(tool, window, cx));
+            }
+            PaletteAction::Search(_) => {}
+            PaletteAction::Open { hit, here } => self.open_hit(hit, here, window, cx),
         }
+    }
+
+    /// The focused file editor, and the folder of the terminal or file in front.
+    fn palette_context(&self, window: &Window, cx: &App) -> (PaletteContext, PaletteTarget) {
+        let editor = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                TabContent::Editor(pane) => Some(pane.clone()),
+                TabContent::Terminal(tab) => tab.read(cx).editor().cloned(),
+                TabContent::Changes(_) => None,
+            })
+            .find(|pane| pane.read(cx).has_focus(window, cx));
+        let mut target = PaletteTarget {
+            editor: editor.as_ref().map(Entity::downgrade),
+            terminal: None,
+        };
+        let front = self.active.and_then(|ix| self.tabs.get(ix)).filter(|_| self.section == Section::Cli);
+        let here = match front.map(|tab| &tab.content) {
+            Some(TabContent::Terminal(tab)) => {
+                let view = tab.read(cx).active().clone();
+                let session = view.read(cx).session.read(cx);
+                let blocks = session.blocks.as_ref();
+                let dir = blocks.and_then(|blocks| blocks.cwd.clone()).or_else(|| session.current_dir());
+                dir.filter(|_| !session.is_replay()).map(|dir| {
+                    let server = match &session.target {
+                        SessionTarget::Ssh { label, .. } => Some(SharedString::from(label.clone())),
+                        _ => None,
+                    };
+                    let home = if server.is_some() { blocks.and_then(|blocks| blocks.home.clone()) } else { dirs::home_dir() };
+                    let here = Here {
+                        dir,
+                        disk: session.disk().boxed_local().shared(),
+                        server,
+                        home,
+                    };
+                    target.terminal = Some((tab.downgrade(), view.downgrade()));
+                    here
+                })
+            }
+            Some(TabContent::Editor(pane)) => pane.read(cx).folder().map(|(dir, disk)| Here {
+                dir,
+                disk: futures::future::ready(Some(disk)).boxed_local().shared(),
+                server: None,
+                home: dirs::home_dir(),
+            }),
+            _ => None,
+        };
+        (PaletteContext { editor: editor.is_some(), here }, target)
+    }
+
+    /// Opens a file or folder the palette found. One found in the terminal's
+    /// folder opens through that terminal, as it may be on a server.
+    fn open_hit(&mut self, hit: Hit, here: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let terminal = self.palette_target.terminal.take().filter(|_| here);
+        let terminal = terminal.and_then(|(tab, view)| Some((tab.upgrade()?, view.upgrade()?)));
+        let line = hit.line.as_ref().map(|(number, _)| *number);
+        match terminal {
+            Some((tab, view)) if hit.folder && !view.read(cx).session.read(cx).is_local() => {
+                let cd = format!("cd {}", shell_quote(&hit.path.to_string_lossy().replace('\\', "/")));
+                tab.update(cx, |tab, cx| tab.send_snippet(&cd, true, cx));
+            }
+            Some((tab, view)) if !hit.folder => {
+                tab.update(cx, |tab, cx| tab.open_file(&view, hit.path, line, window, cx));
+            }
+            _ if hit.folder => self.open_terminal_in(SessionTarget::Local, Some(hit.path), window, cx),
+            _ => self.open_local_file(hit.path, line, window, cx),
+        }
+    }
+
+    /// Opens a file on this computer in a tab of its own, with the cursor on
+    /// `line`. Images, PDFs and the like open in the system's app.
+    fn open_local_file(&mut self, path: PathBuf, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        if system_open::opens_outside(&path) {
+            cx.open_with_system(&path);
+            return;
+        }
+        if self.show_local_file(&path, line, window, cx) {
+            return;
+        }
+        let text = Disk::Local.run({
+            let path = path.clone();
+            move |disk| read_text(disk, &path)
+        });
+        cx.spawn_in(window, async move |workspace, cx| {
+            let text = text.await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| match text {
+                Ok(text) => {
+                    workspace.open_editor(path.clone(), text, false, true, window, cx);
+                    workspace.show_local_file(&path, line, window, cx);
+                }
+                Err(err) => cant_open(&path, &err, window, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Brings the tab holding `path` to the front, with the cursor on `line`.
+    /// False when no tab holds it.
+    fn show_local_file(&mut self, path: &Path, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let found = self.tabs.iter().position(|tab| matches!(&tab.content, TabContent::Editor(pane) if pane.read(cx).holds(path)));
+        let Some(ix) = found else { return false };
+        self.activate(Some(ix), window, cx);
+        if let TabContent::Editor(pane) = &self.tabs[ix].content {
+            pane.update(cx, |pane, cx| {
+                pane.show_open(path, &Disk::Local, window, cx);
+                if let Some(line) = line {
+                    pane.go_to_line(line, window, cx);
+                }
+            });
+        }
+        true
     }
 
     // ---- side panel ----
@@ -680,6 +941,18 @@ impl Workspace {
         self.focus_current(window, cx);
     }
 
+    /// Opens the side panel on the session logs of the terminal in front.
+    fn show_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.side_panel_fits(cx) {
+            return;
+        }
+        if !Settings::get(cx).side_panel {
+            Settings::update(cx, |s| s.side_panel = true);
+        }
+        let panel = self.side_panel(window, cx);
+        panel.update(cx, |panel, cx| panel.show_logs(cx));
+    }
+
     fn side_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<SidePanel> {
         if let Some((panel, _)) = &self.side_panel {
             return panel.clone();
@@ -695,7 +968,6 @@ impl Workspace {
                 };
                 workspace.open_terminal(target, window, cx);
             }
-            SidePanelEvent::ShowAllLogs => workspace.show_page(Page::Logs, window, cx),
             SidePanelEvent::FocusTerminal => workspace.focus_current(window, cx),
             SidePanelEvent::Close => workspace.toggle_side_panel(window, cx),
         });
@@ -884,7 +1156,11 @@ impl Workspace {
 
     fn remove_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|t| t.id == id) else { return };
-        if let TabContent::Editor(pane) = self.tabs.remove(ix).content {
+        let tab = self.tabs.remove(ix);
+        if tab.pinned {
+            self.save_pinned(cx);
+        }
+        if let TabContent::Editor(pane) = tab.content {
             pane.update(cx, |pane, _| pane.discard());
             self.save_open_files(cx);
         }
@@ -911,6 +1187,9 @@ impl Workspace {
     /// Moves the tab with `id` to position `to`, keeping the same tab in front.
     fn move_tab(&mut self, id: usize, to: usize, cx: &mut Context<Self>) {
         let Some(from) = self.tabs.iter().position(|t| t.id == id) else { return };
+        // Pinned tabs stay ahead of the others.
+        let pinned = self.tabs.iter().filter(|t| t.pinned).count();
+        let to = if self.tabs[from].pinned { to.min(pinned.saturating_sub(1)) } else { to.max(pinned) };
         let to = to.min(self.tabs.len() - 1);
         if from == to {
             return;
@@ -1057,11 +1336,6 @@ impl Workspace {
         match self.page {
             // Host keys are saved by the backend during connect, without a store refresh.
             Page::KnownHosts => Store::global(cx).update(cx, |store, cx| store.refresh(cx)),
-            Page::Logs => {
-                if let Some(logs) = &self.logs {
-                    logs.update(cx, |logs, cx| logs.reload(cx));
-                }
-            }
             _ => {}
         }
     }
@@ -1082,6 +1356,8 @@ impl Workspace {
     /// Closes the tab in front, or the window when no tab is.
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         match self.active.filter(|_| self.section == Section::Cli) {
+            // A pinned tab closes only from its menu.
+            Some(ix) if self.is_pinned(ix) => {}
             Some(ix) => self.request_close_tab(ix, window, cx),
             None => window.remove_window(),
         }
@@ -1149,15 +1425,16 @@ impl Workspace {
             };
             let dragged = DraggedTab { id: tab.id, title: title.clone() };
             let tab_id = tab.id;
+            let pinned = tab.pinned;
             let menu_workspace = workspace.clone();
             div()
                 .id(("tab", tab.id))
                 .group("tab")
                 .h(px(26.))
-                .min_w(px(110.))
-                .max_w(px(220.))
+                .min_w(px(if pinned { 0. } else { 110. }))
+                .max_w(px(if pinned { 160. } else { 220. }))
                 .pl_2()
-                .pr_1()
+                .pr(px(if pinned { 8. } else { 4. }))
                 .flex()
                 .items_center()
                 .gap_1p5()
@@ -1183,17 +1460,22 @@ impl Workspace {
                 .when(unsaved, |el| {
                     el.child(div().flex_none().size(px(7.)).rounded_full().bg(theme.foreground.opacity(0.7)))
                 })
-                .child(
-                    Button::new(("close-tab", tab.id))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tab_stop(false)
-                        .on_click(cx.listener(move |workspace, _: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            workspace.request_close_tab(ix, window, cx);
-                        })),
-                )
+                .when(pinned, |el| {
+                    el.child(Icon::new(Lucide::Pin).size(px(11.)).text_color(theme.muted_foreground))
+                })
+                .when(!pinned, |el| {
+                    el.child(
+                        Button::new(("close-tab", tab.id))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tab_stop(false)
+                            .on_click(cx.listener(move |workspace, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                workspace.request_close_tab(ix, window, cx);
+                            })),
+                    )
+                })
                 .on_click(cx.listener(move |workspace, event: &ClickEvent, window, cx| {
                     if event.click_count() == 2 && !changes {
                         workspace.start_rename(ix, window, cx);
@@ -1205,7 +1487,11 @@ impl Workspace {
                 .block_mouse_except_scroll()
                 .on_mouse_down(
                     MouseButton::Middle,
-                    cx.listener(move |workspace, _, window, cx| workspace.request_close_tab(ix, window, cx)),
+                    cx.listener(move |workspace, _, window, cx| {
+                        if !workspace.is_pinned(ix) {
+                            workspace.request_close_tab(ix, window, cx);
+                        }
+                    }),
                 )
                 .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                 .drag_over::<DraggedTab>(|style, _, _, cx| style.border_color(cx.theme().primary))
@@ -1214,6 +1500,7 @@ impl Workspace {
                 }))
                 .context_menu(move |menu, _, _| {
                     let (rename, reset, close) = (menu_workspace.clone(), menu_workspace.clone(), menu_workspace.clone());
+                    let pin = menu_workspace.clone();
                     menu.when(!changes, |menu| {
                         menu.item(PopupMenuItem::new("Rename…").icon(Icon::new(Lucide::Pencil)).on_click(
                             move |_, window, cx| {
@@ -1233,6 +1520,13 @@ impl Workspace {
                         ))
                     })
                     .when(!changes, |menu| menu.separator())
+                    .item(
+                        PopupMenuItem::new(if pinned { "Unpin Tab" } else { "Pin Tab" })
+                            .icon(Icon::new(if pinned { Lucide::PinOff } else { Lucide::Pin }))
+                            .on_click(move |_, _, cx| {
+                                let _ = pin.update(cx, |workspace, cx| workspace.toggle_pin(ix, cx));
+                            }),
+                    )
                     .item(PopupMenuItem::new("Close Tab").icon(IconName::Close).on_click(move |_, window, cx| {
                         let _ = close.update(cx, |workspace, cx| workspace.request_close_tab(ix, window, cx));
                     }))
@@ -1269,6 +1563,14 @@ impl Workspace {
 
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let unlocked = Store::global(cx).read(cx).is_unlocked();
+        // Pull requests and issues show for a signed-in user whose shell is in a GitHub repository.
+        let github = self
+            .active_terminal()
+            .filter(|_| Store::global(cx).read(cx).account.signed_in || fake_github())
+            .and_then(|tab| {
+                let read = tab.read(cx);
+                read.repo(cx).map(|repo| (tab.clone(), repo, read.github_kind(cx)))
+            });
         TitleBar::new()
             // The kit keeps room for the window buttons, which full screen hides.
             .when(window.is_fullscreen(), |bar| bar.pl_0())
@@ -1279,6 +1581,31 @@ impl Workspace {
                     .pr_2()
                     .gap_2()
                     .child(self.render_tab_strip(cx))
+                    .when_some(github, |bar, (tab, repo, shown)| {
+                        let issues_tab = tab.clone();
+                        bar.child(
+                            Button::new("github-pulls")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(Lucide::GitPullRequest))
+                                .selected(shown == Some(Kind::Pulls))
+                                .tooltip(format!("Pull requests of {}", repo.full_name()))
+                                .on_click(move |_, window, cx| {
+                                    tab.update(cx, |tab, cx| tab.toggle_github(Kind::Pulls, window, cx));
+                                }),
+                        )
+                        .child(
+                            Button::new("github-issues")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(Lucide::CircleDot))
+                                .selected(shown == Some(Kind::Issues))
+                                .tooltip(format!("Issues of {}", repo.full_name()))
+                                .on_click(move |_, window, cx| {
+                                    issues_tab.update(cx, |tab, cx| tab.toggle_github(Kind::Issues, window, cx));
+                                }),
+                        )
+                    })
                     .when(self.side_panel_fits(cx), |bar| {
                         bar.child(
                             Button::new("side-panel")
@@ -1439,13 +1766,6 @@ impl Workspace {
                 .get_or_insert_with(|| cx.new(|cx| KnownHostsPage::new(window, cx)))
                 .clone()
                 .into_any_element(),
-            Page::Logs => {
-                let workspace = cx.entity().downgrade();
-                self.logs
-                    .get_or_insert_with(|| cx.new(|cx| LogsPage::new(workspace, window, cx)))
-                    .clone()
-                    .into_any_element()
-            }
             Page::Sftp => self
                 .sftp
                 .get_or_insert_with(|| cx.new(|cx| SftpPage::new(window, cx)))
@@ -1566,12 +1886,17 @@ impl Render for Workspace {
                     w.start_rename(ix, window, cx);
                 }
             }))
+            .on_action(cx.listener(|w, _: &TogglePinTab, _, cx| {
+                if let Some(ix) = w.active.filter(|_| w.section == Section::Cli) {
+                    w.toggle_pin(ix, cx);
+                }
+            }))
             .on_action(cx.listener(|w, _: &ShowHosts, window, cx| w.show_page(Page::Hosts, window, cx)))
             .on_action(cx.listener(|w, _: &ShowKeychain, window, cx| w.show_page(Page::Keychain, window, cx)))
             .on_action(cx.listener(|w, _: &ShowSnippets, window, cx| w.show_page(Page::Snippets, window, cx)))
             .on_action(cx.listener(|w, _: &ShowForwarding, window, cx| w.show_page(Page::Forwarding, window, cx)))
             .on_action(cx.listener(|w, _: &ShowKnownHosts, window, cx| w.show_page(Page::KnownHosts, window, cx)))
-            .on_action(cx.listener(|w, _: &ShowLogs, window, cx| w.show_page(Page::Logs, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowLogs, window, cx| w.show_logs(window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab1, window, cx| w.select_tab(0, window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab2, window, cx| w.select_tab(1, window, cx)))
             .on_action(cx.listener(|w, _: &SelectTab3, window, cx| w.select_tab(2, window, cx)))
@@ -1610,4 +1935,17 @@ impl Render for Workspace {
                 )
             })
     }
+}
+
+/// `text` in single quotes, for a POSIX shell.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// UI check builds pointed at a fake GitHub show its buttons without signing in.
+fn fake_github() -> bool {
+    #[cfg(feature = "snapshot")]
+    return crate::github::api::fake_api().is_some();
+    #[cfg(not(feature = "snapshot"))]
+    false
 }

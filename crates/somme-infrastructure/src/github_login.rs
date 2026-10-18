@@ -39,15 +39,20 @@ fn random() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Opens GitHub's sign-in page with `open` and waits for the browser to come back.
-pub async fn sign_in(client_id: &str, open: impl FnOnce(&str) -> std::io::Result<()>) -> Result<Grant, CloudError> {
+/// Opens GitHub's sign-in page with `open` and waits for the browser to come
+/// back. `scope` asks for more than who the user is, like `repo`.
+pub async fn sign_in(
+    client_id: &str,
+    scope: Option<&str>,
+    open: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Result<Grant, CloudError> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(unreachable)?;
     let port = listener.local_addr().map_err(unreachable)?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let state = random();
     let code_verifier = Zeroizing::new(random());
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
-    let url = Url::parse_with_params(
+    let mut url = Url::parse_with_params(
         AUTHORIZE_URL,
         [
             ("client_id", client_id),
@@ -58,6 +63,9 @@ pub async fn sign_in(client_id: &str, open: impl FnOnce(&str) -> std::io::Result
         ],
     )
     .map_err(unreachable)?;
+    if let Some(scope) = scope {
+        url.query_pairs_mut().append_pair("scope", scope);
+    }
     open(url.as_str()).map_err(|err| CloudError::Unreachable(format!("cannot open the browser: {err}")))?;
     let code = tokio::time::timeout(WAIT, wait_for_code(&listener, &state))
         .await
@@ -174,7 +182,7 @@ mod tests {
             "/callback?code=stale&state=old".into(),
             "/callback?code=good%2Bcode&state=STATE".into(),
         ]);
-        let grant = sign_in("client", open).await.unwrap();
+        let grant = sign_in("client", None, open).await.unwrap();
         assert_eq!(grant.code.as_str(), "good+code");
         assert!(grant.redirect_uri.starts_with("http://127.0.0.1:"));
         assert_eq!(grant.code_verifier.len(), 43);
@@ -187,6 +195,6 @@ mod tests {
     #[tokio::test]
     async fn declining_on_github_stops_the_sign_in() {
         let (open, _) = browser(vec!["/callback?error=access_denied&state=STATE".into()]);
-        assert!(matches!(sign_in("client", open).await, Err(CloudError::Rejected(_))));
+        assert!(matches!(sign_in("client", None, open).await, Err(CloudError::Rejected(_))));
     }
 }

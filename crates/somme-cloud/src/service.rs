@@ -6,7 +6,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
-use crate::domain::{Account, CloudError, GitHubConfig, GitHubSignIn, SessionView, SyncCredentials};
+use crate::domain::{Account, CloudError, GitHubConfig, GitHubSignIn, GitHubToken, SessionView, SyncCredentials};
 use crate::github::GitHub;
 use crate::platform::Provisioner;
 use crate::store::AccountStore;
@@ -39,6 +39,13 @@ pub struct AccountService {
     token_ttl_days: u32,
 }
 
+fn check(request: &GitHubSignIn) -> Result<(), CloudError> {
+    if request.code.is_empty() || request.code_verifier.is_empty() || !is_loopback_callback(&request.redirect_uri) {
+        return Err(CloudError::Invalid("bad sign-in request".into()));
+    }
+    Ok(())
+}
+
 /// The app listens on the loopback address, at a port of its choosing.
 fn is_loopback_callback(uri: &str) -> bool {
     uri.strip_prefix("http://127.0.0.1:")
@@ -68,15 +75,36 @@ impl AccountService {
     }
 
     pub async fn sign_in_with_github(&self, request: &GitHubSignIn) -> Result<SessionView, CloudError> {
-        if request.code.is_empty() || request.code_verifier.is_empty() || !is_loopback_callback(&request.redirect_uri) {
-            return Err(CloudError::Invalid("bad sign-in request".into()));
-        }
+        check(request)?;
         let user = self
             .github
             .user(&request.code, &request.redirect_uri, &request.code_verifier)
             .await?;
         let account = self.store.sign_in(&user, now()).await?;
         self.open_session(&account).await
+    }
+
+    /// Trades a code the signed-in user approved in the browser for a GitHub
+    /// token the app keeps, to show their pull requests and issues. It must
+    /// be the same GitHub user, so a code from someone else is refused.
+    pub async fn github_token(&self, session: &str, request: &GitHubSignIn) -> Result<GitHubToken, CloudError> {
+        let account = self.authenticate(session).await?;
+        check(request)?;
+        let access = self
+            .github
+            .access(&request.code, &request.redirect_uri, &request.code_verifier)
+            .await?;
+        if access.user.id != account.github_id {
+            self.github.revoke(&access.token).await;
+            return Err(CloudError::Invalid(format!(
+                "That is GitHub user {}, but Somme is signed in as {}.",
+                access.user.login, account.login
+            )));
+        }
+        Ok(GitHubToken {
+            token: access.token,
+            scope: access.scope,
+        })
     }
 
     pub async fn logout(&self, token: &str) -> Result<(), CloudError> {
@@ -144,6 +172,7 @@ pub mod tests {
 
     use super::*;
     use crate::domain::GitHubUser;
+    use crate::github::GitHubAccess;
 
     #[derive(Default)]
     pub struct FakeProvisioner {
@@ -162,7 +191,10 @@ pub mod tests {
         }
     }
 
-    pub struct FakeGitHub;
+    #[derive(Default)]
+    pub struct FakeGitHub {
+        pub revoked: Mutex<Vec<String>>,
+    }
 
     #[async_trait]
     impl GitHub for FakeGitHub {
@@ -180,6 +212,19 @@ pub mod tests {
                 avatar_url: Some(format!("https://avatars.githubusercontent.com/u/{id}")),
             })
         }
+
+        async fn access(&self, code: &str, redirect_uri: &str, verifier: &str) -> Result<GitHubAccess, CloudError> {
+            let user = self.user(code, redirect_uri, verifier).await?;
+            Ok(GitHubAccess {
+                token: format!("gho_for_{}", user.login),
+                user,
+                scope: "repo".into(),
+            })
+        }
+
+        async fn revoke(&self, token: &str) {
+            self.revoked.lock().unwrap().push(token.to_owned());
+        }
     }
 
     pub fn sign_in(code: &str) -> GitHubSignIn {
@@ -191,10 +236,31 @@ pub mod tests {
     }
 
     pub async fn service() -> (tempfile::TempDir, AccountService, Arc<FakeProvisioner>) {
+        let (dir, svc, fake, _) = service_with_github().await;
+        (dir, svc, fake)
+    }
+
+    pub async fn service_with_github() -> (tempfile::TempDir, AccountService, Arc<FakeProvisioner>, Arc<FakeGitHub>) {
         let dir = tempfile::tempdir().unwrap();
         let store = AccountStore::open(dir.path()).await.unwrap();
         let fake = Arc::new(FakeProvisioner::default());
-        (dir, AccountService::new(store, fake.clone(), Arc::new(FakeGitHub), 7), fake)
+        let github = Arc::new(FakeGitHub::default());
+        (dir, AccountService::new(store, fake.clone(), github.clone(), 7), fake, github)
+    }
+
+    #[tokio::test]
+    async fn hands_out_a_github_token_only_for_the_signed_in_user() {
+        let (_dir, svc, _, github) = service_with_github().await;
+        let session = svc.sign_in_with_github(&sign_in("user-4")).await.unwrap();
+        let token = svc.github_token(&session.token, &sign_in("user-4")).await.unwrap();
+        assert_eq!(token.token, "gho_for_user4");
+        assert_eq!(token.scope, "repo");
+        assert!(github.revoked.lock().unwrap().is_empty());
+
+        let err = svc.github_token(&session.token, &sign_in("user-5")).await.unwrap_err();
+        assert!(matches!(err, CloudError::Invalid(_)), "another GitHub user");
+        assert_eq!(*github.revoked.lock().unwrap(), ["gho_for_user5"]);
+        assert!(matches!(svc.github_token("bogus", &sign_in("user-4")).await, Err(CloudError::Unauthorized)));
     }
 
     #[tokio::test]

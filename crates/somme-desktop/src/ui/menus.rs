@@ -16,7 +16,7 @@ use crate::ui::native;
 use crate::ui::workspace::{
     CloseTab, ClosePane, FocusNextPane, FocusPreviousPane, LockVault, NewEditor, NewLocalTerminal, NextTab, OpenFile,
     OpenSettings,
-    PreviousTab, Quit, RenameTab, ShowForwarding, ShowHosts, ShowKeychain, ShowKnownHosts, ShowLogs,
+    PreviousTab, Quit, RenameTab, ShowForwarding, TogglePinTab, ShowHosts, ShowKeychain, ShowKnownHosts, ShowLogs,
     ShowSnippets, SplitDown, SplitLeft, SplitRight, SplitUp, ToggleBroadcast, TogglePalette, ToggleSidePanel,
 };
 
@@ -170,6 +170,7 @@ fn menus() -> Vec<Menu> {
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Side Panel", ToggleSidePanel),
+            MenuItem::action("Session Logs", ShowLogs),
             MenuItem::separator(),
             MenuItem::action("Zoom In", ZoomIn),
             MenuItem::action("Zoom Out", ZoomOut),
@@ -182,6 +183,7 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("Previous Tab", PreviousTab),
             MenuItem::separator(),
             MenuItem::action("Rename Tab…", RenameTab),
+            MenuItem::action("Pin or Unpin Tab", TogglePinTab),
             MenuItem::action("Broadcast Input to All Panes", ToggleBroadcast),
             MenuItem::separator(),
             MenuItem::action("Next Pane", FocusNextPane),
@@ -202,7 +204,6 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("Snippets", ShowSnippets),
             MenuItem::action("Port Forwarding", ShowForwarding),
             MenuItem::action("Known Hosts", ShowKnownHosts),
-            MenuItem::action("Logs", ShowLogs),
             MenuItem::separator(),
             MenuItem::action("Lock Saved Servers and Keys", LockVault),
         ]),

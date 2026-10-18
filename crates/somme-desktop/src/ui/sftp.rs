@@ -18,6 +18,7 @@ use gpui_kit::{
 use somme_application::dto::SftpEntryView;
 use somme_domain::Id;
 
+use crate::host_os;
 use crate::runtime;
 use crate::sftp::{self, Endpoint, FsResult};
 use crate::store::Store;
@@ -794,7 +795,7 @@ impl FilePane {
                         };
                         choice(
                             SharedString::from(format!("pick-{id}")),
-                            host_badge(host.color.as_deref(), Icon::new(Lucide::Server), cx).into_any_element(),
+                            host_os::badge(&host, cx).into_any_element(),
                             host.label.clone(),
                             detail,
                         )

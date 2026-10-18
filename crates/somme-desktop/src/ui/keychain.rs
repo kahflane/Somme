@@ -11,7 +11,7 @@ use gpui_kit::{
     ParentElement as _, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use somme_application::dto::{IdentityInput, IdentityView, KeyGenerateInput, KeyImportInput, KeyView, SecretUpdate};
+use somme_application::dto::{IdentityInput, IdentityView, KeyImportInput, KeyView, SecretUpdate};
 use somme_domain::Id;
 
 use crate::store::{Store, mutate, mutate_weak, report};
@@ -19,7 +19,7 @@ use crate::ui::common::{
     Lucide, card, confirm_delete, copy_text, empty_state, form_dialog, host_badge, labeled, notify_error,
     page_header, subtle,
 };
-use crate::ui::fields::{Choice, ChoiceState, choice_select, key_choices, selected};
+use crate::ui::fields::{ChoiceState, choice_select, key_choices, selected};
 
 /// SSH keys and identities (saved user name + password/key pairs).
 pub struct KeychainPage {
@@ -46,68 +46,6 @@ impl KeychainPage {
 
     fn query(&self, cx: &App) -> String {
         self.search.read(cx).value().trim().to_lowercase()
-    }
-
-    fn generate_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let label = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Laptop key"));
-        let algorithms = vec![
-            Choice {
-                value: "ed25519",
-                label: "Ed25519 (recommended)".into(),
-            },
-            Choice {
-                value: "ecdsa",
-                label: "ECDSA".into(),
-            },
-            Choice {
-                value: "rsa",
-                label: "RSA".into(),
-            },
-        ];
-        let algorithm = choice_select(algorithms, &"ed25519", window, cx);
-        let page = cx.entity().downgrade();
-        let focus = label.focus_handle(cx);
-        form_dialog(
-            "Generate Key",
-            "Generate",
-            420.,
-            Some(focus),
-            {
-                let label = label.clone();
-                let algorithm = algorithm.clone();
-                move |_, _| {
-                    v_flex()
-                        .gap_3()
-                        .child(labeled("Label", Input::new(&label)))
-                        .child(labeled("Type", Select::new(&algorithm)))
-                        .into_any_element()
-                }
-            },
-            move |window, cx| {
-                let text = label.read(cx).value().trim().to_owned();
-                if text.is_empty() {
-                    return false;
-                }
-                let input = KeyGenerateInput {
-                    label: text,
-                    algorithm: selected(&algorithm, cx).unwrap_or("ed25519").to_owned(),
-                };
-                mutate_weak(
-                    &page,
-                    window,
-                    cx,
-                    move |services| async move { services.keys.generate(input).await },
-                    |_, result, window, cx| {
-                        if let Err(err) = result {
-                            notify_error(window, cx, "Could not generate key", err);
-                        }
-                    },
-                );
-                true
-            },
-            window,
-            cx,
-        );
     }
 
     fn rename_key(&mut self, key: KeyView, window: &mut Window, cx: &mut Context<Self>) {
@@ -196,29 +134,19 @@ impl KeychainPage {
                 ),
             )
             .child(
-                Button::new("generate-key")
+                Button::new("import-key")
                     .primary()
                     .small()
-                    .icon(IconName::Plus)
-                    .label("Generate Key")
-                    .on_click(cx.listener(|page, _, window, cx| page.generate_key(window, cx))),
+                    .icon(Icon::new(Lucide::FileKey))
+                    .label("Import Key")
+                    .on_click(|_, window, cx| KeyImport::open(window, cx)),
             )
             .child(
-                Button::new("keychain-more")
+                Button::new("new-identity")
                     .small()
-                    .icon(IconName::Ellipsis)
-                    .dropdown_menu(|menu, _, _| {
-                        menu.item(
-                            PopupMenuItem::new("Import Key")
-                                .icon(Icon::new(Lucide::FileKey))
-                                .on_click(|_, window, cx| KeyImport::open(window, cx)),
-                        )
-                        .item(
-                            PopupMenuItem::new("New Identity")
-                                .icon(Icon::new(Lucide::UserPlus))
-                                .on_click(|_, window, cx| IdentityEditor::open(None, window, cx)),
-                        )
-                    }),
+                    .icon(Icon::new(Lucide::UserPlus))
+                    .label("New Identity")
+                    .on_click(|_, window, cx| IdentityEditor::open(None, window, cx)),
             )
     }
 
@@ -401,7 +329,7 @@ impl Render for KeychainPage {
                 empty_state(
                     Icon::new(Lucide::KeyRound),
                     "No keys yet",
-                    "Generate a new SSH key, or import one you already have. Identities save a user name with a password or key.",
+                    "Import an SSH key you already have. Identities save a user name with a password or key.",
                     cx,
                 )
                 .child(
@@ -409,14 +337,8 @@ impl Render for KeychainPage {
                         .gap_2()
                         .pt_2()
                         .child(
-                            Button::new("empty-generate")
-                                .primary()
-                                .icon(IconName::Plus)
-                                .label("Generate Key")
-                                .on_click(cx.listener(|page, _, window, cx| page.generate_key(window, cx))),
-                        )
-                        .child(
                             Button::new("empty-import")
+                                .primary()
                                 .icon(Icon::new(Lucide::FileKey))
                                 .label("Import Key")
                                 .on_click(|_, window, cx| KeyImport::open(window, cx)),

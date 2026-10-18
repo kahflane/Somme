@@ -8,11 +8,11 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::fs::Metadata;
 use russh_sftp::protocol::StatusCode;
-use somme_application::ports::{GatewayError, RemoteEntry, RemoteFs};
+use somme_application::ports::{GatewayError, RemoteEntry, RemoteFs, RemoteHit};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 
 use crate::ssh::connect::Connection;
-use crate::ssh::{connection_error, sudo};
+use crate::ssh::{connection_error, search, sudo};
 
 fn transfer(err: impl std::fmt::Display) -> GatewayError {
     GatewayError::Transfer(err.to_string())
@@ -193,6 +193,17 @@ impl RemoteFs for SftpFs {
 
     async fn write_as_root(&self, path: &str, data: &[u8], password: Option<&str>) -> Result<(), GatewayError> {
         sudo::write(&self.conn, path, data, password).await
+    }
+
+    async fn search(
+        &self,
+        dir: &str,
+        query: &str,
+        text: bool,
+        ignore_case: bool,
+        limit: usize,
+    ) -> Result<Vec<RemoteHit>, GatewayError> {
+        search::search(&self.conn, dir, query, text, ignore_case, limit).await
     }
 
     async fn close(&self) {

@@ -99,6 +99,7 @@ impl Store {
                 refresh_generation: 0,
             };
             store.load_account(cx);
+            store.refresh(cx);
             store
         });
         cx.set_global(GlobalStore(store.clone()));
@@ -156,28 +157,30 @@ impl Store {
     pub fn set_vault(&mut self, status: VaultStatus, cx: &mut Context<Self>) {
         let was_unlocked = self.is_unlocked();
         self.vault = Some(status);
-        if status.unlocked {
-            self.refresh(cx);
-        } else if was_unlocked {
+        if was_unlocked && !status.unlocked {
             self.clear_lists();
         }
+        self.refresh(cx);
         cx.emit(StoreEvent::VaultChanged);
         cx.notify();
     }
 
+    /// Snippets stay: they are not secret, and local terminals use them
+    /// without the master password.
     fn clear_lists(&mut self) {
         self.groups.clear();
         self.hosts.clear();
         self.identities.clear();
         self.keys.clear();
-        self.snippets.clear();
         self.forwards.clear();
         self.known_hosts.clear();
     }
 
-    /// Reloads every list. Older reloads that finish late are ignored.
+    /// Reloads every list, or only snippets while the vault is locked. Older
+    /// reloads that finish late are ignored.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if !self.is_unlocked() {
+            self.refresh_snippets(cx);
             return;
         }
         self.refresh_generation += 1;
@@ -205,6 +208,26 @@ impl Store {
                 }
                 store.active_forwards = active.into_iter().collect();
                 store.sync = store.services.sync.status();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_snippets(&mut self, cx: &mut Context<Self>) {
+        self.refresh_generation += 1;
+        let generation = self.refresh_generation;
+        let snippets = self.services.snippets.clone();
+        cx.spawn(async move |this, cx| {
+            let list = runtime::io(async move { snippets.list().await }).await;
+            let _ = this.update(cx, |store, cx| {
+                if store.refresh_generation != generation {
+                    return;
+                }
+                match list {
+                    Ok(list) => store.snippets = list,
+                    Err(err) => store.load_error = Some(err.to_string()),
+                }
                 cx.notify();
             });
         })
@@ -297,7 +320,7 @@ impl Store {
     }
 }
 
-fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
+pub(crate) fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => Some(ImageFormat::Png),
         [0xFF, 0xD8, 0xFF, ..] => Some(ImageFormat::Jpeg),

@@ -105,7 +105,7 @@ fn command(script: &str, path: &str) -> String {
 }
 
 /// `text` in single quotes, for any POSIX shell.
-fn quote(text: &str) -> String {
+pub(super) fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 

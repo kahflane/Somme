@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use somme_application::ports::{
-    CloudAccounts, CloudError, CloudProfile, CloudSession, GatewayError, SessionStore, SyncCredentials,
+    CloudAccounts, CloudError, CloudProfile, CloudSession, GatewayError, GitHubAccess, SessionStore, SyncCredentials,
 };
 use somme_domain::now;
 use tokio::sync::Mutex;
@@ -24,6 +24,8 @@ pub const DEFAULT_CLOUD_URL: &str = "https://somme-cloud.fly.dev";
 /// Profile pictures only come from GitHub.
 const AVATAR_HOST: &str = "avatars.githubusercontent.com";
 const AVATAR_SIZE: &str = "96";
+/// Read and write access to the user's repositories, for pull requests and issues.
+const REPO_SCOPE: &str = "repo";
 const MAX_AVATAR: usize = 2 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -55,6 +57,12 @@ struct CredentialsBody {
     url: String,
     token: String,
     expires_at: i64,
+}
+
+#[derive(Deserialize)]
+struct TokenBody {
+    token: String,
+    scope: String,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +119,7 @@ impl CloudAccounts for HttpCloudClient {
             return Err(Self::rejection(response).await);
         }
         let config: GitHubConfig = response.json().await.map_err(unreachable)?;
-        let grant = github_login::sign_in(&config.client_id, |page: &str| open::that_detached(page)).await?;
+        let grant = github_login::sign_in(&config.client_id, None, |page: &str| open::that_detached(page)).await?;
         let response = self
             .http
             .post(format!("{}/v1/sessions/github", self.base))
@@ -171,6 +179,44 @@ impl CloudAccounts for HttpCloudClient {
             url: body.url,
             token: Zeroizing::new(body.token),
             expires_at: body.expires_at,
+        })
+    }
+
+    async fn github_access(&self, session: &CloudSession) -> Result<GitHubAccess, CloudError> {
+        let response = self
+            .http
+            .get(format!("{}/v1/auth/github", self.base))
+            .send()
+            .await
+            .map_err(unreachable)?;
+        if !response.status().is_success() {
+            return Err(Self::rejection(response).await);
+        }
+        let config: GitHubConfig = response.json().await.map_err(unreachable)?;
+        let grant =
+            github_login::sign_in(&config.client_id, Some(REPO_SCOPE), |page: &str| open::that_detached(page)).await?;
+        let response = self
+            .http
+            .post(format!("{}/v1/github/token", self.base))
+            .bearer_auth(session.token.as_str())
+            .json(&GitHubBody {
+                code: &grant.code,
+                redirect_uri: &grant.redirect_uri,
+                code_verifier: &grant.code_verifier,
+            })
+            .send()
+            .await
+            .map_err(unreachable)?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(CloudError::SessionExpired);
+        }
+        if !response.status().is_success() {
+            return Err(Self::rejection(response).await);
+        }
+        let body: TokenBody = response.json().await.map_err(unreachable)?;
+        Ok(GitHubAccess {
+            token: Zeroizing::new(body.token),
+            scope: body.scope,
         })
     }
 

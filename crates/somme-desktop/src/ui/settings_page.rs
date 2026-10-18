@@ -4,16 +4,21 @@ use gpui_kit::component::setting::{
 };
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, h_flex, h_resizable, resizable_panel,
+    v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, Context, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    StatefulInteractiveElement as _, SharedString, Styled as _, Subscription, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::settings::{Appearance, BellSetting, CursorShapeSetting, Settings};
 use crate::store::{Store, mutate_weak, report};
 use crate::ui::common::{APP_NAME, Lucide, ago, avatar, notify_error, notify_ok};
+use crate::ui::agent_logs::{AgentLogsEvent, AgentLogsPanel, RunDetailEvent, RunDetailPanel};
+use crate::ui::agents::agents_page;
+use crate::ui::credits::{ARTWORK, CreditsList};
 use crate::ui::native;
 use crate::ui::theme_picker::{self, section};
 
@@ -24,9 +29,14 @@ pub struct SettingsPage {
     /// is the only way to jump to another page from outside.
     visit: usize,
     start_page: usize,
+    /// The agents' script log, beside the settings.
+    logs: Option<(Entity<AgentLogsPanel>, Subscription)>,
+    /// One run from the log, beside it.
+    run: Option<(Entity<RunDetailPanel>, Subscription)>,
 }
 
 const ACCOUNT_PAGE: usize = 5;
+const AGENTS_PAGE: usize = 6;
 
 impl SettingsPage {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -43,7 +53,54 @@ impl SettingsPage {
             fonts: Vec::new(),
             visit: 0,
             start_page: 0,
+            logs: None,
+            run: None,
         }
+    }
+
+    pub fn open_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.logs.is_some() {
+            return;
+        }
+        let panel = cx.new(|cx| AgentLogsPanel::new(window, cx));
+        let subscription = cx.subscribe_in(&panel, window, |page, _, event: &AgentLogsEvent, _, cx| {
+            match event {
+                AgentLogsEvent::Close => {
+                    page.logs = None;
+                    page.run = None;
+                    page.stay_on_agents();
+                }
+                AgentLogsEvent::Open(id) => page.open_run(id.clone(), cx),
+            }
+            cx.notify();
+        });
+        self.logs = Some((panel, subscription));
+        self.stay_on_agents();
+        cx.notify();
+    }
+
+    /// Adding or removing a panel builds the settings view again, which
+    /// would open its first page, so it is sent back to Agents.
+    fn stay_on_agents(&mut self) {
+        self.visit += 1;
+        self.start_page = AGENTS_PAGE;
+    }
+
+    fn open_run(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Some((run, _)) = &self.run {
+            run.update(cx, |run, cx| run.show(id, cx));
+            return;
+        }
+        let panel = cx.new(|cx| RunDetailPanel::new(id, cx));
+        let subscription = cx.subscribe(&panel, |page, _, event: &RunDetailEvent, cx| match event {
+            RunDetailEvent::Close => {
+                page.run = None;
+                page.stay_on_agents();
+                cx.notify();
+            }
+        });
+        self.run = Some((panel, subscription));
+        self.stay_on_agents();
     }
 
     pub fn show_account(&mut self, cx: &mut Context<Self>) {
@@ -389,7 +446,7 @@ fn privacy_page() -> SettingPage {
             )
             .item(
                 SettingItem::new("Record session logs", switch(|s| s.log_sessions, |s, v| s.log_sessions = v))
-                    .description("Saves what each terminal prints. Open them from Logs."),
+                    .description("Saves what each terminal prints. Open them from the side panel's Logs tab."),
             ),
     )
 }
@@ -561,10 +618,42 @@ fn sign_in(page: WeakEntity<SettingsPage>, window: &mut Window, cx: &mut App) {
     );
 }
 
+fn credits_page() -> SettingPage {
+    // One group, so the sidebar shows Credits alone, without sub items.
+    SettingPage::new("Credits").icon(Icon::new(Lucide::Heart)).group(
+        SettingGroup::new()
+            .title("Open source")
+            .description(format!("{APP_NAME} is built on open source work. Thank you to everyone behind it."))
+            .item(SettingItem::render(|_, window, cx| {
+                let theme = cx.theme().clone();
+                let heading = |text: SharedString| div().pt_2().pb_1().text_sm().font_semibold().child(text);
+                let artwork = ARTWORK.iter().map(|(name, license, link)| {
+                    h_flex()
+                        .id(*name)
+                        .h(px(30.))
+                        .px_2()
+                        .gap_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(theme.accent))
+                        .child(div().flex_1().text_sm().child(*name))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(*license))
+                        .on_click(move |_, _, cx| cx.open_url(link))
+                });
+                v_flex()
+                    .w_full()
+                    .child(heading("Icons and logos".into()))
+                    .children(artwork)
+                    .child(heading("Libraries".into()))
+                    .child(window.use_keyed_state("credits-list", cx, |window, cx| CreditsList::new(window, cx)))
+            })),
+    )
+}
+
 impl Render for SettingsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let page = cx.entity().downgrade();
-        div().size_full().child(
+        let settings = div().size_full().child(
             SettingsView::new(("app-settings", self.visit))
                 .default_selected_index(SelectIndex {
                     page_ix: self.start_page,
@@ -577,8 +666,19 @@ impl Render for SettingsPage {
                     editor_page(),
                     security_page(),
                     privacy_page(),
-                    account_page(page),
+                    account_page(page.clone()),
+                    agents_page(page),
+                    credits_page(),
                 ]),
-        )
+        );
+        let Some((logs, _)) = &self.logs else { return settings.into_any_element() };
+        // A new id for each set of panels, so each keeps its own sizes.
+        h_resizable(if self.run.is_some() { "settings-logs-3" } else { "settings-logs" })
+            .child(resizable_panel().size_range(px(160.)..px(2000.)).child(settings))
+            .child(resizable_panel().size(px(540.)).flex_none().size_range(px(320.)..px(1600.)).child(logs.clone()))
+            .when_some(self.run.as_ref(), |group, (run, _)| {
+                group.child(resizable_panel().size(px(400.)).flex_none().size_range(px(300.)..px(1400.)).child(run.clone()))
+            })
+            .into_any_element()
     }
 }

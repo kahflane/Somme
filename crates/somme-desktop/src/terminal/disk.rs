@@ -3,12 +3,18 @@
 //! thread.
 
 use std::future::Future;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use somme_application::ports::{GatewayError, RemoteFs};
+use somme_application::ports::{GatewayError, RemoteFs, RemoteHit};
 
 use crate::runtime;
+
+/// How often a server search looks whether it should stop.
+const STOP_CHECK: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub enum Disk {
@@ -163,9 +169,37 @@ impl Disk {
                 if size > limit {
                     return Err(DiskError::Other(too_big(size, limit)));
                 }
-                Ok(std::fs::read(path)?)
+                // Something with no size, like a device, may never end.
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)?.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > limit {
+                    return Err(DiskError::Other(too_big(bytes.len() as u64, limit)));
+                }
+                Ok(bytes)
             }
             Disk::Remote { files, .. } => Ok(block(files.read(&remote(path), limit))?),
+        }
+    }
+
+    /// A file's size. Folders are refused, and on this computer so is anything
+    /// that is not a plain file, like a device or a pipe, as reading it may
+    /// never end. A server doesn't tell those apart, so read them with a limit.
+    pub fn size(&self, path: &Path) -> Result<u64, DiskError> {
+        match self {
+            Disk::Local => {
+                let meta = std::fs::metadata(path)?;
+                if !meta.is_file() {
+                    return Err(DiskError::Other("It is not a regular file.".into()));
+                }
+                Ok(meta.len())
+            }
+            Disk::Remote { files, .. } => {
+                let entry = block(files.stat(&remote(path)))?;
+                if entry.is_dir {
+                    return Err(DiskError::Other("It is a folder.".into()));
+                }
+                Ok(entry.size)
+            }
         }
     }
 
@@ -198,6 +232,34 @@ impl Disk {
             Disk::Local => Err(no_local_sudo()),
             Disk::Remote { files, .. } => Ok(block(files.write_as_root(&remote(path), bytes, password))?),
         }
+    }
+
+    /// Looks for files on a server, as [`crate::search`] does here. Setting
+    /// `stop` ends the search there too.
+    pub fn server_search(
+        &self,
+        dir: &Path,
+        query: &str,
+        text: bool,
+        ignore_case: bool,
+        limit: usize,
+        stop: &AtomicBool,
+    ) -> Result<Vec<RemoteHit>, DiskError> {
+        let Disk::Remote { files, .. } = self else {
+            return Err(DiskError::Other("This is not a server.".into()));
+        };
+        let dir = remote(dir);
+        block(async {
+            let stopped = async {
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(STOP_CHECK).await;
+                }
+            };
+            tokio::select! {
+                hits = files.search(&dir, query, text, ignore_case, limit) => Ok(hits?),
+                () = stopped => Ok(Vec::new()),
+            }
+        })
     }
 
     /// Runs `work` with this disk on a thread that may block.
@@ -268,9 +330,10 @@ pub mod fake {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use somme_application::ports::{GatewayError, RemoteEntry, RemoteFs};
+    use somme_application::ports::{GatewayError, RemoteEntry, RemoteFs, RemoteHit};
 
     use super::Disk;
+    use crate::search::{self, Find, Hit};
 
     pub const HOME: &str = "/home/me";
 
@@ -370,6 +433,28 @@ pub mod fake {
 
         async fn write(&self, path: &str, data: &[u8]) -> Result<(), GatewayError> {
             std::fs::write(self.local(path), data).map_err(error)
+        }
+
+        async fn search(
+            &self,
+            dir: &str,
+            query: &str,
+            text: bool,
+            _: bool,
+            limit: usize,
+        ) -> Result<Vec<RemoteHit>, GatewayError> {
+            let found = std::sync::Mutex::new(Vec::new());
+            let find = if text { Find::Text } else { Find::Names };
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            search::walk(&[self.local(dir)], find, query, &stop, &|hit: Hit| found.lock().unwrap().push(hit));
+            let hits = found.into_inner().unwrap().into_iter().take(limit);
+            Ok(hits
+                .map(|hit| RemoteHit {
+                    path: format!("/{}", hit.path.strip_prefix(&self.root).unwrap().to_string_lossy()),
+                    is_dir: hit.folder,
+                    line: hit.line,
+                })
+                .collect())
         }
 
         async fn close(&self) {}

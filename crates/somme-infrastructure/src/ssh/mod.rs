@@ -1,18 +1,21 @@
 mod auth;
 mod connect;
+mod exec;
 mod forward;
 mod handler;
 mod hooks;
+mod search;
 mod sftp;
 mod shell;
 mod sudo;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use somme_application::ports::{
-    ConnectContext, ConnectPlan, ForwardSpec, GatewayError, OutputSink, RemoteFs, SshGateway,
-    StopNotifier, TermSize, Terminal, Tunnel,
+    ConnectContext, ConnectPlan, ForwardSpec, GatewayError, OutputSink, RemoteFs, ScriptOutput,
+    SshGateway, StopNotifier, TermSize, Terminal, Tunnel,
 };
 
 use crate::ssh::connect::Connection;
@@ -56,6 +59,20 @@ impl SshGateway for RusshGateway {
         Ok(Arc::new(
             forward::SshTunnel::start(conn, remote_forwards, spec, on_stop).await?,
         ))
+    }
+
+    async fn run_script(
+        &self,
+        plan: ConnectPlan,
+        ctx: ConnectContext,
+        script: &str,
+        timeout: Duration,
+        limit: usize,
+    ) -> Result<ScriptOutput, GatewayError> {
+        let conn = Connection::open(&plan, &ctx, RemoteForwards::default()).await?;
+        let out = exec::run(&conn, script, timeout, limit).await;
+        conn.disconnect().await;
+        out
     }
 }
 

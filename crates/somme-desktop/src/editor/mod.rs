@@ -8,5 +8,6 @@ pub mod pane;
 pub mod scratch;
 pub mod sudo;
 pub mod system_open;
+pub mod tools;
 
 pub use pane::{EditorPane, EditorPaneEvent};

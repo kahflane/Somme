@@ -1,11 +1,14 @@
+use std::sync::{Mutex, PoisonError};
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use keyring::Entry;
-use somme_application::ports::{CryptoError, KeyStore, MasterKey};
+use somme_application::ports::{CryptoError, GatewayError, KeyStore, MasterKey, SecretStore};
 use zeroize::Zeroizing;
 
 const SERVICE: &str = "app.somme.vault";
 const MASTER_KEY_USER: &str = "master-key";
+const GITHUB_TOKEN_USER: &str = "github-token";
 
 pub struct KeyringStore {
     service: String,
@@ -61,5 +64,44 @@ impl KeyStore for KeyringStore {
 
     fn clear(&self) -> Result<(), CryptoError> {
         self.delete_secret()
+    }
+}
+
+/// One secret in the keychain, read once and then kept in memory, since a
+/// keychain read can make the system ask the user.
+pub struct KeyringSecret {
+    keyring: KeyringStore,
+    cached: Mutex<Option<Option<Zeroizing<String>>>>,
+}
+
+impl KeyringSecret {
+    /// The GitHub token for pull requests and issues.
+    pub fn github_token() -> Self {
+        Self {
+            keyring: KeyringStore::new(GITHUB_TOKEN_USER),
+            cached: Mutex::new(None),
+        }
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, Option<Option<Zeroizing<String>>>> {
+        self.cached.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl SecretStore for KeyringSecret {
+    fn load(&self) -> Option<Zeroizing<String>> {
+        self.cache().get_or_insert_with(|| self.keyring.get_secret()).clone()
+    }
+
+    fn save(&self, secret: &str) -> Result<(), GatewayError> {
+        self.keyring.set_secret(secret).map_err(|err| GatewayError::Io(err.to_string()))?;
+        *self.cache() = Some(Some(Zeroizing::new(secret.to_owned())));
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), GatewayError> {
+        self.keyring.delete_secret().map_err(|err| GatewayError::Io(err.to_string()))?;
+        *self.cache() = Some(None);
+        Ok(())
     }
 }

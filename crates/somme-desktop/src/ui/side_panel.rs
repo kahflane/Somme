@@ -9,6 +9,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, h_flex,
     v_flex,
 };
+use chrono::{Local, TimeZone as _};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
@@ -18,9 +19,9 @@ use gpui_kit::{
 use crate::settings::Settings;
 use crate::store::Store;
 use crate::terminal::log::{self, LogEntry};
-use crate::ui::common::{Lucide, ago};
-use crate::ui::logs::started;
+use crate::ui::common::{Lucide, ago, confirm_delete, human_size, notify_error};
 use crate::ui::settings_page::monospace_fonts;
+use crate::ui::snippets::SnippetEditor;
 use crate::ui::theme_picker::{self, section};
 
 pub const PANEL_WIDTH: f32 = 284.;
@@ -67,7 +68,6 @@ pub enum SidePanelEvent {
     ManageSnippets,
     /// Play a recorded session back in a new tab.
     OpenLog(LogEntry),
-    ShowAllLogs,
     /// Give the keyboard back to the terminal.
     FocusTerminal,
     Close,
@@ -85,7 +85,8 @@ pub struct SidePanel {
     search: Entity<InputState>,
     /// Whose logs to show: a host id, or `None` for local terminals.
     log_host: Option<String>,
-    logs: Vec<LogEntry>,
+    /// The logs, newest first, with their sizes.
+    logs: Vec<(LogEntry, u64)>,
     fonts: Vec<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
@@ -130,10 +131,53 @@ impl SidePanel {
         }
     }
 
+    /// Opens the Logs list.
+    pub fn show_logs(&mut self, cx: &mut Context<Self>) {
+        self.section = Section::Logs;
+        self.reload_logs(cx);
+    }
+
     fn reload_logs(&mut self, cx: &mut Context<Self>) {
         let data_dir = Store::services(cx).data_dir.clone();
-        self.logs = log::list(&data_dir).into_iter().filter(|entry| entry.host_id == self.log_host).collect();
+        self.logs = log::list(&data_dir)
+            .into_iter()
+            .filter(|entry| entry.host_id == self.log_host)
+            .map(|entry| {
+                let size = log::size(&data_dir, &entry);
+                (entry, size)
+            })
+            .collect();
         cx.notify();
+    }
+
+    fn delete_logs(&mut self, entries: Vec<LogEntry>, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = cx.entity().downgrade();
+        confirm_delete(
+            title,
+            "Deleted logs cannot be brought back.",
+            move |window, cx| {
+                let data_dir = Store::services(cx).data_dir.clone();
+                for entry in &entries {
+                    if let Err(err) = log::delete(&data_dir, entry) {
+                        notify_error(window, cx, "Could not delete log", err);
+                        break;
+                    }
+                }
+                let _ = panel.update(cx, |panel, cx| panel.reload_logs(cx));
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Whose logs the list shows.
+    fn logs_title(&self, cx: &App) -> String {
+        let Some(id) = &self.log_host else { return "Local terminal".to_owned() };
+        let store = Store::global(cx).read(cx);
+        match store.hosts.iter().find(|host| host.id.to_string() == *id) {
+            Some(host) => host.label.clone(),
+            None => self.logs.first().map(|(entry, _)| entry.label.clone()).unwrap_or_else(|| "This server".to_owned()),
+        }
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -178,29 +222,8 @@ impl SidePanel {
         let theme = cx.theme().clone();
         let query = self.search.read(cx).value().trim().to_lowercase();
         let store = Store::global(cx).read(cx);
-        if !store.is_unlocked() {
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .p_4()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_center()
-                        .text_color(theme.muted_foreground)
-                        .child("Snippets are locked with your master password."),
-                )
-                .child(
-                    Button::new("panel-unlock")
-                        .small()
-                        .icon(Icon::new(Lucide::LockOpen))
-                        .label("Unlock")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidePanelEvent::ManageSnippets))),
-                )
-                .into_any_element();
-        }
+        // The Snippets page sits behind the master password; a new snippet does not need it.
+        let manage = store.is_unlocked();
         let snippets = store.snippets.clone();
         let total = snippets.len();
         let matches: Vec<_> = snippets
@@ -295,8 +318,14 @@ impl SidePanel {
                         .small()
                         .w_full()
                         .icon(IconName::Plus)
-                        .label(if total == 0 { "New snippet" } else { "Manage snippets" })
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidePanelEvent::ManageSnippets))),
+                        .label(if total == 0 || !manage { "New snippet" } else { "Manage snippets" })
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            if manage {
+                                cx.emit(SidePanelEvent::ManageSnippets);
+                            } else {
+                                SnippetEditor::open(None, window, cx);
+                            }
+                        })),
                 ),
             )
             .into_any_element()
@@ -305,10 +334,13 @@ impl SidePanel {
     fn render_logs(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let recording = Settings::get(cx).log_sessions;
-        let rows = self.logs.iter().enumerate().map(|(ix, entry)| {
+        let title = self.logs_title(cx);
+        let rows = self.logs.iter().enumerate().map(|(ix, (entry, size))| {
             let open = entry.clone();
+            let delete = entry.clone();
             h_flex()
                 .id(("panel-log", ix))
+                .group("panel-log")
                 .px_2()
                 .py_1p5()
                 .gap_2()
@@ -321,15 +353,37 @@ impl SidePanel {
                         .flex_1()
                         .min_w_0()
                         .child(div().text_sm().truncate().child(started(entry.started_at)))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(ago(entry.started_at))),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} · {}", ago(entry.started_at), human_size(*size))),
+                        ),
+                )
+                .child(
+                    Button::new(("panel-log-delete", ix))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Delete)
+                        .tooltip("Delete log")
+                        .invisible()
+                        .group_hover("panel-log", |button| button.visible())
+                        .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            let title = format!("Delete the log from {}?", started(delete.started_at));
+                            panel.delete_logs(vec![delete.clone()], title, window, cx);
+                        })),
                 )
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidePanelEvent::OpenLog(open.clone()))))
         });
         let empty = if !recording {
             "Recording is off. Turn it on to keep a copy of what each session prints."
+        } else if self.log_host.is_some() {
+            "No logs for this server yet. New sessions are recorded."
         } else {
-            "No logs for this host yet. New sessions are recorded."
+            "No logs for local terminals yet. New sessions are recorded."
         };
+        let all: Vec<LogEntry> = self.logs.iter().map(|(entry, _)| entry.clone()).collect();
         v_flex()
             .size_full()
             .child(
@@ -348,6 +402,19 @@ impl SidePanel {
                     .child(div().text_sm().child("Record new sessions")),
             )
             .child(
+                h_flex()
+                    .px_3()
+                    .pb_1()
+                    .gap_1p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        Icon::new(if self.log_host.is_some() { Lucide::Server } else { Lucide::SquareTerminal })
+                            .size(px(12.)),
+                    )
+                    .child(div().truncate().child(title.clone())),
+            )
+            .child(
                 v_flex()
                     .id("panel-log-list")
                     .flex_1()
@@ -361,16 +428,22 @@ impl SidePanel {
                     })
                     .children(rows),
             )
-            .child(
-                div().p_2().border_t_1().border_color(theme.border).child(
-                    Button::new("panel-all-logs")
-                        .ghost()
-                        .small()
-                        .w_full()
-                        .label("All logs")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidePanelEvent::ShowAllLogs))),
-                ),
-            )
+            .when(!all.is_empty(), |panel| {
+                panel.child(
+                    div().p_2().border_t_1().border_color(theme.border).child(
+                        Button::new("panel-delete-logs")
+                            .ghost()
+                            .small()
+                            .w_full()
+                            .icon(IconName::Delete)
+                            .label("Delete these logs")
+                            .on_click(cx.listener(move |panel, _, window, cx| {
+                                let title = format!("Delete all {} logs of {title}?", all.len());
+                                panel.delete_logs(all.clone(), title, window, cx);
+                            })),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
@@ -448,6 +521,15 @@ impl SidePanel {
             .child(section(title(second), theme_picker::app_themes(second, cx), cx))
             .into_any_element()
     }
+}
+
+/// When a session started, like "Oct 18, 2026 12:28".
+fn started(timestamp: i64) -> String {
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|t| t.format("%b %-d, %Y %H:%M").to_string())
+        .unwrap_or_default()
 }
 
 impl Render for SidePanel {

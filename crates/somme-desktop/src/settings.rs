@@ -73,6 +73,10 @@ pub struct Settings {
     pub trusted_folders: Vec<String>,
     /// Opens the editor files left open last time, scratch files too.
     pub reopen_files: bool,
+    /// Lets agents connect over MCP and run scripts on saved hosts.
+    pub agent_access: bool,
+    /// Keeps a background service taking agents while the app is closed.
+    pub agent_service: bool,
 }
 
 impl Default for Settings {
@@ -104,6 +108,8 @@ impl Default for Settings {
             auto_lock_minutes: 0,
             trusted_folders: Vec::new(),
             reopen_files: true,
+            agent_access: false,
+            agent_service: false,
         }
     }
 }

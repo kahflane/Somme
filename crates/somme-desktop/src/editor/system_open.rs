@@ -30,22 +30,60 @@ pub fn opens_outside(path: &Path) -> bool {
 
 /// A copy of `path` on this computer, for the system's app to open. Files on
 /// a server are downloaded to a new temporary folder, keeping their name so
-/// the system knows the kind.
+/// the system knows the kind, and marked as downloaded.
 pub async fn local_copy(disk: Disk, path: PathBuf) -> Result<PathBuf, DiskError> {
     if disk.is_local() {
         return Ok(path);
     }
     disk.run(move |disk| {
         let name = path.file_name().ok_or_else(|| DiskError::Other("It has no file name.".into()))?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_nanos());
-        let dir = std::env::temp_dir().join("somme-open").join(stamp.to_string());
-        std::fs::create_dir_all(&dir)?;
+        // A new folder with a random name that only this user can open, so no
+        // one else on this computer can put something in its place. It stays
+        // for the app that opens the file.
+        let mut folder = tempfile::Builder::new();
+        folder.prefix("somme-open-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            folder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = folder.tempdir()?.keep();
         let local = dir.join(name);
         disk.download(&path, &local)?;
+        mark_downloaded(&local);
         Ok(local)
     })
     .await
 }
+
+/// Marks a file the way browsers mark downloads, so the system treats it as
+/// from the internet: macOS checks apps and scripts inside it before they
+/// run, and Office on Windows opens it in Protected View.
+#[cfg(target_os = "macos")]
+fn mark_downloaded(path: &Path) {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs());
+    let mark = format!("0081;{stamp:x};Somme;");
+    let set = std::process::Command::new("/usr/bin/xattr")
+        .args(["-w", "com.apple.quarantine", &mark])
+        .arg(path)
+        .status();
+    if !set.is_ok_and(|status| status.success()) {
+        tracing::warn!("could not mark a downloaded file");
+    }
+}
+
+#[cfg(windows)]
+fn mark_downloaded(path: &Path) {
+    let mut zone = path.as_os_str().to_owned();
+    zone.push(":Zone.Identifier");
+    if let Err(err) = std::fs::write(zone, "[ZoneTransfer]\r\nZoneId=3\r\n") {
+        tracing::warn!(%err, "could not mark a downloaded file");
+    }
+}
+
+/// Other systems have no such mark.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn mark_downloaded(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -61,9 +99,20 @@ mod tests {
         let disk = fake::disk(root.path());
         let local = futures::executor::block_on(local_copy(disk, PathBuf::from("/home/me/photo.png"))).unwrap();
         let bytes = std::fs::read(&local);
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(local.parent().unwrap()).unwrap().permissions().mode() & 0o777
+        };
+        #[cfg(target_os = "macos")]
+        let mark = std::process::Command::new("/usr/bin/xattr").args(["-p", "com.apple.quarantine"]).arg(&local).output();
         std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
         assert_eq!(local.file_name(), Some("photo.png".as_ref()));
         assert_eq!(bytes.unwrap(), b"png");
+        #[cfg(unix)]
+        assert_eq!(mode, 0o700, "only this user can open the folder");
+        #[cfg(target_os = "macos")]
+        assert!(String::from_utf8_lossy(&mark.unwrap().stdout).contains(";Somme;"));
     }
 
     #[test]

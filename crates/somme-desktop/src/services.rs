@@ -7,18 +7,18 @@ use async_trait::async_trait;
 use futures::channel::{mpsc, oneshot};
 use somme_application::ports::{
     CloudAccounts, CloudSession, ConnectContext, CryptoError, EventPublisher, GatewayError, KeyStore, MasterKey,
-    PromptAnswer, PromptKind, Prompter, SessionStore, SshGateway, SyncState,
+    PromptAnswer, PromptKind, Prompter, SecretStore, SessionStore, SshGateway, SyncState,
 };
 use somme_application::services::{
     ConnectionPlanner, ForwardService, GroupService, HostService, IdentityService, ImportService, KeyService,
-    KnownHostService, KnownHostsVerifier, Links, PreferenceService, SessionService, SftpService, SnippetService, SyncService,
-    VaultService,
+    KnownHostService, KnownHostsVerifier, Links, PreferenceService, ScriptService, SessionService, SftpService, SnippetService,
+    SyncService, VaultService,
 };
 use somme_domain::Id;
 use somme_infrastructure::cloud::{DEFAULT_CLOUD_URL, HttpCloudClient, KeyringSessionStore, ManagedTokens};
 use somme_infrastructure::crypto::XChaChaVaultCrypto;
 use somme_infrastructure::db::{DataPaths, SqlRepository, TursoSync};
-use somme_infrastructure::keystore::KeyringStore;
+use somme_infrastructure::keystore::{KeyringSecret, KeyringStore};
 use somme_infrastructure::keytool::RusshKeyTool;
 use somme_infrastructure::pty::NativePtyGateway;
 use somme_infrastructure::ssh::RusshGateway;
@@ -102,6 +102,25 @@ impl KeyStore for MemoryKeyStore {
 }
 
 #[derive(Default)]
+struct MemorySecret(parking_lot::Mutex<Option<String>>);
+
+impl SecretStore for MemorySecret {
+    fn load(&self) -> Option<zeroize::Zeroizing<String>> {
+        self.0.lock().clone().map(zeroize::Zeroizing::new)
+    }
+
+    fn save(&self, secret: &str) -> Result<(), GatewayError> {
+        *self.0.lock() = Some(secret.to_owned());
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), GatewayError> {
+        *self.0.lock() = None;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct MemorySessionStore(parking_lot::Mutex<Option<CloudSession>>);
 
 impl SessionStore for MemorySessionStore {
@@ -136,6 +155,8 @@ pub struct Services {
     pub known_hosts: Arc<KnownHostService>,
     pub sessions: Arc<SessionService>,
     pub sftp: Arc<SftpService>,
+    /// Scripts run for agents through the MCP server.
+    pub scripts: Arc<ScriptService>,
     pub sync: Arc<SyncService>,
     pub import: Arc<ImportService>,
     pub preferences: Arc<PreferenceService>,
@@ -143,7 +164,7 @@ pub struct Services {
     publisher: Arc<dyn EventPublisher>,
 }
 
-fn data_dir() -> anyhow::Result<PathBuf> {
+pub fn data_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("SOMME_DATA_DIR") {
         return Ok(dir.into());
     }
@@ -165,6 +186,17 @@ impl Services {
             Arc::new(MemorySessionStore::default())
         } else {
             Arc::new(KeyringSessionStore::new(data_dir.join("account.json")))
+        };
+        let github_token: Arc<dyn SecretStore> = if test_mode {
+            let secret = MemorySecret::default();
+            // UI checks talk to a fake GitHub that takes any token.
+            #[cfg(feature = "snapshot")]
+            if crate::github::api::fake_api().is_some() {
+                *secret.0.lock() = Some("fake-token".to_owned());
+            }
+            Arc::new(secret)
+        } else {
+            Arc::new(KeyringSecret::github_token())
         };
         let master_key: Arc<dyn KeyStore> = if test_mode {
             Arc::new(MemoryKeyStore::default())
@@ -233,6 +265,7 @@ impl Services {
             sync_gateway.clone(),
             cloud,
             cloud_sessions,
+            github_token,
             vault.clone(),
             publisher.clone(),
             repo.clone(),
@@ -243,6 +276,7 @@ impl Services {
             groups: Arc::new(GroupService::new(repo.clone(), links.clone())),
             identities: Arc::new(IdentityService::new(repo.clone(), vault.clone(), links)),
             preferences: Arc::new(PreferenceService::new(repo.clone())),
+            scripts: Arc::new(ScriptService::new(planner.clone(), ssh.clone(), repo.clone())),
             known_hosts: Arc::new(KnownHostService::new(repo)),
             sftp: Arc::new(SftpService::new(planner, ssh, ctx)),
             vault,

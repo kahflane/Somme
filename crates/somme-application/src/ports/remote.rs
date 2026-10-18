@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use somme_domain::ForwardKind;
@@ -84,6 +85,28 @@ pub struct RemoteEntry {
     pub permissions: Option<String>,
 }
 
+/// How a script run with [`SshGateway::run_script`] went.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptOutput {
+    /// What it printed. Past the limit, the middle is cut out.
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_status: Option<u32>,
+    /// The signal that stopped it, like `KILL`.
+    pub exit_signal: Option<String>,
+    /// It ran past its time and was stopped.
+    pub timed_out: bool,
+}
+
+/// A file or folder [`RemoteFs::search`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteHit {
+    pub path: String,
+    pub is_dir: bool,
+    /// For a text search: the line's number, from 1, and the line.
+    pub line: Option<(u32, String)>,
+}
+
 pub type StopNotifier = Box<dyn FnOnce(Option<String>) + Send>;
 
 #[async_trait]
@@ -111,6 +134,20 @@ pub trait RemoteFs: Send + Sync {
     async fn write_as_root(&self, path: &str, data: &[u8], password: Option<&str>) -> Result<(), GatewayError> {
         let _ = (path, data, password);
         Err(GatewayError::Session("sudo is not available here".into()))
+    }
+    /// Looks under `dir` for files and folders whose names hold `query`, or
+    /// with `text`, for lines in files that hold it. Hidden files and folders
+    /// are skipped. Gives at most `limit` hits.
+    async fn search(
+        &self,
+        dir: &str,
+        query: &str,
+        text: bool,
+        ignore_case: bool,
+        limit: usize,
+    ) -> Result<Vec<RemoteHit>, GatewayError> {
+        let _ = (dir, query, text, ignore_case, limit);
+        Err(GatewayError::Session("search is not available here".into()))
     }
     async fn close(&self);
 }
@@ -146,4 +183,16 @@ pub trait SshGateway: Send + Sync {
         spec: ForwardSpec,
         on_stop: StopNotifier,
     ) -> Result<Arc<dyn Tunnel>, GatewayError>;
+
+    /// Runs `script` with the login shell on its own connection, with no
+    /// terminal and no input. It is stopped after `timeout`. Each output
+    /// keeps at most `limit` bytes.
+    async fn run_script(
+        &self,
+        plan: ConnectPlan,
+        ctx: ConnectContext,
+        script: &str,
+        timeout: Duration,
+        limit: usize,
+    ) -> Result<ScriptOutput, GatewayError>;
 }
