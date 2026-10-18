@@ -55,7 +55,7 @@ roxmltree = "0.21"
 ropey = { version = "=2.0.0-beta.1", features = ["metric_chars", "metric_lines_lf"] }
 serde.workspace = true
 serde_json.workspace = true
-# Hashes an update's download, to check it against the signed list.
+# Hashes update downloads and voice models, to check them.
 sha2.workspace = true
 tempfile = "3"
 thiserror.workspace = true
@@ -63,7 +63,13 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+# Speech to text for the voice button: whisper.cpp, and the microphone.
+whisper-rs = "0.16"
+cpal = "0.18"
 zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
 
 [features]
 snapshot = ["gpui-kit/test-support"]

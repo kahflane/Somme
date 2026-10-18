@@ -17,6 +17,7 @@ mod store;
 mod terminal;
 mod ui;
 mod update;
+mod voice;
 mod web_images;
 
 use std::sync::Arc;
@@ -150,6 +151,7 @@ fn main() -> anyhow::Result<()> {
         cx.observe_global::<Settings>(ui::themes::apply_font).detach();
         Store::init(services.clone(), cx);
         host_os::init(&services.data_dir, cx);
+        voice::Voice::init(&services.data_dir, cx);
         look::init(services.clone(), cx);
         mcp::init(services.clone(), cx);
         update::init(services.data_dir.clone(), cx);

@@ -83,6 +83,10 @@ pub struct Settings {
     pub check_updates: bool,
     /// The version put off with Later. Only a newer one shows again.
     pub update_later: Option<String>,
+    /// The Whisper model voice typing uses.
+    pub voice_model: crate::voice::VoiceModel,
+    /// The language spoken, by Whisper's code, or "auto".
+    pub voice_language: String,
 }
 
 impl Default for Settings {
@@ -119,6 +123,8 @@ impl Default for Settings {
             agent_service: false,
             check_updates: true,
             update_later: None,
+            voice_model: crate::voice::VoiceModel::default(),
+            voice_language: "auto".to_owned(),
         }
     }
 }

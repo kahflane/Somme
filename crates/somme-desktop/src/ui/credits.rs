@@ -35,10 +35,12 @@ pub struct Library {
     pub link: String,
 }
 
-/// Icons and logos, which are not Rust libraries.
+/// Icons, logos and speech models, which are not Rust libraries.
 pub const ARTWORK: &[(&str, &str, &str)] = &[
     ("Lucide icons", "ISC", "https://lucide.dev"),
     ("Simple Icons, for system logos", "CC0-1.0", "https://simpleicons.org"),
+    ("Whisper speech model, by OpenAI", "MIT", "https://github.com/openai/whisper"),
+    ("Silero VAD, which finds speech", "MIT", "https://github.com/snakers4/silero-vad"),
 ];
 
 static CREDITS: LazyLock<Credits> =

@@ -32,6 +32,7 @@ mod drop;
 mod links;
 mod picker;
 mod prompt;
+mod voice;
 
 use prompt::Prompt;
 
@@ -58,6 +59,7 @@ actions!(
         CopyOutput,
         CopyLastCommand,
         CopyLastOutput,
+        ToggleVoice,
     ]
 );
 
@@ -86,6 +88,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-end", ScrollToBottom, ctx),
         KeyBinding::new("shift-pageup", ScrollPageUp, ctx),
         KeyBinding::new("shift-pagedown", ScrollPageDown, ctx),
+        KeyBinding::new("cmd-shift-space", ToggleVoice, ctx),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
@@ -104,6 +107,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-pagedown", ScrollPageDown, ctx),
         KeyBinding::new("ctrl-shift-home", ScrollToTop, ctx),
         KeyBinding::new("ctrl-shift-end", ScrollToBottom, ctx),
+        KeyBinding::new("ctrl-shift-space", ToggleVoice, ctx),
     ]);
     cx.bind_keys([KeyBinding::new("escape", CloseFind, Some("TerminalSearch"))]);
     prompt::init(cx);
@@ -187,6 +191,10 @@ pub struct TerminalView {
     /// Uploads of files dropped on a server's shell.
     notes: Vec<drop::Note>,
     next_note: usize,
+    /// The offer to download the speech model is open.
+    voice_offer: bool,
+    /// Says voice typing is listening, where the command box isn't shown.
+    voice_note: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -211,6 +219,15 @@ impl TerminalView {
                     view.focus_prompt(window, cx);
                 }
                 cx.emit(TerminalViewEvent::Focused);
+            }),
+            cx.observe(&crate::voice::Voice::global(cx), |_, _, cx| cx.notify()),
+            // A closed tab stops listening for it.
+            cx.on_release({
+                let me = cx.entity_id();
+                move |_, cx| {
+                    let voice = crate::voice::Voice::global(cx);
+                    voice.update(cx, |voice, cx| voice.release(me, cx));
+                }
             }),
         ];
         let (has_blocks, local) = (session.read(cx).blocks.is_some(), session.read(cx).is_local());
@@ -240,6 +257,8 @@ impl TerminalView {
             awaiting_block: false,
             notes: Vec::new(),
             next_note: 0,
+            voice_offer: false,
+            voice_note: None,
             _subscriptions: subscriptions,
         };
         view.reset_blink(cx);
@@ -1022,7 +1041,12 @@ impl Render for TerminalView {
         } else {
             surface.into_any_element()
         };
-        div().size_full().relative().child(body).children(self.render_drop_target(cx))
+        div()
+            .size_full()
+            .relative()
+            .on_action(cx.listener(Self::toggle_voice))
+            .child(body)
+            .children(self.render_drop_target(cx))
     }
 }
 

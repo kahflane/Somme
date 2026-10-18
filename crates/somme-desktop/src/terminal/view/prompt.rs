@@ -309,7 +309,7 @@ impl TerminalView {
     }
 
     /// Closes the list of past commands and puts back what was typed.
-    fn close_history(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn close_history(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(browse) = self.prompt.as_mut().and_then(|prompt| prompt.browse.take()) else { return false };
         self.set_prompt_text(&browse.draft, window, cx);
         cx.notify();
@@ -554,6 +554,12 @@ impl TerminalView {
                 .text_color(muted)
                 .child(Icon::new(icon).size(px(12.)))
         };
+        let palette = super::voice::Palette {
+            foreground,
+            muted,
+            red,
+            accent: to_hsla(theme.ansi[4]),
+        };
         let mut chips = h_flex().gap_1p5().items_center().flex_wrap();
         if let Some(cwd) = blocks.and_then(|b| b.cwd.as_deref()) {
             let open = self.picker.as_ref().is_some_and(|p| p.kind == PickerKind::Folders);
@@ -620,6 +626,8 @@ impl TerminalView {
                 );
             }
         }
+
+        chips = chips.child(div().flex_1()).child(self.render_mic(&palette, cx));
 
         let menu = self.prompt.as_ref().and_then(|prompt| prompt.menu.as_ref()).map(|menu| {
             let choices = &menu.completion.choices;
@@ -794,6 +802,7 @@ impl TerminalView {
         let popups: Vec<AnyElement> = self
             .render_picker(cx)
             .into_iter()
+            .chain(self.render_voice_offer(&palette, cx))
             .chain(history.map(IntoElement::into_any_element))
             .chain(menu.map(IntoElement::into_any_element))
             .collect();
@@ -837,7 +846,7 @@ impl TerminalView {
                 cx.stop_propagation();
             }))
             .capture_action(cx.listener(|view, _: &Escape, window, cx| {
-                if view.close_picker(window, cx) || view.close_history(window, cx) {
+                if view.close_picker(window, cx) || view.close_history(window, cx) || view.cancel_voice(cx) {
                     cx.stop_propagation();
                 } else if let Some(prompt) = view.prompt.as_mut()
                     && prompt.menu.take().is_some()

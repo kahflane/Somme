@@ -149,6 +149,22 @@
       "link": "https://github.com/zakarumych/allocator-api2"
     },
     {
+      "name": "alsa",
+      "versions": [
+        "0.11.0"
+      ],
+      "license": "Apache-2.0/MIT",
+      "link": "https://github.com/diwic/alsa-rs"
+    },
+    {
+      "name": "alsa-sys",
+      "versions": [
+        "0.4.0"
+      ],
+      "license": "MIT",
+      "link": "https://github.com/diwic/alsa-sys"
+    },
+    {
       "name": "android_system_properties",
       "versions": [
         "0.1.6"
@@ -988,12 +1004,28 @@
       "link": "https://github.com/robertbastian/core_maths"
     },
     {
+      "name": "coreaudio-rs",
+      "versions": [
+        "0.14.2"
+      ],
+      "license": "MIT/Apache-2.0",
+      "link": "https://github.com/RustAudio/coreaudio-rs.git"
+    },
+    {
       "name": "cosmic-text",
       "versions": [
         "0.19.0"
       ],
       "license": "MIT OR Apache-2.0",
       "link": "https://github.com/pop-os/cosmic-text"
+    },
+    {
+      "name": "cpal",
+      "versions": [
+        "0.18.2"
+      ],
+      "license": "Apache-2.0",
+      "link": "https://github.com/RustAudio/cpal"
     },
     {
       "name": "cpubits",
@@ -1173,6 +1205,14 @@
       ],
       "license": "MIT",
       "link": "https://github.com/xacrimon/dashmap"
+    },
+    {
+      "name": "dasp_sample",
+      "versions": [
+        "0.11.0"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/rustaudio/sample.git"
     },
     {
       "name": "data-encoding",
@@ -3472,6 +3512,22 @@
       "link": "https://github.com/gfx-rs/wgpu"
     },
     {
+      "name": "ndk",
+      "versions": [
+        "0.9.0"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/rust-mobile/ndk"
+    },
+    {
+      "name": "ndk-context",
+      "versions": [
+        "0.1.1"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/rust-windowing/android-ndk-rs"
+    },
+    {
       "name": "ndk-sys",
       "versions": [
         "0.6.0+11769913"
@@ -3667,6 +3723,22 @@
       "link": "https://github.com/seanmonstar/num_cpus"
     },
     {
+      "name": "num_enum",
+      "versions": [
+        "0.7.6"
+      ],
+      "license": "BSD-3-Clause OR MIT OR Apache-2.0",
+      "link": "https://github.com/illicitonion/num_enum"
+    },
+    {
+      "name": "num_enum_derive",
+      "versions": [
+        "0.7.6"
+      ],
+      "license": "BSD-3-Clause OR MIT OR Apache-2.0",
+      "link": "https://github.com/illicitonion/num_enum"
+    },
+    {
       "name": "objc",
       "versions": [
         "0.2.7"
@@ -3709,7 +3781,39 @@
       "link": "https://github.com/madsmtm/objc2"
     },
     {
+      "name": "objc2-audio-toolbox",
+      "versions": [
+        "0.3.2"
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "link": "https://github.com/madsmtm/objc2"
+    },
+    {
+      "name": "objc2-avf-audio",
+      "versions": [
+        "0.3.2"
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "link": "https://github.com/madsmtm/objc2"
+    },
+    {
       "name": "objc2-cloud-kit",
+      "versions": [
+        "0.3.2"
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "link": "https://github.com/madsmtm/objc2"
+    },
+    {
+      "name": "objc2-core-audio",
+      "versions": [
+        "0.3.2"
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "link": "https://github.com/madsmtm/objc2"
+    },
+    {
+      "name": "objc2-core-audio-types",
       "versions": [
         "0.3.2"
       ],
@@ -6983,6 +7087,22 @@
       "link": "https://github.com/harryfei/which-rs.git"
     },
     {
+      "name": "whisper-rs",
+      "versions": [
+        "0.16.0"
+      ],
+      "license": "Unlicense",
+      "link": "https://codeberg.org/tazz4843/whisper-rs"
+    },
+    {
+      "name": "whisper-rs-sys",
+      "versions": [
+        "0.15.0"
+      ],
+      "license": "Unlicense",
+      "link": "https://codeberg.org/tazz4843/whisper-rs"
+    },
+    {
       "name": "wildmatch",
       "versions": [
         "2.6.1"
@@ -7721,6 +7841,7 @@
     "atomic 0.5.3",
     "autocfg 1.5.1",
     "bindgen 0.69.5",
+    "bindgen 0.72.1",
     "bit-set 0.11.1",
     "bit-vec 0.10.1",
     "borsh 1.8.1",

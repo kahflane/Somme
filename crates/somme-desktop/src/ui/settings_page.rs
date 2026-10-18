@@ -21,6 +21,7 @@ use crate::ui::agents::agents_page;
 use crate::ui::credits::{ARTWORK, CreditsList};
 use crate::ui::native;
 use crate::ui::theme_picker::{self, section};
+use crate::voice::{LANGUAGES, Voice, VoiceModel, megabytes};
 
 /// App and terminal preferences, security, and the sync account.
 pub struct SettingsPage {
@@ -40,6 +41,8 @@ const AGENTS_PAGE: usize = 6;
 
 impl SettingsPage {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        // Download progress shows on the Voice page.
+        cx.observe(&Voice::global(cx), |_, _, cx| cx.notify()).detach();
         // Scanning system fonts takes a moment, so the list fills in when ready.
         cx.spawn(async move |page, cx| {
             let fonts = crate::runtime::io(async { Ok::<_, std::convert::Infallible>(monospace_fonts()) }).await;
@@ -630,6 +633,81 @@ fn updates_page() -> SettingPage {
     )
 }
 
+const VOICE_MODELS: &[(VoiceModel, &str)] =
+    &[(VoiceModel::Best, "Best (large-v3-turbo)"), (VoiceModel::Small, "Small, for older computers")];
+
+fn voice_page() -> SettingPage {
+    SettingPage::new("Voice").icon(Icon::new(Lucide::Mic)).group(
+        SettingGroup::new()
+            .title("Voice typing")
+            .description(format!(
+                "Click the mic in the command box, or press {}, and talk. Press it again to stop, and your words are typed in. The speech model runs on this computer, so nothing you say is sent anywhere.",
+                if cfg!(target_os = "macos") { "⌘⇧Space" } else { "Ctrl+Shift+Space" }
+            ))
+            .item(
+                SettingItem::new("Model", choice(VOICE_MODELS, |s| s.voice_model, |s, v| s.voice_model = v))
+                    .description("Best is the most accurate. Small is quicker on older computers."),
+            )
+            .item(
+                SettingItem::new(
+                    "Language",
+                    choice(
+                        LANGUAGES,
+                        |s| LANGUAGES.iter().find(|(code, _)| *code == s.voice_language).map_or("auto", |(code, _)| code),
+                        |s, code| s.voice_language = code.to_owned(),
+                    ),
+                )
+                .description("Picking yours is quicker and more accurate than letting it guess."),
+            )
+            .item(SettingItem::render(|_, _, cx| {
+                let theme = cx.theme().clone();
+                let voice = Voice::global(cx);
+                let state = voice.read(cx);
+                let model = Voice::chosen(cx);
+                let (status, button) = if let Some(download) = state.download() {
+                    let status = format!("Downloading… {} of {}", megabytes(download.done), megabytes(download.total));
+                    let voice = voice.clone();
+                    let button = Button::new("voice-download")
+                        .small()
+                        .label("Stop")
+                        .on_click(move |_, _, cx| voice.update(cx, |voice, cx| voice.cancel_download(cx)));
+                    (status, button)
+                } else if state.ready(model) {
+                    let voice = voice.clone();
+                    let button = Button::new("voice-download")
+                        .small()
+                        .icon(Icon::new(Lucide::Trash))
+                        .label("Delete")
+                        .on_click(move |_, _, cx| voice.update(cx, |voice, cx| voice.delete(model, cx)));
+                    (format!("Downloaded ({})", model.size()), button)
+                } else {
+                    let voice = voice.clone();
+                    let button = Button::new("voice-download")
+                        .small()
+                        .primary()
+                        .icon(Icon::new(Lucide::Download))
+                        .label("Download")
+                        .on_click(move |_, _, cx| voice.update(cx, |voice, cx| voice.start_download(model, cx)));
+                    (format!("Not downloaded ({})", model.size()), button)
+                };
+                let error = state.download_error.clone();
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .child(div().text_sm().child("Speech model"))
+                            .child(div().text_xs().text_color(theme.muted_foreground).child(status))
+                            .when_some(error, |info, error| {
+                                info.child(div().text_xs().text_color(theme.danger).child(error))
+                            }),
+                    )
+                    .child(button)
+            })),
+    )
+}
+
 fn credits_page() -> SettingPage {
     // One group, so the sidebar shows Credits alone, without sub items.
     SettingPage::new("Credits").icon(Icon::new(Lucide::Heart)).group(
@@ -654,7 +732,7 @@ fn credits_page() -> SettingPage {
                 });
                 v_flex()
                     .w_full()
-                    .child(heading("Icons and logos".into()))
+                    .child(heading("Icons, logos and models".into()))
                     .children(artwork)
                     .child(heading("Libraries".into()))
                     .child(window.use_keyed_state("credits-list", cx, |window, cx| CreditsList::new(window, cx)))
@@ -681,6 +759,7 @@ impl Render for SettingsPage {
                     account_page(page.clone()),
                     agents_page(page),
                     updates_page(),
+                    voice_page(),
                     credits_page(),
                 ]),
         );

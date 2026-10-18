@@ -24,7 +24,7 @@ use crate::terminal::session::Status;
 /// How long a note about a finished upload stays.
 const NOTE_TIME: Duration = Duration::from_secs(6);
 
-/// An upload, shown over the terminal.
+/// An upload or a voice typing message, shown over the terminal.
 pub(super) struct Note {
     id: usize,
     text: String,
@@ -207,7 +207,7 @@ impl TerminalView {
         .detach();
     }
 
-    fn add_note(&mut self, text: String, cx: &mut Context<Self>) -> usize {
+    pub(super) fn add_note(&mut self, text: String, cx: &mut Context<Self>) -> usize {
         self.next_note += 1;
         let id = self.next_note;
         self.notes.push(Note {
@@ -217,6 +217,22 @@ impl TerminalView {
         });
         cx.notify();
         id
+    }
+
+    pub(super) fn set_note_text(&mut self, id: usize, text: String, cx: &mut Context<Self>) {
+        if let Some(note) = self.notes.iter_mut().find(|note| note.id == id) {
+            note.text = text;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn remove_note(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.notes.retain(|note| note.id != id);
+        cx.notify();
+    }
+
+    pub(super) fn fail_note(&mut self, id: usize, text: String, cx: &mut Context<Self>) {
+        self.end_note(id, text, NoteState::Failed, cx);
     }
 
     fn end_note(&mut self, id: usize, text: String, state: NoteState, cx: &mut Context<Self>) {

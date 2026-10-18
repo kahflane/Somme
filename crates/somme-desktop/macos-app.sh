@@ -35,6 +35,7 @@ cat > "$app/Contents/Info.plist" <<EOF
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSMicrophoneUsageDescription</key><string>Somme listens only while voice typing is on, and turns your speech into text on this Mac.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
