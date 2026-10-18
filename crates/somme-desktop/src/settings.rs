@@ -98,7 +98,7 @@ impl Default for Settings {
             side_panel: false,
             terminal_matches_theme: true,
             font_family: default_font().to_owned(),
-            font_everywhere: true,
+            font_everywhere: false,
             font_size: 12.,
             ui_font_size: 14.,
             line_height: 1.25,

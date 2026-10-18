@@ -8,7 +8,7 @@ use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMen
 use gpui_kit::component::sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, TitleBar, WindowExt as _, h_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, TitleBar, WindowExt as _, h_flex,
     v_flex,
 };
 use futures::FutureExt as _;
@@ -1731,6 +1731,22 @@ impl Workspace {
             .active_terminal()
             .filter(|tab| tab.read(cx).git_dir(cx).is_some())
             .map(|tab| (tab.read(cx).graph_shown(), tab));
+        // Signed out, the git buttons stay in view but can't be used, so it is
+        // clear what signing in brings.
+        let signed_out = !(Store::global(cx).read(cx).account.signed_in || fake_github());
+        let (graph, locked_github) = if signed_out {
+            let on_github = self.active_terminal().is_some_and(|tab| tab.read(cx).repo(cx).is_some());
+            (None, graph.is_some().then_some(on_github))
+        } else {
+            (graph, None)
+        };
+        // A disabled button shows no tooltip, so the one around it does.
+        let locked = |id: &'static str, icon: Lucide| {
+            div()
+                .id(id)
+                .child(Button::new(id).ghost().xsmall().icon(Icon::new(icon)).disabled(true))
+                .tooltip(|window, cx| Tooltip::new("Sign in with GitHub to use this (Settings › Account)").build(window, cx))
+        };
         TitleBar::new()
             // The kit keeps room for the window buttons, which full screen hides.
             .when(window.is_fullscreen(), |bar| bar.pl_0())
@@ -1779,6 +1795,13 @@ impl Workspace {
                                     }),
                             ),
                         )
+                    })
+                    .when_some(locked_github, |bar, on_github| {
+                        bar.when(on_github, |bar| {
+                            bar.child(locked("github-pulls", Lucide::GitPullRequest))
+                                .child(locked("github-issues", Lucide::CircleDot))
+                        })
+                        .child(locked("git-graph", Lucide::GitGraph))
                     })
                     .when_some(graph, |bar, (shown, tab)| {
                         bar.child(

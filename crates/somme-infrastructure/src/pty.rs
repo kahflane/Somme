@@ -133,6 +133,25 @@ fn add_shell_hooks(cmd: &mut CommandBuilder, token: &str) -> bool {
     true
 }
 
+/// Settings that belong to the program that started Somme, not to its
+/// terminals. Started from Claude Code, Somme would pass on its session
+/// markers, and a `claude` run in Somme would think it was part of that
+/// session; Claude Code also points git at its own editor.
+fn launcher_settings(names: impl Iterator<Item = std::ffi::OsString>) -> Vec<String> {
+    let names: Vec<String> = names.filter_map(|name| name.into_string().ok()).collect();
+    if !names.iter().any(|name| name == "CLAUDECODE") {
+        return Vec::new();
+    }
+    names
+        .into_iter()
+        .filter(|name| {
+            name == "CLAUDECODE"
+                || name.starts_with("CLAUDE_CODE_")
+                || ["CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "GIT_EDITOR"].contains(&name.as_str())
+        })
+        .collect()
+}
+
 impl PtyGateway for NativePtyGateway {
     fn spawn(
         &self,
@@ -144,6 +163,9 @@ impl PtyGateway for NativePtyGateway {
             .openpty(pty_size(size))
             .map_err(session_error)?;
         let mut cmd = CommandBuilder::new_default_prog();
+        for name in launcher_settings(std::env::vars_os().map(|(name, _)| name)) {
+            cmd.env_remove(name);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         let hooks = options.marks.is_some_and(|token| add_shell_hooks(&mut cmd, token));
@@ -179,5 +201,35 @@ impl PtyGateway for NativePtyGateway {
             shell,
             hooks,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> impl Iterator<Item = std::ffi::OsString> {
+        list.iter().map(std::ffi::OsString::from).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn a_claude_code_session_is_not_passed_on() {
+        let dropped = launcher_settings(names(&[
+            "HOME",
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_PID",
+            "AI_AGENT",
+            "GIT_EDITOR",
+            "CLAUDE_CONFIG_DIR",
+            "PATH",
+        ]));
+        assert_eq!(
+            dropped,
+            ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "AI_AGENT", "GIT_EDITOR"]
+        );
+        // Started some other way, the user's own settings all stay.
+        assert!(launcher_settings(names(&["HOME", "GIT_EDITOR", "CLAUDE_CODE_USE_BEDROCK"])).is_empty());
     }
 }
