@@ -8,7 +8,7 @@ mod remote;
 mod sync;
 mod terminal;
 
-pub use cloud::{CloudAccounts, CloudError, CloudSession, SessionStore, SyncCredentials};
+pub use cloud::{CloudAccounts, CloudError, CloudProfile, CloudSession, SessionStore, SyncCredentials};
 pub use crypto::{CryptoError, KeyStore, MasterKey, VaultCrypto};
 pub use events::EventPublisher;
 pub use import::{ImportedHost, SshConfigSource};

@@ -2,8 +2,10 @@ mod auth;
 mod connect;
 mod forward;
 mod handler;
+mod hooks;
 mod sftp;
 mod shell;
+mod sudo;
 
 use std::sync::Arc;
 
@@ -26,10 +28,11 @@ impl SshGateway for RusshGateway {
         plan: ConnectPlan,
         ctx: ConnectContext,
         size: TermSize,
+        marks: Option<&str>,
         sink: Arc<dyn OutputSink>,
     ) -> Result<Arc<dyn Terminal>, GatewayError> {
         let conn = Connection::open(&plan, &ctx, RemoteForwards::default()).await?;
-        Ok(Arc::new(shell::SshTerminal::start(conn, size, sink).await?))
+        Ok(Arc::new(shell::SshTerminal::start(conn, size, marks, sink).await?))
     }
 
     async fn sftp(

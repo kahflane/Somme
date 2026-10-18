@@ -6,6 +6,10 @@
 typeset -g _somme_token="${SOMME_MARK_TOKEN-}"
 builtin unset SOMME_MARK_TOKEN
 
+# On a server, the hooks sit in a folder made for this shell alone.
+typeset -g _somme_files="${SOMME_HOOKS_TMP-}"
+builtin unset SOMME_HOOKS_TMP
+
 if [[ -n "${SOMME_USER_ZDOTDIR+x}" ]]; then
   builtin export ZDOTDIR="$SOMME_USER_ZDOTDIR"
 else
@@ -20,3 +24,9 @@ fi
 if [[ -o interactive && -n "${SOMME_SHELL_HOOKS-}" ]]; then
   builtin source "$SOMME_SHELL_HOOKS/somme.zsh"
 fi
+
+# Loaded, so that folder can go.
+if [[ $_somme_files == */somme.* && -d $_somme_files ]]; then
+  command rm -rf -- "$_somme_files"
+fi
+builtin unset _somme_files

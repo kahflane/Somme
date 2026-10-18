@@ -98,6 +98,7 @@ fn main() -> anyhow::Result<()> {
         terminal::view::init(cx);
         editor::pane::init(cx);
         ui::workspace::init(cx);
+        ui::menus::init(cx);
         cx.set_global(Settings::load(&services.data_dir));
         cx.set_global(SettingsFile(services.data_dir.clone()));
         apply_appearance(cx);

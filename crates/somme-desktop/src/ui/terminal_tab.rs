@@ -7,8 +7,11 @@ use gpui_kit::{
     IntoElement, ParentElement as _, Render, SharedString, Subscription, Window, div,
 };
 
+use crate::editor::pane::{cant_open, read_text, read_text_as_root};
+use crate::editor::sudo;
 use crate::editor::{EditorPane, EditorPaneEvent};
 use crate::services::Services;
+use crate::terminal::disk::{Disk, DiskError};
 use crate::terminal::session::Status;
 use crate::terminal::view::TerminalViewEvent;
 use crate::terminal::{SessionTarget, TerminalSession, TerminalView};
@@ -149,7 +152,7 @@ impl TerminalTab {
                 cx.emit(TerminalTabEvent::Changed);
                 cx.notify();
             }
-            TerminalViewEvent::OpenFile(path) => tab.open_file(path.clone(), window, cx),
+            TerminalViewEvent::OpenFile(path) => tab.open_file(view, path.clone(), window, cx),
             TerminalViewEvent::OpenChanges(dir) => cx.emit(TerminalTabEvent::OpenChanges(dir.clone())),
             TerminalViewEvent::Typed(bytes) if tab.broadcast => {
                 for other in tab.panes() {
@@ -178,11 +181,58 @@ impl TerminalTab {
         self.subscriptions.push((view.entity_id(), subscription));
     }
 
-    /// Opens a file in the editor beside the terminals.
-    pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        // Language servers are looked for on the shell's PATH.
-        let shell_path = self.active.read(cx).session.read(cx).blocks.as_ref().and_then(|b| b.path.clone());
-        let pane = match &self.editor {
+    /// Opens a file from `view`'s shell in the editor beside the terminals. For
+    /// an SSH shell, the file is on the server. The editor opens only once the
+    /// file is read.
+    pub fn open_file(&mut self, view: &Entity<TerminalView>, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let session = view.read(cx).session.read(cx);
+        // Language servers run here, and are looked for on the shell's PATH.
+        let shell_path = session.is_local().then(|| session.blocks.as_ref().and_then(|b| b.path.clone())).flatten();
+        let disk = session.disk();
+        cx.spawn_in(window, async move |tab, cx| {
+            let Some(disk) = disk.await else { return };
+            let open = tab.update_in(cx, |tab, window, cx| {
+                tab.editor.as_ref().is_some_and(|(pane, _)| pane.update(cx, |pane, cx| pane.show_open(&path, &disk, window, cx)))
+            });
+            if open.unwrap_or(true) {
+                return;
+            }
+            let text = disk.clone().run({
+                let path = path.clone();
+                move |disk| read_text(disk, &path)
+            });
+            let (text, as_root) = match text.await {
+                Err(DiskError::Denied) if disk.can_sudo() => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let title = format!("Open {name} with sudo?");
+                    let detail = "Your account can't read this file. Somme can open it as root with sudo, \
+                                  and save your changes the same way.";
+                    if !sudo::ask(&title, detail, "Open with sudo", cx).await {
+                        return;
+                    }
+                    let read = {
+                        let path = path.clone();
+                        move |disk: &Disk, password: Option<&str>| read_text_as_root(disk, &path, password)
+                    };
+                    (sudo::as_root(&disk, read, cx).await, true)
+                }
+                text => (text, false),
+            };
+            let _ = tab.update_in(cx, |tab, window, cx| match text {
+                Ok(text) => {
+                    let pane = tab.editor_pane(window, cx);
+                    pane.update(cx, |pane, cx| pane.add(path, disk, text, as_root, shell_path.as_deref(), window, cx));
+                    cx.notify();
+                }
+                Err(err) => cant_open(&path, &err, window, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// The editor beside the terminals, opened if needed.
+    fn editor_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<EditorPane> {
+        match &self.editor {
             Some((pane, _)) => pane.clone(),
             None => {
                 let pane = cx.new(EditorPane::new);
@@ -196,9 +246,7 @@ impl TerminalTab {
                 self.editor = Some((pane.clone(), subscription));
                 pane
             }
-        };
-        pane.update(cx, |pane, cx| pane.open(path, shell_path.as_deref(), window, cx));
-        cx.notify();
+        }
     }
 
     pub fn panes(&self) -> Vec<Entity<TerminalView>> {

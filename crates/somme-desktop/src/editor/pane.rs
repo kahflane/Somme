@@ -1,11 +1,12 @@
 //! Files open beside a terminal: a tab per file, the code, and a status line.
+//! Files can be on this computer or on the server an SSH shell runs on.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::highlighter::LanguageRegistry;
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position, Rope};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
@@ -16,6 +17,8 @@ use gpui_kit::{
 use crate::editor::language::{self, Language};
 use crate::editor::lsp::{self, Client, DocProvider, Status};
 use crate::settings::Settings;
+use crate::editor::sudo;
+use crate::terminal::disk::{Disk, DiskError};
 use crate::ui::common::Lucide;
 use crate::ui::native;
 
@@ -54,12 +57,15 @@ enum Help {
 
 struct OpenFile {
     path: PathBuf,
+    disk: Disk,
     editor: Entity<EditorState>,
     language: Option<Language>,
     /// The highlighter knows the language.
     colored: bool,
     /// Changed since it was opened or saved.
     dirty: bool,
+    /// Read and saved as root, with sudo.
+    as_root: bool,
     help: Help,
     _subscriptions: [Subscription; 2],
 }
@@ -91,21 +97,32 @@ impl EditorPane {
         }
     }
 
-    /// Opens `path`, or shows it when it is open already. `shell_path` is where to
-    /// look for language servers.
-    pub fn open(&mut self, path: PathBuf, shell_path: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.files.iter().position(|file| file.path == path) {
-            self.activate(ix, window, cx);
+    /// Shows `path` when it is open already.
+    pub fn show_open(&mut self, path: &Path, disk: &Disk, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(ix) = self.files.iter().position(|file| file.path == path && file.disk.same(disk)) else {
+            return false;
+        };
+        self.activate(ix, window, cx);
+        true
+    }
+
+    /// Adds a file read with [`read_text`], or shows it when it is open
+    /// already. `shell_path` is where to look for language servers. `as_root`
+    /// saves it with sudo, as it was read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add(
+        &mut self,
+        path: PathBuf,
+        disk: Disk,
+        text: String,
+        as_root: bool,
+        shell_path: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.show_open(&path, &disk, window, cx) {
             return;
         }
-        let text = match read_text(&path) {
-            Ok(text) => text,
-            Err(reason) => {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                native::error(&format!("Can't open {name}"), &reason, window, cx);
-                return;
-            }
-        };
         let language = language::detect(&path);
         let colored = language.is_some_and(|l| LanguageRegistry::singleton().language(l.grammar).is_some());
         let size = text.len();
@@ -117,6 +134,8 @@ impl EditorPane {
             }
         });
         let help = match language {
+            // Language servers run here, and read files from this computer.
+            Some(_) if !disk.is_local() => Help::None("Code help runs for files on this computer".into()),
             Some(_) if size > LSP_MAX_BYTES => Help::None("File too big for code help".into()),
             Some(language) => Self::help_for(&path, &language, &editor, shell_path, cx),
             None => Help::None(String::new()),
@@ -137,10 +156,12 @@ impl EditorPane {
         ];
         self.files.push(OpenFile {
             path,
+            disk,
             editor,
             language,
             colored,
             dirty: false,
+            as_root,
             help,
             _subscriptions: subscriptions,
         });
@@ -149,8 +170,12 @@ impl EditorPane {
 
     /// Opens `path` with `selection` picked, for Go to Definition.
     fn open_at(&mut self, path: PathBuf, selection: Option<lsp_types::Range>, window: &mut Window, cx: &mut Context<Self>) {
-        self.open(path.clone(), None, window, cx);
-        let (Some(range), Some(file)) = (selection, self.files.iter().find(|file| file.path == path)) else {
+        match read_text(&Disk::Local, &path) {
+            Ok(text) => self.add(path.clone(), Disk::Local, text, false, None, window, cx),
+            Err(err) => return cant_open(&path, &err, window, cx),
+        }
+        let file = self.files.iter().find(|file| file.path == path && file.disk.is_local());
+        let (Some(range), Some(file)) = (selection, file) else {
             return;
         };
         file.editor.update(cx, |editor, cx| {
@@ -268,16 +293,69 @@ impl EditorPane {
     }
 
     fn save(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(file) = self.files.get_mut(self.active) else { return };
+        let Some(file) = self.files.get(self.active) else { return };
         let text = file.editor.read(cx).text().clone();
-        if let Err(err) = std::fs::write(&file.path, text.to_string()) {
-            let name = file.name();
-            native::error(&format!("Can't save {name}"), &err.to_string(), window, cx);
+        let (path, disk, editor, name) = (file.path.clone(), file.disk.clone(), file.editor.clone(), file.name());
+        if disk.is_local() {
+            let result = disk.write(&path, text.to_string().as_bytes());
+            self.saved(&editor, &text, result, false, window, cx);
             return;
         }
-        file.dirty = false;
+        let as_root = file.as_root;
+        cx.spawn_in(window, async move |pane, cx| {
+            let bytes = text.to_string();
+            if !as_root {
+                let result = disk.clone().run({
+                    let (path, bytes) = (path.clone(), bytes.clone());
+                    move |disk| disk.write(&path, bytes.as_bytes())
+                });
+                match result.await {
+                    Err(DiskError::Denied) => {
+                        let title = format!("Save {name} with sudo?");
+                        let detail = "Your account can't change this file. Somme can save it as root with sudo. \
+                                      It keeps its owner and permissions.";
+                        if !sudo::ask(&title, detail, "Save with sudo", cx).await {
+                            return;
+                        }
+                    }
+                    result => {
+                        let _ = pane.update_in(cx, |pane, window, cx| pane.saved(&editor, &text, result, false, window, cx));
+                        return;
+                    }
+                }
+            }
+            let result = sudo::as_root(&disk, move |disk, password| disk.write_as_root(&path, bytes.as_bytes(), password), cx).await;
+            let _ = pane.update_in(cx, |pane, window, cx| pane.saved(&editor, &text, result, true, window, cx));
+        })
+        .detach();
+    }
+
+    /// Marks a file saved as `text`, or says why it wasn't. `as_root` says it
+    /// was saved with sudo, so later saves go the same way.
+    fn saved(
+        &mut self,
+        editor: &Entity<EditorState>,
+        text: &Rope,
+        result: Result<(), DiskError>,
+        as_root: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = self.files.iter_mut().find(|file| file.editor == *editor) else { return };
+        match result {
+            Ok(()) => {}
+            Err(DiskError::Cancelled) => return,
+            Err(err) => {
+                let name = file.name();
+                native::error(&format!("Can't save {name}"), &err.to_string(), window, cx);
+                return;
+            }
+        }
+        file.as_root |= as_root;
+        // Typing during a slow save leaves changes to save.
+        file.dirty = *file.editor.read(cx).text() != *text;
         if let Help::Server { client, uri } = &file.help {
-            client.saved(uri, &text);
+            client.saved(uri, text);
         }
         cx.notify();
     }
@@ -293,14 +371,14 @@ impl EditorPane {
             self.close(ix, window, cx);
             return;
         }
-        let (path, pane) = (file.path.clone(), cx.entity().downgrade());
+        let (editor, pane) = (file.editor.clone(), cx.entity().downgrade());
         native::confirm(
             &format!("Close {} without saving?", file.name()),
             "Your changes will be lost.",
             "Close Without Saving",
             move |window, cx| {
                 let _ = pane.update(cx, |pane, cx| {
-                    if let Some(ix) = pane.files.iter().position(|file| file.path == path) {
+                    if let Some(ix) = pane.files.iter().position(|file| file.editor == editor) {
                         pane.close(ix, window, cx);
                     }
                 });
@@ -446,6 +524,9 @@ impl EditorPane {
                 )
             })
             .child(div().flex_1())
+            .when(file.as_root, |bar| {
+                bar.child(div().flex_none().text_color(theme.warning).child("Saving as root"))
+            })
             .when(!server.is_empty(), |bar| {
                 bar.child(div().min_w_0().truncate().text_color(server_color).child(server))
             })
@@ -465,17 +546,31 @@ impl EditorPane {
     }
 }
 
-/// Reads a file as text. Err says why it can't be edited.
-fn read_text(path: &Path) -> Result<String, String> {
-    let size = std::fs::metadata(path).map_err(|err| err.to_string())?.len();
-    if size > MAX_BYTES {
-        return Err(format!("It is {} MB. Files up to {} MB open here.", size / 1_048_576, MAX_BYTES / 1_048_576));
+/// Says a file did not open, and why.
+pub fn cant_open(path: &Path, err: &DiskError, window: &mut Window, cx: &mut App) {
+    if *err == DiskError::Cancelled {
+        return;
     }
-    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    native::error(&format!("Can't open {name}"), &err.to_string(), window, cx);
+}
+
+/// Reads a file as text. Err says why it can't be edited. Slow for big files
+/// and server files: run it in [`Disk::run`].
+pub fn read_text(disk: &Disk, path: &Path) -> Result<String, DiskError> {
+    text(disk.read(path, MAX_BYTES)?)
+}
+
+/// [`read_text`] as root, with sudo.
+pub fn read_text_as_root(disk: &Disk, path: &Path, password: Option<&str>) -> Result<String, DiskError> {
+    text(disk.read_as_root(path, MAX_BYTES, password)?)
+}
+
+fn text(bytes: Vec<u8>) -> Result<String, DiskError> {
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
-        return Err("It is not a text file.".into());
+        return Err(DiskError::Other("It is not a text file.".into()));
     }
-    String::from_utf8(bytes).map_err(|_| "It is not UTF-8 text.".into())
+    String::from_utf8(bytes).map_err(|_| DiskError::Other("It is not UTF-8 text.".into()))
 }
 
 impl Focusable for EditorPane {
@@ -529,7 +624,8 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         std::fs::write(dir.join("b.bin"), [1, 0, 2]).unwrap();
         std::fs::write(dir.join("c.txt"), [0xff, 0xfe, 0x41]).unwrap();
-        let results = [read_text(&dir.join("a.txt")), read_text(&dir.join("b.bin")), read_text(&dir.join("c.txt"))];
+        let read = |name: &str| read_text(&Disk::Local, &dir.join(name));
+        let results = [read("a.txt"), read("b.bin"), read("c.txt")];
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(results[0].as_deref(), Ok("hello"));
         assert!(results[1].is_err());

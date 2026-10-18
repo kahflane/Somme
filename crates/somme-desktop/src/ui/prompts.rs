@@ -64,6 +64,14 @@ pub fn show(request: PromptRequest, window: &mut Window, cx: &mut App) {
     }
 }
 
+/// Asks for one hidden value, like a sudo password.
+pub fn ask_secret(title: &str, detail: &str, label: &str, window: &mut Window, cx: &mut App) -> oneshot::Receiver<PromptAnswer> {
+    let (sender, receiver) = oneshot::channel();
+    let answer: Answer = Rc::new(RefCell::new(Some(sender)));
+    ask_inputs(title.into(), detail.into(), vec![(label.into(), false)], answer, window, cx);
+    receiver
+}
+
 fn ask_inputs(
     title: String,
     detail: String,

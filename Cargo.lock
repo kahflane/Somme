@@ -7679,6 +7679,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -8901,7 +8902,6 @@ name = "somme-cloud"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2 0.5.3",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -8974,6 +8974,7 @@ dependencies = [
  "dirs 6.0.0",
  "fast-socks5",
  "keyring",
+ "open",
  "portable-pty",
  "rand 0.10.3",
  "reqwest",
@@ -8981,6 +8982,7 @@ dependencies = [
  "russh-sftp",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "somme-application",
  "somme-domain",
  "ssh2-config",

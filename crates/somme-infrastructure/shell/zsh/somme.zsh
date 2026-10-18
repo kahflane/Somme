@@ -4,6 +4,7 @@
 #   B                        the user accepted a line
 #   C;<command>              the command starts running
 #   P;<path>                 PATH changed, for completing command names
+#   H;<folder>               the home folder, for showing ~ on a server
 # Text is percent-encoded so it cannot end a mark early. Each mark starts with
 # a secret Somme picked for this shell, so program output cannot fake one.
 
@@ -29,6 +30,11 @@ _somme_mark() {
 
 _somme_precmd() {
   builtin local code=$?
+  if [[ $HOME != "${_somme_home-}" ]]; then
+    typeset -g _somme_home=$HOME
+    _somme_encode "$HOME"
+    _somme_mark "H;$REPLY"
+  fi
   if [[ $PATH != "${_somme_path-}" ]]; then
     typeset -g _somme_path=$PATH
     _somme_encode "$PATH"

@@ -31,20 +31,12 @@ fn cloud_url() -> Option<String> {
 }
 
 #[tokio::test]
-#[ignore = "needs a running somme-cloud at SOMME_CLOUD_URL"]
-async fn sign_up_then_two_devices_sync_through_managed_database() {
+#[ignore = "needs a running somme-cloud at SOMME_CLOUD_URL and a person to sign in with GitHub"]
+async fn sign_in_then_two_devices_sync_through_managed_database() {
     let Some(url) = cloud_url() else { return };
     let cloud: Arc<dyn CloudAccounts> = Arc::new(HttpCloudClient::new(&url).unwrap());
-    let email = format!("e2e-{}@somme.test", new_id().simple());
-    let session = cloud.register(&email, "managed sync test pw").await.unwrap();
-    assert!(matches!(
-        cloud.register(&email, "managed sync test pw").await,
-        Err(CloudError::Rejected(_))
-    ));
-    assert!(matches!(
-        cloud.login(&email, "not the password").await,
-        Err(CloudError::Rejected(_))
-    ));
+    let session = cloud.sign_in_with_github().await.unwrap();
+    assert!(!session.profile.login.is_empty());
 
     let credentials = cloud.credentials(&session).await.unwrap();
     assert!(credentials.url.starts_with("libsql://somme-"));
@@ -73,7 +65,8 @@ async fn sign_up_then_two_devices_sync_through_managed_database() {
     repo_a.save(&snippet).await.unwrap();
     store_a.backend().synced().unwrap().push().await.unwrap();
 
-    let second_login = cloud.login(&email, "managed sync test pw").await.unwrap();
+    // GitHub remembers the app, so the second sign-in finishes without a click.
+    let second_login = cloud.sign_in_with_github().await.unwrap();
     let b = Backend::open_synced(&dir_b.path().join("b.db"), &credentials.url, device(second_login.clone()))
         .await
         .unwrap();

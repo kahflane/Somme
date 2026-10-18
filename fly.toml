@@ -1,5 +1,6 @@
 # Somme Cloud on Fly.io. Deploy from the repo root: fly deploy --ha=false
-# Secrets (set with `fly secrets`): TURSO_API, TURSO_ORG, optional TURSO_GROUP.
+# Secrets (set with `fly secrets`): TURSO_API, TURSO_ORG, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET,
+# optional TURSO_GROUP.
 app = "somme-cloud"
 primary_region = "sin"
 

@@ -1,17 +1,30 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use russh_sftp::client::SftpSession;
+use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::client::fs::Metadata;
+use russh_sftp::protocol::StatusCode;
 use somme_application::ports::{GatewayError, RemoteEntry, RemoteFs};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 
 use crate::ssh::connect::Connection;
-use crate::ssh::connection_error;
+use crate::ssh::{connection_error, sudo};
 
 fn transfer(err: impl std::fmt::Display) -> GatewayError {
     GatewayError::Transfer(err.to_string())
+}
+
+/// Like [`transfer`], but tells a refused file apart, so the user can be
+/// offered sudo.
+fn file_error(err: SftpError) -> GatewayError {
+    match &err {
+        SftpError::Status(status) if status.status_code == StatusCode::PermissionDenied => GatewayError::PermissionDenied,
+        _ => transfer(err),
+    }
 }
 
 // Entry names come from the server. A hostile server could send "../x" or a
@@ -28,13 +41,37 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
+fn entry(path: &str, meta: &Metadata) -> RemoteEntry {
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    RemoteEntry {
+        name: name.to_owned(),
+        path: path.to_owned(),
+        is_dir: meta.is_dir(),
+        is_symlink: meta.is_symlink(),
+        size: meta.size.unwrap_or(0),
+        modified_at: meta.mtime.map(|t| i64::from(t) * 1000),
+        permissions: meta.permissions.map(|_| meta.permissions().to_string()),
+    }
+}
+
 pub struct SftpFs {
-    conn: Connection,
+    conn: Arc<Connection>,
     sftp: SftpSession,
+    /// Closing ends the connection too, unless a terminal shares it.
+    owns_connection: bool,
 }
 
 impl SftpFs {
     pub async fn start(conn: Connection) -> Result<Self, GatewayError> {
+        Self::open(Arc::new(conn), true).await
+    }
+
+    /// File access beside a terminal, on its connection.
+    pub async fn beside(conn: Arc<Connection>) -> Result<Self, GatewayError> {
+        Self::open(conn, false).await
+    }
+
+    async fn open(conn: Arc<Connection>, owns_connection: bool) -> Result<Self, GatewayError> {
         let channel = conn
             .target()
             .channel_open_session()
@@ -45,7 +82,11 @@ impl SftpFs {
             .await
             .map_err(connection_error)?;
         let sftp = SftpSession::new(channel.into_stream()).await.map_err(transfer)?;
-        Ok(Self { conn, sftp })
+        Ok(Self {
+            conn,
+            sftp,
+            owns_connection,
+        })
     }
 
     fn remove_tree<'a>(&'a self, path: &'a str) -> Pin<Box<dyn Future<Output = Result<(), GatewayError>> + Send + 'a>> {
@@ -119,9 +160,46 @@ impl RemoteFs for SftpFs {
         target.shutdown().await.map_err(transfer)
     }
 
+    async fn stat(&self, path: &str) -> Result<RemoteEntry, GatewayError> {
+        let meta = self.sftp.metadata(path).await.map_err(file_error)?;
+        Ok(entry(path, &meta))
+    }
+
+    async fn read(&self, path: &str, limit: u64) -> Result<Vec<u8>, GatewayError> {
+        let size = self.sftp.metadata(path).await.map_err(file_error)?.size.unwrap_or(0);
+        if size > limit {
+            return Err(GatewayError::Transfer(format!("the file is over {} MB", limit / (1024 * 1024))));
+        }
+        let mut file = self.sftp.open(path).await.map_err(file_error)?;
+        let mut bytes = Vec::new();
+        // The file may grow while it is read.
+        (&mut file).take(limit + 1).read_to_end(&mut bytes).await.map_err(transfer)?;
+        let _ = file.shutdown().await;
+        if bytes.len() as u64 > limit {
+            return Err(GatewayError::Transfer(format!("the file is over {} MB", limit / (1024 * 1024))));
+        }
+        Ok(bytes)
+    }
+
+    async fn write(&self, path: &str, data: &[u8]) -> Result<(), GatewayError> {
+        let mut file = self.sftp.create(path).await.map_err(file_error)?;
+        file.write_all(data).await.map_err(transfer)?;
+        file.shutdown().await.map_err(transfer)
+    }
+
+    async fn read_as_root(&self, path: &str, limit: u64, password: Option<&str>) -> Result<Vec<u8>, GatewayError> {
+        sudo::read(&self.conn, path, limit, password).await
+    }
+
+    async fn write_as_root(&self, path: &str, data: &[u8], password: Option<&str>) -> Result<(), GatewayError> {
+        sudo::write(&self.conn, path, data, password).await
+    }
+
     async fn close(&self) {
         let _ = self.sftp.close().await;
-        self.conn.disconnect().await;
+        if self.owns_connection {
+            self.conn.disconnect().await;
+        }
     }
 }
 

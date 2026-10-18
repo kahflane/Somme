@@ -240,23 +240,6 @@ async fn run_step(line: &str, base: &Path, window: AnyWindowHandle, cx: &mut Asy
             }
             println!("bench: {:.2} ms per frame over {n} frames", total.as_secs_f64() * 1000. / f64::from(n));
         }
-        "move" => {
-            let mut parts = arg.split_whitespace().map(str::parse::<f32>);
-            let (Some(Ok(x)), Some(Ok(y))) = (parts.next(), parts.next()) else {
-                anyhow::bail!("expected: move X Y");
-            };
-            window.update(cx, |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.dispatch_event(
-                    PlatformInput::MouseMove(MouseMoveEvent {
-                        position: point(px(x), px(y)),
-                        pressed_button: None,
-                        modifiers: Modifiers::default(),
-                    }),
-                    cx,
-                );
-            })?;
-        }
         "action" => {
             let name = arg.trim().to_owned();
             window.update(cx, |_, window, cx| -> anyhow::Result<()> {

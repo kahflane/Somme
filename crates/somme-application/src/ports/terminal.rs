@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::ports::GatewayError;
+use crate::ports::{GatewayError, RemoteFs};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TermSize {
@@ -24,6 +24,17 @@ pub trait Terminal: Send + Sync {
 
     /// The folder the shell is in now. Only local terminals know it.
     fn cwd(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Whether the shell loads Somme's hooks, so marks will come.
+    fn has_hooks(&self) -> bool {
+        false
+    }
+
+    /// Files on the server an SSH shell runs on, over the same connection.
+    /// None for local shells, or when the server offers no file access.
+    async fn files(&self) -> Option<Arc<dyn RemoteFs>> {
         None
     }
 }

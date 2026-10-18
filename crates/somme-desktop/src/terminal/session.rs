@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,10 +22,11 @@ use crate::services::Services;
 use crate::settings::Settings;
 use crate::terminal::blocks::{self, Block, BlockState, GitInfo};
 use crate::terminal::colors;
+use crate::terminal::disk::Disk;
 use crate::terminal::log::{self, SessionLog};
 use crate::terminal::marks::{Mark, MarkScanner, Piece};
 
-/// How long a new local terminal waits for the shell hooks before showing a classic screen.
+/// How long a new terminal waits for the shell hooks before showing a classic screen.
 pub const HOOKS_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug)]
@@ -94,19 +96,24 @@ pub enum SessionEvent {
     PhaseChanged,
 }
 
-/// Command blocks for a local shell that runs Somme's hooks.
+/// Command blocks for a shell that runs Somme's hooks.
 #[derive(Default)]
 pub struct Blocks {
     pub list: Vec<Block>,
     /// Set once the shell's first prompt mark arrives.
     pub ready: bool,
-    /// The shell's folder at its last prompt.
+    /// The shell's folder at its last prompt. On a server it is the server's folder.
     pub cwd: Option<PathBuf>,
     pub git: Option<GitInfo>,
     /// The shell's PATH, for completing command names.
     pub path: Option<String>,
+    /// The user's home folder where the shell runs.
+    pub home: Option<PathBuf>,
     /// The command sent from the editor, until the shell starts it.
     pending: Option<String>,
+    /// Since when the view waits for the hooks' first mark. Unset when the
+    /// shell runs without them.
+    waiting_since: Option<Instant>,
 }
 
 impl Blocks {
@@ -161,7 +168,7 @@ pub struct TerminalSession {
     line_buffer: String,
     pub history: Vec<String>,
     scanner: MarkScanner,
-    /// Set for local shells started with the hooks.
+    /// Set when command blocks are on; used once the shell's hooks report in.
     pub blocks: Option<Blocks>,
 }
 
@@ -182,7 +189,7 @@ impl TerminalSession {
                 .flatten();
             let listener = Listener::default();
             let size = GridSize::default();
-            let blocks = (matches!(target, SessionTarget::Local) && settings.command_blocks).then(Blocks::default);
+            let blocks = (!replay && settings.command_blocks).then(Blocks::default);
             let mut session = Self {
                 target,
                 start_dir,
@@ -213,9 +220,10 @@ impl TerminalSession {
         }
         // A local shell's folder says more than the title it sets.
         if let SessionTarget::Local = self.target
-            && let Some(cwd) = self.blocks.as_ref().and_then(|blocks| blocks.cwd.as_deref())
+            && let Some(blocks) = self.blocks.as_ref()
+            && let Some(cwd) = blocks.cwd.as_deref()
         {
-            return blocks::short_path(cwd).into();
+            return blocks::short_path(cwd, blocks.home.as_deref()).into();
         }
         if let Some(title) = self.title.as_ref().filter(|t| !t.trim().is_empty()) {
             return title.clone().into();
@@ -251,7 +259,7 @@ impl TerminalSession {
         match &self.blocks {
             None => false,
             Some(blocks) if blocks.ready => !self.term().mode().contains(TermMode::ALT_SCREEN),
-            Some(_) => self.is_running() && self.started_at.elapsed() < HOOKS_WAIT,
+            Some(blocks) => self.is_running() && blocks.waiting_since.is_some_and(|since| since.elapsed() < HOOKS_WAIT),
         }
     }
 
@@ -284,6 +292,28 @@ impl TerminalSession {
         matches!(self.target, SessionTarget::Replay { .. })
     }
 
+    /// Whether the shell runs on this computer, so its folders are local ones.
+    pub fn is_local(&self) -> bool {
+        matches!(self.target, SessionTarget::Local)
+    }
+
+    /// Where this shell's files are. On a server, this opens file access over
+    /// the session's connection; None when the server offers none.
+    pub fn disk(&self) -> impl Future<Output = Option<Disk>> + 'static {
+        let local = self.is_local();
+        let id = self.session_id.filter(|_| self.is_running());
+        let home = self.blocks.as_ref().and_then(|blocks| blocks.home.clone());
+        let services = self.services.clone();
+        async move {
+            if local {
+                return Some(Disk::Local);
+            }
+            let id = id?;
+            let files = runtime::io(async move { services.sessions.files(id).await }).await?;
+            Some(Disk::Remote { files, home })
+        }
+    }
+
     /// Opens (or reopens) the connection. Screen contents are kept.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
         if let SessionTarget::Replay { file, .. } = &self.target {
@@ -305,12 +335,7 @@ impl TerminalSession {
                 block.finish(-1, size);
             }
             blocks.ready = false;
-            // Show the classic screen once the wait is over, if the hooks never report in.
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(HOOKS_WAIT).await;
-                let _ = this.update(cx, |_, cx| cx.notify());
-            })
-            .detach();
+            blocks.waiting_since = Some(Instant::now());
         }
         cx.emit(SessionEvent::StatusChanged);
 
@@ -353,7 +378,9 @@ impl TerminalSession {
                         };
                         sessions.open_local(size, options, move |_| sink)
                     }
-                    SessionTarget::Ssh { host_id, .. } => sessions.open_ssh(host_id, size, move |_| sink).await,
+                    SessionTarget::Ssh { host_id, .. } => {
+                        sessions.open_ssh(host_id, size, token.as_deref(), move |_| sink).await
+                    }
                     SessionTarget::Replay { .. } => unreachable!("replays never connect"),
                 }
             })
@@ -365,6 +392,7 @@ impl TerminalSession {
                         if session.status == Status::Connecting {
                             session.status = Status::Connected;
                         }
+                        session.wait_for_hooks(services.sessions.has_hooks(id), cx);
                         runtime::handle().spawn(write_loop(services, id, io_rx));
                     }
                     Err(err) => {
@@ -380,6 +408,20 @@ impl TerminalSession {
             });
         })
         .detach();
+    }
+
+    /// Waits a little for the hooks' first mark, or shows the classic screen
+    /// right away when the shell runs without them.
+    fn wait_for_hooks(&mut self, hooks: bool, cx: &mut Context<Self>) {
+        let Some(blocks) = self.blocks.as_mut().filter(|blocks| !blocks.ready) else { return };
+        blocks.waiting_since = hooks.then(Instant::now);
+        if hooks {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(HOOKS_WAIT).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
     }
 
     fn load_replay(&mut self, file: String, cx: &mut Context<Self>) {
@@ -480,11 +522,15 @@ impl TerminalSession {
             Mark::Prompt { exit, cwd } => {
                 if !blocks.ready {
                     blocks.ready = true;
-                    // The main screen now only holds hidden prompts, so it needs no history.
-                    self.term.set_options(TermConfig {
+                    // What the shell printed so far, like a server's welcome
+                    // message, becomes the first block. The main screen then only
+                    // holds hidden prompts, so it needs no history.
+                    let config = TermConfig {
                         scrolling_history: 0,
                         ..TermConfig::default()
-                    });
+                    };
+                    let startup = std::mem::replace(&mut self.term, Term::new(config, &size, self.listener.clone()));
+                    blocks.list.extend(Block::startup(startup, size));
                 }
                 if let Some(block) = blocks.live_mut() {
                     block.finish(exit, size);
@@ -513,6 +559,10 @@ impl TerminalSession {
             }
             Mark::Path(path) => {
                 blocks.path = Some(path);
+                return;
+            }
+            Mark::Home(home) => {
+                blocks.home = Some(home);
                 return;
             }
             Mark::Command(command) => {
@@ -546,6 +596,9 @@ impl TerminalSession {
 
     /// Looks up the branch and changes for the shell's folder in the background.
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        if !self.is_local() {
+            return;
+        }
         let Some(dir) = self.blocks.as_ref().and_then(|b| b.cwd.clone()) else { return };
         cx.spawn(async move |this, cx| {
             let lookup = dir.clone();

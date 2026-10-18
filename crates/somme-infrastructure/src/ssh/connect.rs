@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use russh::client::{self, Handle};
@@ -18,6 +18,8 @@ pub type SshHandle = Handle<ClientHandler>;
 
 pub struct Connection {
     hops: Vec<Arc<SshHandle>>,
+    server_id: Arc<OnceLock<String>>,
+    banner: Arc<Mutex<String>>,
 }
 
 fn config() -> Arc<client::Config> {
@@ -38,9 +40,13 @@ impl Connection {
     ) -> Result<Self, GatewayError> {
         let config = config();
         let mut hops: Vec<Arc<SshHandle>> = Vec::with_capacity(plan.hops.len());
+        let mut server_id = Arc::default();
+        let mut banner = Arc::default();
         let last = plan.hops.len().saturating_sub(1);
         for (index, hop) in plan.hops.iter().enumerate() {
             let rejected = Arc::new(AtomicBool::new(false));
+            server_id = Arc::new(OnceLock::new());
+            banner = Arc::new(Mutex::new(String::new()));
             let handler = ClientHandler {
                 title: hop.title.clone(),
                 host: hop.host.clone(),
@@ -52,6 +58,8 @@ impl Connection {
                 } else {
                     RemoteForwards::default()
                 },
+                server_id: Arc::clone(&server_id),
+                banner: Arc::clone(&banner),
             };
             let connected = tokio::time::timeout(
                 CONNECT_TIMEOUT,
@@ -70,11 +78,21 @@ impl Connection {
         if hops.is_empty() {
             return Err(GatewayError::Connection("nothing to connect to".into()));
         }
-        Ok(Self { hops })
+        Ok(Self { hops, server_id, banner })
     }
 
     pub fn target(&self) -> &Arc<SshHandle> {
         &self.hops[self.hops.len() - 1]
+    }
+
+    /// The last server's version line, such as `SSH-2.0-OpenSSH_9.6`.
+    pub fn server_id(&self) -> Option<&str> {
+        self.server_id.get().map(String::as_str)
+    }
+
+    /// The last server's pre-login banner, once. Empty when it sent none.
+    pub fn take_banner(&self) -> String {
+        self.banner.lock().map(|mut text| std::mem::take(&mut *text)).unwrap_or_default()
     }
 
     pub fn is_closed(&self) -> bool {

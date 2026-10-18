@@ -3,5 +3,6 @@
 pub mod language;
 pub mod lsp;
 pub mod pane;
+pub mod sudo;
 
 pub use pane::{EditorPane, EditorPaneEvent};

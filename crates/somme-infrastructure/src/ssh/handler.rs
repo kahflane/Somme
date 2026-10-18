@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use dashmap::DashMap;
 use russh::keys::{HashAlg, PublicKeyOrCertificate};
-use russh::{Channel, client};
+use russh::{Channel, Names, client};
 use somme_application::ports::{HostKeyVerifier, ServerKey};
 use tokio::net::TcpStream;
 
@@ -27,6 +27,10 @@ pub struct ClientHandler {
     pub verifier: Arc<dyn HostKeyVerifier>,
     pub rejected: Arc<AtomicBool>,
     pub remote_forwards: RemoteForwards,
+    /// The server's version line, such as `SSH-2.0-OpenSSH_9.6`.
+    pub server_id: Arc<OnceLock<String>>,
+    /// Text the server sends before login, from its `Banner` setting.
+    pub banner: Arc<Mutex<String>>,
 }
 
 fn describe(key: &PublicKeyOrCertificate) -> ServerKey {
@@ -50,6 +54,23 @@ impl client::Handler for ClientHandler {
             self.rejected.store(true, Ordering::SeqCst);
         }
         Ok(accepted)
+    }
+
+    async fn auth_banner(&mut self, banner: &str, _session: &mut client::Session) -> Result<(), Self::Error> {
+        if let Ok(mut text) = self.banner.lock() {
+            text.push_str(banner);
+        }
+        Ok(())
+    }
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        _names: &Names,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let _ = self.server_id.set(String::from_utf8_lossy(session.remote_sshid()).into_owned());
+        Ok(())
     }
 
     async fn server_channel_open_forwarded_tcpip(

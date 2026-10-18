@@ -8,6 +8,7 @@ pub mod keychain;
 pub mod known_hosts;
 pub mod lock;
 pub mod logs;
+pub mod menus;
 pub mod native;
 pub mod palette;
 pub mod sftp;

@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint};
 use alacritty_terminal::term::cell::Flags;
-use gpui_kit::{AppContext as _, Context, Pixels, Point, Window};
+use gpui_kit::{Context, Pixels, Point, Window};
 
 use super::{TerminalView, TerminalViewEvent, picker};
 use crate::terminal::blocks::Block;
 use crate::terminal::complete;
+use crate::terminal::disk::Disk;
 
 /// Words on each side of the hovered one that may join it, for names with spaces.
 const JOIN_WORDS: usize = 2;
@@ -68,18 +69,20 @@ impl TerminalView {
     }
 
     /// Looks for a file or folder name under the mouse. The disk is checked off
-    /// the UI thread, as a path can sit on a slow network drive.
+    /// the UI thread, as a path can sit on a slow network drive or a server.
     pub(super) fn hover_link(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some((block, point)) = self.output_cell(position) else { return self.clear_link(cx) };
         if self.link.as_ref().is_some_and(|link| link.contains(block, point)) {
             return;
         }
-        let found = self.session.read(cx).blocks.as_ref().and_then(|blocks| {
+        let session = self.session.read(cx);
+        let found = session.blocks.as_ref().and_then(|blocks| {
             let entry = blocks.list.get(block)?;
             let (start, candidates) = candidates(&row(entry, point.line)?, point.column.0)?;
-            let bases = bases(entry.cwd.as_deref()?, &entry.command);
+            let bases = bases(entry.cwd.as_deref()?, &entry.command, blocks.home.as_deref());
             Some((start, candidates, bases))
         });
+        let disk = session.disk();
         let Some((start, candidates, bases)) = found else { return self.clear_link(cx) };
         let probe = Probe {
             block,
@@ -92,7 +95,8 @@ impl TerminalView {
         self.clear_link(cx);
         self.link_probe = Some(probe);
         cx.spawn(async move |this, cx| {
-            let found = cx.background_spawn(async move { find(&candidates, &bases) }).await;
+            let Some(disk) = disk.await else { return };
+            let found = disk.run(move |disk| find(&candidates, &bases, disk)).await;
             let _ = this.update(cx, |view, cx| {
                 if view.link_probe == Some(probe) {
                     view.link = found.map(|(columns, path, dir)| PathLink {
@@ -238,14 +242,14 @@ fn trim_name(chars: &[char]) -> Range<usize> {
 
 /// Folders a relative name is looked up in: where the command ran, and for
 /// `ls` and the like, the folders it listed.
-fn bases(cwd: &Path, command: &str) -> Vec<PathBuf> {
+fn bases(cwd: &Path, command: &str, home: Option<&Path>) -> Vec<PathBuf> {
     let mut bases = vec![cwd.to_path_buf()];
     let mut words = command.split_whitespace();
     let program = words.next().unwrap_or_default();
     if LISTERS.contains(&program.rsplit('/').next().unwrap_or_default()) {
         for word in words.filter(|word| !word.starts_with('-')) {
             let word = word.trim_matches(['\'', '"']);
-            if let Some(path) = resolve(word, cwd) {
+            if let Some(path) = resolve(word, cwd, home) {
                 bases.push(path);
             }
         }
@@ -253,27 +257,28 @@ fn bases(cwd: &Path, command: &str) -> Vec<PathBuf> {
     bases
 }
 
-fn resolve(text: &str, base: &Path) -> Option<PathBuf> {
+fn resolve(text: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
     if text == "~" {
-        return dirs::home_dir();
+        return home.map(Path::to_path_buf);
     }
     if let Some(rest) = text.strip_prefix("~/") {
-        return dirs::home_dir().map(|home| home.join(rest));
+        return home.map(|home| home.join(rest));
     }
     Some(base.join(text))
 }
 
 /// The first candidate that is on disk, with its columns and whether it is a folder.
-fn find(candidates: &[Candidate], bases: &[PathBuf]) -> Option<(Range<usize>, PathBuf, bool)> {
+fn find(candidates: &[Candidate], bases: &[PathBuf], disk: &Disk) -> Option<(Range<usize>, PathBuf, bool)> {
+    let home = disk.home();
     let mut seen = Vec::new();
     for candidate in candidates {
         for base in bases {
-            let Some(path) = resolve(&candidate.text, base) else { continue };
+            let Some(path) = resolve(&candidate.text, base, home.as_deref()) else { continue };
             if seen.contains(&path) {
                 continue;
             }
-            if let Ok(meta) = std::fs::metadata(&path) {
-                return Some((candidate.columns.clone(), path, meta.is_dir()));
+            if let Some(dir) = disk.is_dir(&path) {
+                return Some((candidate.columns.clone(), path, dir));
             }
             seen.push(path);
         }
@@ -336,11 +341,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("somme-links-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub/inner")).unwrap();
         std::fs::write(dir.join("sub/notes.txt"), "").unwrap();
-        let bases = bases(&dir, "ls -l sub");
+        let bases = bases(&dir, "ls -l sub", None);
         let (_, found) = candidates(&row("-rw-r--r-- 1 me staff 0 notes.txt"), 26).unwrap();
-        let hit = find(&found, &bases);
-        let missing = find(&candidates(&row("nothing-here"), 2).unwrap().1, &bases);
-        let folder = find(&candidates(&row("inner"), 2).unwrap().1, &bases);
+        let hit = find(&found, &bases, &Disk::Local);
+        let missing = find(&candidates(&row("nothing-here"), 2).unwrap().1, &bases, &Disk::Local);
+        let folder = find(&candidates(&row("inner"), 2).unwrap().1, &bases, &Disk::Local);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(hit, Some((24..33, dir.join("sub/notes.txt"), false)));
         assert_eq!(missing, None);
