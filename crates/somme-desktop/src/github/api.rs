@@ -5,6 +5,7 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Method, StatusCode, header};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -610,6 +611,8 @@ impl GitHub {
     }
 
     pub async fn delete_branch(&self, repo: &Repo, branch: &str) -> Result<(), ApiError> {
+        let branch =
+            branch_path(branch).ok_or_else(|| ApiError::Failed(format!("Somme can not delete a branch named {branch}.")))?;
         let request = self.request(Method::DELETE, &format!("/repos/{}/git/refs/heads/{branch}", repo.full_name()));
         self.send(request).await.map(drop)
     }
@@ -824,9 +827,31 @@ pub fn short_sha(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
 
+/// Characters kept as they are in a URL path segment.
+const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+
+/// A branch name as URL path segments, each encoded, so a `#`, `?` or `%` in
+/// the name can not change which URL is called. Branch names come from pull
+/// request authors.
+fn branch_path(branch: &str) -> Option<String> {
+    let segments: Vec<&str> = branch.split('/').collect();
+    if segments.iter().any(|segment| segment.is_empty() || *segment == "." || *segment == "..") {
+        return None;
+    }
+    Some(segments.iter().map(|segment| utf8_percent_encode(segment, SEGMENT).to_string()).collect::<Vec<_>>().join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_names_stay_inside_the_url_path() {
+        assert_eq!(branch_path("feature/login").as_deref(), Some("feature/login"));
+        assert_eq!(branch_path("fix#1?x=%41").as_deref(), Some("fix%231%3Fx%3D%2541"));
+        assert_eq!(branch_path("a/../../../user"), None);
+        assert_eq!(branch_path("a//b"), None);
+    }
 
     #[test]
     fn reads_a_search_page() {

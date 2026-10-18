@@ -6,6 +6,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
@@ -32,7 +33,40 @@ pub enum Listener {
     #[cfg(unix)]
     Unix { listener: tokio::net::UnixListener, owner: u32 },
     #[cfg_attr(unix, allow(dead_code))]
-    Tcp { listener: tokio::net::TcpListener, token: String },
+    Tcp { listener: tokio::net::TcpListener, token: Arc<str> },
+}
+
+/// A connection that may still have to show it may come in.
+pub enum Incoming {
+    Ready(Stream),
+    #[cfg_attr(unix, allow(dead_code))]
+    Tcp { stream: tokio::net::TcpStream, token: Arc<str> },
+}
+
+impl Incoming {
+    /// The connection, if it may come in. A TCP one has a few seconds to send
+    /// the secret, so run this on the connection's own task, where a slow
+    /// one holds up no one else.
+    pub async fn admit(self) -> Option<Stream> {
+        match self {
+            Incoming::Ready(stream) => Some(stream),
+            Incoming::Tcp { stream, token } => {
+                let mut stream = BufReader::new(stream);
+                let mut line = Vec::new();
+                let read = tokio::time::timeout(Duration::from_secs(5), async {
+                    use tokio::io::AsyncReadExt as _;
+                    (&mut stream).take(256).read_until(b'\n', &mut line).await
+                })
+                .await;
+                let given = String::from_utf8_lossy(&line);
+                if !matches!(read, Ok(Ok(_))) || !same(given.trim_end().as_bytes(), token.as_bytes()) {
+                    tracing::warn!("refused an agent connection without the secret");
+                    return None;
+                }
+                Some(Box::new(stream))
+            }
+        }
+    }
 }
 
 /// What [`Listener::bind`] made, so it can be removed again, and only if no
@@ -121,11 +155,12 @@ impl Listener {
             stamp: stamp(&path),
             path,
         };
-        Ok((Listener::Tcp { listener, token }, mark))
+        Ok((Listener::Tcp { listener, token: token.into() }, mark))
     }
 
-    /// The next agent. `None` when the one who knocked may not come in.
-    pub async fn accept(&self) -> io::Result<Option<Stream>> {
+    /// The next agent, still to be let in with [`Incoming::admit`]. `None`
+    /// when the one who knocked may not come in.
+    pub async fn accept(&self) -> io::Result<Option<Incoming>> {
         match self {
             #[cfg(unix)]
             Listener::Unix { listener, owner } => {
@@ -134,23 +169,14 @@ impl Listener {
                     tracing::warn!("refused an agent connection from another user");
                     return Ok(None);
                 }
-                Ok(Some(Box::new(stream)))
+                Ok(Some(Incoming::Ready(Box::new(stream))))
             }
             Listener::Tcp { listener, token } => {
                 let (stream, _) = listener.accept().await?;
-                let mut stream = BufReader::new(stream);
-                let mut line = Vec::new();
-                let read = tokio::time::timeout(Duration::from_secs(5), async {
-                    use tokio::io::AsyncReadExt as _;
-                    (&mut stream).take(256).read_until(b'\n', &mut line).await
-                })
-                .await;
-                let given = String::from_utf8_lossy(&line);
-                if !matches!(read, Ok(Ok(_))) || !same(given.trim_end().as_bytes(), token.as_bytes()) {
-                    tracing::warn!("refused an agent connection without the secret");
-                    return Ok(None);
-                }
-                Ok(Some(Box::new(stream)))
+                Ok(Some(Incoming::Tcp {
+                    stream,
+                    token: token.clone(),
+                }))
             }
         }
     }
@@ -211,7 +237,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut answers = Vec::new();
             for _ in 0..2 {
-                answers.push(match listener.accept().await.unwrap() {
+                answers.push(match listener.accept().await.unwrap().unwrap().admit().await {
                     Some(mut stream) => {
                         stream.write_all(b"hello\n").await.unwrap();
                         true
@@ -234,6 +260,30 @@ mod tests {
         drop(listener);
         mark.remove();
         assert!(!dir.path().join(ENDPOINT).exists());
+    }
+
+    #[tokio::test]
+    async fn a_silent_caller_holds_up_no_one_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (listener, _mark) = Listener::bind_tcp(dir.path()).unwrap();
+        let server = tokio::spawn(async move {
+            let mut admitted = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let incoming = listener.accept().await.unwrap().unwrap();
+                admitted.spawn(async move {
+                    let mut stream = incoming.admit().await?;
+                    stream.write_all(b"hello\n").await.ok()
+                });
+            }
+            admitted
+        });
+        let port = read_endpoint(&dir.path().join(ENDPOINT)).unwrap().port;
+        let _silent = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut agent = connect_tcp(dir.path()).await.unwrap();
+        let mut greeting = [0; 6];
+        tokio::time::timeout(Duration::from_secs(2), agent.read_exact(&mut greeting)).await.unwrap().unwrap();
+        assert_eq!(&greeting, b"hello\n");
+        server.await.unwrap().abort_all();
     }
 
     #[test]
