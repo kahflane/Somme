@@ -10,7 +10,7 @@ use gpui_kit::{
 
 use crate::runtime;
 use crate::store::Store;
-use crate::ui::common::{APP_NAME, logo, notify_error, notify_ok};
+use crate::ui::common::{logo, notify_error, notify_ok};
 
 const MIN_PASSWORD: usize = 8;
 
@@ -158,11 +158,11 @@ impl Render for LockScreen {
         let setup = !status.initialized;
         let (title, detail) = if setup {
             (
-                SharedString::from("Create your vault"),
-                "Hosts, keys and passwords are encrypted with a master password. It never leaves this computer.",
+                SharedString::from("Set a master password"),
+                "It encrypts your saved servers, SSH keys and passwords. It never leaves this computer.",
             )
         } else {
-            (format!("Unlock {APP_NAME}").into(), "Enter your master password to open the vault.")
+            ("Enter your master password".into(), "It unlocks your saved servers, SSH keys and passwords.")
         };
 
         let form = v_flex()
@@ -196,7 +196,7 @@ impl Render for LockScreen {
                     .primary()
                     .w_full()
                     .loading(self.busy)
-                    .label(if setup { "Create Vault" } else { "Unlock" })
+                    .label(if setup { "Set Password" } else { "Unlock" })
                     .on_click(cx.listener(|screen, _, window, cx| screen.submit(window, cx))),
             )
             .when(setup, |form| {
@@ -204,7 +204,7 @@ impl Render for LockScreen {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("If you forget this password, the vault cannot be recovered."),
+                        .child("If you forget this password, your saved servers and keys cannot be recovered."),
                 )
             });
 

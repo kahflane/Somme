@@ -65,8 +65,11 @@ impl TursoSync {
         Arc::clone(&self.store)
     }
 
+    /// Syncs in the background from now on. Only the first call starts it.
     pub fn start(self: &Arc<Self>, events: Arc<dyn EventPublisher>) {
-        let _ = self.events.set(events);
+        if self.events.set(events).is_err() {
+            return;
+        }
         let this = Arc::clone(self);
         tokio::spawn(async move {
             loop {

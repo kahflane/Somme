@@ -177,7 +177,31 @@ impl SidePanel {
     fn render_snippets(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let query = self.search.read(cx).value().trim().to_lowercase();
-        let snippets = Store::global(cx).read(cx).snippets.clone();
+        let store = Store::global(cx).read(cx);
+        if !store.is_unlocked() {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_4()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_center()
+                        .text_color(theme.muted_foreground)
+                        .child("Snippets are locked with your master password."),
+                )
+                .child(
+                    Button::new("panel-unlock")
+                        .small()
+                        .icon(Icon::new(Lucide::LockOpen))
+                        .label("Unlock")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidePanelEvent::ManageSnippets))),
+                )
+                .into_any_element();
+        }
+        let snippets = store.snippets.clone();
         let total = snippets.len();
         let matches: Vec<_> = snippets
             .into_iter()

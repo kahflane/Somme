@@ -1,4 +1,4 @@
-//! The menu bar: Somme, File, Edit, View, Tab, Blocks, Vault, Window and Help.
+//! The menu bar: Somme, File, Edit, View, Tab, Blocks, SSH, Window and Help.
 //!
 //! Most items run the same actions as their keyboard shortcuts. Edit items press
 //! the shortcut instead, so they reach whatever has focus: a terminal, the
@@ -15,7 +15,7 @@ use crate::ui::common::APP_NAME;
 use crate::ui::native;
 use crate::ui::workspace::{
     CloseTab, ClosePane, FocusNextPane, FocusPreviousPane, LockVault, NewLocalTerminal, NextTab, OpenSettings,
-    PreviousTab, Quit, RenameTab, ShowForwarding, ShowHome, ShowHosts, ShowKeychain, ShowKnownHosts, ShowLogs,
+    PreviousTab, Quit, RenameTab, ShowForwarding, ShowHosts, ShowKeychain, ShowKnownHosts, ShowLogs,
     ShowSnippets, SplitDown, SplitRight, ToggleBroadcast, TogglePalette, ToggleSidePanel,
 };
 
@@ -185,9 +185,7 @@ fn menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Clear Blocks", Clear),
         ]),
-        Menu::new("Vault").items([
-            MenuItem::action("Show Vault", ShowHome),
-            MenuItem::separator(),
+        Menu::new("SSH").items([
             MenuItem::action("Hosts", ShowHosts),
             MenuItem::action("Keychain", ShowKeychain),
             MenuItem::action("Snippets", ShowSnippets),
@@ -195,7 +193,7 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("Known Hosts", ShowKnownHosts),
             MenuItem::action("Logs", ShowLogs),
             MenuItem::separator(),
-            MenuItem::action("Lock Vault", LockVault),
+            MenuItem::action("Lock Saved Servers and Keys", LockVault),
         ]),
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),

@@ -26,6 +26,8 @@ pub enum PaletteAction {
     NewLocalTerminal,
     Page(Page),
     Lock,
+    /// Opens the SSH section, which asks for the master password.
+    Unlock,
 }
 
 pub enum PaletteEvent {
@@ -159,12 +161,17 @@ fn rows(query: &str, cx: &App) -> Vec<Row> {
             },
         );
     }
+    let (title, action, icon) = if store.is_unlocked() {
+        ("Lock Saved Servers and Keys", PaletteAction::Lock, Lucide::Lock)
+    } else {
+        ("Unlock Saved Servers and Keys", PaletteAction::Unlock, Lucide::LockOpen)
+    };
     add(
-        "Lock Vault",
+        title,
         Row {
-            action: PaletteAction::Lock,
-            icon: Icon::new(Lucide::Lock),
-            title: "Lock Vault".into(),
+            action,
+            icon: Icon::new(icon),
+            title: title.into(),
             detail: "".into(),
             kind: "Command",
         },

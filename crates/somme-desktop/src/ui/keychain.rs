@@ -634,7 +634,7 @@ impl Render for KeyImport {
                     .child(div().font_family(theme.mono_font_family.clone()).child(Textarea::new(&self.private_key))),
             )
             .child(labeled("Passphrase", Input::new(&self.passphrase).mask_toggle()))
-            .child(subtle("The key is encrypted and stored in your vault.", cx))
+            .child(subtle("The key is encrypted with your master password.", cx))
             .when_some(self.error.clone(), |col, err| {
                 col.child(div().text_sm().text_color(theme.danger).child(err))
             })

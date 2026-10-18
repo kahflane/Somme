@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -205,30 +206,88 @@ struct StoredSession {
     avatar_url: Option<String>,
 }
 
-pub struct KeyringSessionStore {
-    keyring: KeyringStore,
+/// The non-secret part of a sign-in, kept beside the keychain item.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredProfile {
+    login: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 
-impl Default for KeyringSessionStore {
-    fn default() -> Self {
+/// Keeps the sign-in in the system keychain. Reading the keychain can stop
+/// and ask the user, so it happens once a run, and who is signed in is also
+/// written to a plain file the app can read at start without asking.
+pub struct KeyringSessionStore {
+    keyring: KeyringStore,
+    profile_file: PathBuf,
+    /// The keychain's answer, once asked.
+    read: StdMutex<Option<Option<CloudSession>>>,
+}
+
+impl KeyringSessionStore {
+    pub fn new(profile_file: PathBuf) -> Self {
         Self {
             keyring: KeyringStore::new(SESSION_USER),
+            profile_file,
+            read: StdMutex::new(None),
         }
+    }
+
+    fn remember(&self, session: Option<CloudSession>) {
+        let written = match &session {
+            Some(session) => serde_json::to_string(&StoredProfile {
+                login: session.profile.login.clone(),
+                name: session.profile.name.clone(),
+                avatar_url: session.profile.avatar_url.clone(),
+            })
+            .map_err(std::io::Error::other)
+            .and_then(|raw| std::fs::write(&self.profile_file, raw)),
+            None => match std::fs::remove_file(&self.profile_file) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(err) = written {
+            tracing::warn!(%err, "could not update the saved profile");
+        }
+        *self.read.lock().unwrap_or_else(PoisonError::into_inner) = Some(session);
     }
 }
 
 impl SessionStore for KeyringSessionStore {
     fn load(&self) -> Option<CloudSession> {
-        let raw = self.keyring.get_secret()?;
-        // Sessions saved before GitHub sign-in have no login and are dropped.
-        let stored: StoredSession = serde_json::from_str(&raw).ok()?;
-        Some(CloudSession {
-            token: Zeroizing::new(stored.token),
-            profile: CloudProfile {
-                login: stored.login,
-                name: stored.name,
-                avatar_url: stored.avatar_url,
-            },
+        if let Some(session) = self.read.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            return session.clone();
+        }
+        let session = self.keyring.get_secret().and_then(|raw| {
+            // Sessions saved before GitHub sign-in have no login and are dropped.
+            let stored: StoredSession = serde_json::from_str(&raw).ok()?;
+            Some(CloudSession {
+                token: Zeroizing::new(stored.token),
+                profile: CloudProfile {
+                    login: stored.login,
+                    name: stored.name,
+                    avatar_url: stored.avatar_url,
+                },
+            })
+        });
+        self.remember(session.clone());
+        session
+    }
+
+    fn profile(&self) -> Option<CloudProfile> {
+        if let Some(session) = self.read.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            return session.as_ref().map(|s| s.profile.clone());
+        }
+        let raw = std::fs::read_to_string(&self.profile_file).ok()?;
+        let stored: StoredProfile = serde_json::from_str(&raw).ok()?;
+        Some(CloudProfile {
+            login: stored.login,
+            name: stored.name,
+            avatar_url: stored.avatar_url,
         })
     }
 
@@ -244,13 +303,17 @@ impl SessionStore for KeyringSessionStore {
         );
         self.keyring
             .set_secret(&raw)
-            .map_err(|e| GatewayError::Io(e.to_string()))
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        self.remember(Some(session.clone()));
+        Ok(())
     }
 
     fn clear(&self) -> Result<(), GatewayError> {
         self.keyring
             .delete_secret()
-            .map_err(|e| GatewayError::Io(e.to_string()))
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        self.remember(None);
+        Ok(())
     }
 }
 
@@ -294,5 +357,31 @@ impl TokenSource for ManagedTokens {
 
     fn available(&self) -> bool {
         self.sessions.load().is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn who_is_signed_in_comes_from_the_file_until_the_keychain_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("account.json");
+        let store = KeyringSessionStore::new(file.clone());
+        assert_eq!(store.profile(), None);
+
+        std::fs::write(&file, r#"{"login":"octocat","avatarUrl":"https://avatars.example.test/1"}"#).unwrap();
+        let octocat = CloudProfile {
+            login: "octocat".into(),
+            name: None,
+            avatar_url: Some("https://avatars.example.test/1".into()),
+        };
+        assert_eq!(store.profile(), Some(octocat));
+
+        // Once the keychain has answered "nobody", the file goes too.
+        store.remember(None);
+        assert!(!file.exists());
+        assert_eq!(store.profile(), None);
     }
 }

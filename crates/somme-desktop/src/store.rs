@@ -31,6 +31,8 @@ pub struct Store {
     pub avatar: Option<Arc<Image>>,
     /// A GitHub sign-in is waiting on the browser.
     pub signing_in: bool,
+    /// Set once the vault and sign-in have been read from the keychain.
+    keychain_asked: bool,
     pub load_error: Option<String>,
     refresh_generation: usize,
 }
@@ -70,7 +72,12 @@ async fn load_lists(services: Arc<Services>) -> AppResult<Lists> {
 impl Store {
     pub fn init(services: Arc<Services>, cx: &mut App) -> Entity<Self> {
         let sync = services.sync.status();
-        let account = services.sync.account();
+        let account = AccountStatus {
+            signed_in: false,
+            login: None,
+            name: None,
+            avatar_url: None,
+        };
         let store = cx.new(|cx| {
             let mut store = Self {
                 services,
@@ -87,11 +94,11 @@ impl Store {
                 account,
                 avatar: None,
                 signing_in: false,
+                keychain_asked: false,
                 load_error: None,
                 refresh_generation: 0,
             };
-            store.check_vault(cx);
-            store.load_avatar(cx);
+            store.load_account(cx);
             store
         });
         cx.set_global(GlobalStore(store.clone()));
@@ -108,6 +115,27 @@ impl Store {
 
     pub fn is_unlocked(&self) -> bool {
         self.vault.is_some_and(|v| v.unlocked)
+    }
+
+    /// Opens what the SSH section needs. The keychain can stop and ask the
+    /// user, so nothing reads it before this: the vault key unlocks the vault,
+    /// and the GitHub sign-in lets sync start.
+    pub fn open_vault(&mut self, cx: &mut Context<Self>) {
+        if self.keychain_asked {
+            return;
+        }
+        self.keychain_asked = true;
+        self.check_vault(cx);
+        let services = self.services.clone();
+        cx.spawn(async move |this, cx| {
+            let account = runtime::io(async move {
+                services.start_sync();
+                services.sync.load_session()
+            })
+            .await;
+            let _ = this.update(cx, |store, cx| store.set_account(account, cx));
+        })
+        .detach();
     }
 
     pub fn check_vault(&mut self, cx: &mut Context<Self>) {
@@ -183,10 +211,24 @@ impl Store {
         .detach();
     }
 
-    /// Re-reads the signed-in account. This touches the system keychain, so it
-    /// only runs at start and after signing in or out.
+    /// Shows who is signed in at start. This reads the saved profile, not the
+    /// keychain.
+    fn load_account(&mut self, cx: &mut Context<Self>) {
+        let sync = self.services.sync.clone();
+        cx.spawn(async move |this, cx| {
+            let account = runtime::io(async move { sync.account() }).await;
+            let _ = this.update(cx, |store, cx| store.set_account(account, cx));
+        })
+        .detach();
+    }
+
+    /// Re-reads the signed-in account, after signing in or out.
     pub fn refresh_account(&mut self, cx: &mut Context<Self>) {
         let account = self.services.sync.account();
+        self.set_account(account, cx);
+    }
+
+    fn set_account(&mut self, account: AccountStatus, cx: &mut Context<Self>) {
         let new_picture = account.avatar_url != self.account.avatar_url;
         self.account = account;
         if new_picture {

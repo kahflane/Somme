@@ -26,7 +26,7 @@ pub struct SettingsPage {
     start_page: usize,
 }
 
-const ACCOUNT_PAGE: usize = 3;
+const ACCOUNT_PAGE: usize = 4;
 
 impl SettingsPage {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -328,35 +328,50 @@ fn terminal_page() -> SettingPage {
     )
 }
 
+// Short pages keep to one group: the sidebar lists a page's groups as jump
+// links, which do nothing on a page too short to scroll.
 fn security_page() -> SettingPage {
-    SettingPage::new("Security").icon(Icon::new(Lucide::Lock)).group(
-        SettingGroup::new()
-            .title("Vault")
-            .item(
-                SettingItem::new(
-                    "Lock automatically",
-                    choice(AUTO_LOCK, |s| s.auto_lock_minutes, |s, v| s.auto_lock_minutes = v),
+    SettingPage::new("Security")
+        .icon(Icon::new(Lucide::Lock))
+        .group(
+            SettingGroup::new()
+                .title("Master password")
+                .description(
+                    "Your saved servers, SSH keys and passwords are encrypted with your master password. When they are locked, Somme asks for it again before showing them. Open terminals keep running.",
                 )
-                .description(format!("Locks the vault when you have not used {APP_NAME} for a while.")),
-            )
-            .item(SettingItem::render(|_, _, cx| {
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        v_flex()
-                            .child(div().text_sm().child("Lock now"))
-                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Shortcut: ⌘⇧L")),
+                .item(
+                    SettingItem::new(
+                        "Lock automatically",
+                        choice(AUTO_LOCK, |s| s.auto_lock_minutes, |s, v| s.auto_lock_minutes = v),
                     )
-                    .child(
-                        Button::new("lock-now")
-                            .small()
-                            .icon(Icon::new(Lucide::Lock))
-                            .label("Lock")
-                            .on_click(|_, _, cx| Store::global(cx).update(cx, |store, cx| store.lock(cx))),
-                    )
-            }))
+                    .description(format!("Locks them when you have not used {APP_NAME} for a while.")),
+                )
+                .item(SettingItem::render(|_, _, cx| {
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            v_flex()
+                                .child(div().text_sm().child("Lock now"))
+                                .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Shortcut: ⌘⇧L")),
+                        )
+                        .child(
+                            Button::new("lock-now")
+                                .small()
+                                .icon(Icon::new(Lucide::Lock))
+                                .label("Lock")
+                                .on_click(|_, _, cx| Store::global(cx).update(cx, |store, cx| store.lock(cx))),
+                        )
+                })),
+        )
+}
+
+fn privacy_page() -> SettingPage {
+    SettingPage::new("Privacy").icon(Icon::new(Lucide::EyeOff)).group(
+        SettingGroup::new()
+            .title("History and logs")
+            .description(format!("What {APP_NAME} keeps on this computer."))
             .item(
                 SettingItem::new("Keep command history", switch(|s| s.keep_history, |s, v| s.keep_history = v))
                     .description("Remembers commands you type, for search and reuse."),
@@ -461,7 +476,10 @@ fn account_panel(page: WeakEntity<SettingsPage>, _: &mut Window, cx: &mut App) -
                                         &sync_page,
                                         window,
                                         cx,
-                                        |services| async move { services.sync.sync_now().await },
+                                        |services| async move {
+                                            services.start_sync();
+                                            services.sync.sync_now().await
+                                        },
                                         report("Sync failed"),
                                     )
                                 }),
@@ -508,7 +526,10 @@ fn sign_in(page: WeakEntity<SettingsPage>, window: &mut Window, cx: &mut App) {
         &page,
         window,
         cx,
-        |services| async move { services.sync.sign_in_with_github().await },
+        |services| async move {
+            services.start_sync();
+            services.sync.sign_in_with_github().await
+        },
         |_, result, window, cx| {
             // Joining an account that already has a vault locks this one until its
             // master password is entered.
@@ -539,7 +560,7 @@ impl Render for SettingsPage {
                     group_ix: None,
                 })
                 .sidebar_width(gpui_kit::px(220.))
-                .pages([appearance_page(&self.fonts, cx), terminal_page(), security_page(), account_page(page)]),
+                .pages([appearance_page(&self.fonts, cx), terminal_page(), security_page(), privacy_page(), account_page(page)]),
         )
     }
 }
