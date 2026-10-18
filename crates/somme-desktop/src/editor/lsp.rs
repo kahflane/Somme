@@ -661,7 +661,10 @@ pub fn uri_path(uri: &str) -> Option<PathBuf> {
     }
     let text = String::from_utf8_lossy(&out).into_owned();
     // `/C:/x` on Windows is `C:/x`.
-    let text = if cfg!(windows) { text.trim_start_matches('/').to_owned() } else { text };
+    let text = match text.as_bytes() {
+        [b'/', drive, b':', ..] if cfg!(windows) && drive.is_ascii_alphabetic() => text[1..].to_owned(),
+        _ => text,
+    };
     Some(PathBuf::from(text))
 }
 
@@ -692,6 +695,12 @@ mod tests {
         assert_eq!(uri, "file:///Users/me/My%20Project/na%C3%AFve%231.rs");
         assert_eq!(uri_path(&uri).as_deref(), Some(path));
         assert_eq!(uri_path("https://x"), None);
+        if cfg!(windows) {
+            let path = Path::new(r"C:\Users\me\a b.rs");
+            let uri = file_uri(path);
+            assert_eq!(uri, "file:///C:/Users/me/a%20b.rs");
+            assert_eq!(uri_path(&uri).as_deref(), Some(path));
+        }
     }
 
     #[test]
