@@ -1,0 +1,164 @@
+# Builds Somme for macOS, Windows and Linux.
+#
+# Push a tag like v0.2.0 (matching `version` in Cargo.toml) to publish a
+# GitHub release with every build, SHA256SUMS and, when the signing key is
+# set, SHA256SUMS.sig. Somme's updater reads that release.
+#
+# Run it by hand (Actions > Release > Run workflow) to only build and check:
+# the files are kept as the run's artifacts, and nothing is published.
+#
+# Signing: put the private key file's text in the repository secret
+# SOMME_UPDATE_SIGNING_KEY, and its public key in
+# crates/somme-desktop/assets/update-key.pub. Without the secret, the release
+# has no signature and Somme only offers to open its page.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-15
+          - name: macos-x86_64
+            os: macos-15-intel
+          - name: linux-x86_64
+            os: ubuntu-22.04
+          - name: windows-x86_64
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake clang libssl-dev libdbus-1-dev libasound2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev \
+            libxcb1-dev libvulkan-dev libfontconfig1-dev libfreetype6-dev libzstd-dev
+
+      - name: Read the version
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "::error::The tag ${GITHUB_REF_NAME} doesn't match version $version in Cargo.toml."
+            exit 1
+          fi
+
+      - name: Build for macOS
+        if: runner.os == 'macOS'
+        run: |
+          arch=$(rustc -vV | sed -n 's/^host: //p' | cut -d- -f1)
+          app=$(crates/somme-desktop/macos-app.sh --release | tail -n 1)
+          mkdir -p dist
+          # The updater unpacks this with `ditto -x -k` and wants Somme.app at the top.
+          ditto -c -k --keepParent "$app" "dist/Somme-$VERSION-macos-$arch.zip"
+
+      - name: Build for Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked -p somme-desktop
+          root="Somme-$VERSION-linux-x86_64"
+          mkdir -p "dist/$root"
+          cp target/release/somme-desktop "dist/$root/somme"
+          cp crates/somme-desktop/assets/icon.svg "dist/$root/somme.svg"
+          cat > "dist/$root/somme.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Somme
+          Comment=SSH client and terminal
+          Exec=somme %U
+          Icon=somme
+          Terminal=false
+          Categories=Development;System;TerminalEmulator;
+          EOF
+          tar -C dist -czf "dist/$root.tar.gz" "$root"
+          rm -rf "dist/$root"
+
+      - name: Build for Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release --locked -p somme-desktop
+          mkdir -p dist
+          cp target/release/somme-desktop.exe dist/Somme.exe
+          (cd dist && 7z a "Somme-$VERSION-windows-x86_64.zip" Somme.exe >/dev/null && rm Somme.exe)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: build
+    if: github.ref_type == 'tag'
+    # macOS, so the signing tool in the Mac build runs as it is.
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List the checksums
+        working-directory: dist
+        run: shasum -a 256 Somme-* > SHA256SUMS && cat SHA256SUMS
+
+      - name: Sign the checksums
+        working-directory: dist
+        env:
+          SIGNING_KEY: ${{ secrets.SOMME_UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::warning::SOMME_UPDATE_SIGNING_KEY isn't set, so the release isn't signed and Somme won't install it by itself."
+            exit 0
+          fi
+          tool=$(mktemp -d)
+          ditto -x -k Somme-*-macos-aarch64.zip "$tool"
+          key="$RUNNER_TEMP/update.key"
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          chmod 600 "$key"
+          "$tool/Somme.app/Contents/MacOS/Somme" --update-sign "$key" SHA256SUMS
+          rm -f "$key"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Somme ${GITHUB_REF_NAME#v}" \
+            --generate-notes
