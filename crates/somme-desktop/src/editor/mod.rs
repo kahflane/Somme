@@ -2,8 +2,10 @@
 //! help from language servers.
 
 pub mod big;
+pub mod jq;
 pub mod language;
 pub mod lsp;
+pub mod markdown;
 pub mod pane;
 pub mod scratch;
 pub mod sudo;

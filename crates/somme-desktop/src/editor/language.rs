@@ -53,6 +53,8 @@ pub fn detect(path: &Path) -> Option<Language> {
         "rs" => RUST,
         "toml" => toml(),
         "json" | "jsonc" => lang("json", "JSON", "json", &[&["vscode-json-language-server", "--stdio"]], &[]),
+        // A JSON value per line. The JSON server would call each new line an error.
+        "jsonl" | "ndjson" => lang("json", "JSON Lines", "json", &[], &[]),
         "js" | "mjs" | "cjs" | "jsx" => lang("javascript", "JavaScript", "javascript", TYPESCRIPT_SERVERS, JS_ROOTS),
         "ts" | "mts" | "cts" => lang("typescript", "TypeScript", "typescript", TYPESCRIPT_SERVERS, JS_ROOTS),
         "tsx" => lang("tsx", "TSX", "typescriptreact", TYPESCRIPT_SERVERS, JS_ROOTS),
