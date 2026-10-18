@@ -2,6 +2,7 @@
 //! help from language servers.
 
 pub mod big;
+pub mod blame;
 pub mod jq;
 pub mod language;
 pub mod lsp;

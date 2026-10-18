@@ -53,6 +53,10 @@ impl CloudAccounts for NoCloud {
     async fn github_access(&self, _: &CloudSession) -> Result<GitHubAccess, CloudError> {
         unimplemented!()
     }
+
+    async fn github_access_page(&self) -> Result<String, CloudError> {
+        unimplemented!()
+    }
 }
 
 struct NoSessions;

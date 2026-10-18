@@ -257,8 +257,9 @@ pub mod tests {
         assert_eq!(token.scope, "repo");
         assert!(github.revoked.lock().unwrap().is_empty());
 
-        let err = svc.github_token(&session.token, &sign_in("user-5")).await.unwrap_err();
-        assert!(matches!(err, CloudError::Invalid(_)), "another GitHub user");
+        // The token type can't be printed, so no unwrap_err.
+        let err = svc.github_token(&session.token, &sign_in("user-5")).await.err();
+        assert!(matches!(err, Some(CloudError::Invalid(_))), "another GitHub user");
         assert_eq!(*github.revoked.lock().unwrap(), ["gho_for_user5"]);
         assert!(matches!(svc.github_token("bogus", &sign_in("user-4")).await, Err(CloudError::Unauthorized)));
     }

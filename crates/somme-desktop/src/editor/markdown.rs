@@ -107,18 +107,23 @@ enum Place {
     Blocked,
 }
 
-/// Whether a path reaches another computer, as `\\server\share` or
-/// `//server/share` do on Windows. Opening one there sends the user's login
-/// to that server, so a document from anywhere could collect it.
+/// Whether a path can reach another computer, as `\\server\share`,
+/// `//server/share` and `\??\UNC\server` do on Windows. Opening one there
+/// sends the user's login to that server, so a document from anywhere could
+/// collect it.
 fn is_network(path: &str) -> bool {
     let mut chars = path.chars();
-    matches!((chars.next(), chars.next()), (Some('/' | '\\'), Some('/' | '\\')))
+    matches!((chars.next(), chars.next()), (Some('/' | '\\'), Some('/' | '\\' | '?')))
 }
 
 fn place(url: &str, folder: Option<&Path>) -> Place {
     let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
+    if lower.starts_with("https://") {
         return Place::Web;
+    }
+    // Anyone on the network could see or swap it, so only secure ones load.
+    if lower.starts_with("http://") {
+        return Place::Blocked;
     }
     if lower.starts_with("data:") {
         return Place::Inline;
@@ -570,7 +575,7 @@ mod tests {
         assert!(matches!(place("img/a%20b.png", Some(Path::new("/docs"))), Place::File(path) if path == Path::new("/docs/img/a b.png")));
         assert!(matches!(place("HTTPS://example.test/a.png", None), Place::Web));
         assert!(matches!(place("data:image/png;base64,AAAA", None), Place::Inline));
-        for network in [r"\\server\share\a.png", "//server/share/a.png", "file:////server/a.png", "%5C%5Cserver%5Ca.png", r"\\?\UNC\server\a.png", "smb://server/a.png"] {
+        for network in [r"\\server\share\a.png", "//server/share/a.png", "file:////server/a.png", "%5C%5Cserver%5Ca.png", r"\\?\UNC\server\a.png", r"\??\UNC\server\a.png", "smb://server/a.png", "http://example.test/a.png"] {
             assert!(matches!(place(network, Some(Path::new("/docs"))), Place::Blocked), "{network}");
         }
     }

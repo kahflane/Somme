@@ -23,6 +23,7 @@ const TIMELINE_PAGES: usize = 5;
 /// Bigger diffs are not shown; GitHub's own page gives up around here too.
 const MAX_DIFF: usize = 8 * 1024 * 1024;
 const MAX_AVATAR: usize = 1024 * 1024;
+const MAX_README: usize = 1024 * 1024;
 const AVATAR_HOST: &str = "avatars.githubusercontent.com";
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -91,6 +92,47 @@ pub struct Page {
     pub closed: u64,
     /// Where the next page starts, when there is one.
     pub next: Option<String>,
+}
+
+/// What a GitHub profile page shows beside the README.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Profile {
+    #[serde(default)]
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub bio: Option<String>,
+    pub company: Option<String>,
+    pub location: Option<String>,
+    pub blog: Option<String>,
+    pub twitter_username: Option<String>,
+    #[serde(default)]
+    pub followers: u64,
+    #[serde(default)]
+    pub following: u64,
+}
+
+/// Someone who can be @mentioned.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Person {
+    pub login: String,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+/// Whether `login` can be a GitHub user name, so it is safe in a URL path.
+pub fn valid_login(login: &str) -> bool {
+    (1..=39).contains(&login.len()) && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// How many pull requests and issues of a repository are open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Summary {
+    /// Where the repository is now. GitHub sends a moved or renamed one on,
+    /// but its search finds nothing under the old name.
+    pub repo: Repo,
+    pub pulls: u64,
+    pub issues: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -321,6 +363,10 @@ fn failed(err: impl std::fmt::Display) -> ApiError {
     ApiError::Failed(err.to_string())
 }
 
+fn reach_failed(err: impl std::fmt::Display) -> ApiError {
+    ApiError::Failed(format!("Can't reach GitHub: {err}"))
+}
+
 impl GitHub {
     pub fn new(token: Zeroizing<String>) -> Result<Self, ApiError> {
         let http = reqwest::Client::builder()
@@ -340,16 +386,22 @@ impl GitHub {
 
     /// A request for `accept`. Only one Accept header goes out, or GitHub may pick JSON.
     fn request_as(&self, method: Method, path: &str, accept: &str) -> reqwest::RequestBuilder {
-        self.http
+        let request = self
+            .http
             .request(method, format!("{}{path}", api_base()))
-            .bearer_auth(self.token.as_str())
             .header(header::ACCEPT, accept)
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        // Without a token GitHub still shows what is public.
+        if self.token.is_empty() { request } else { request.bearer_auth(self.token.as_str()) }
     }
 
     /// Sends the request and turns GitHub's errors into plain words.
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, ApiError> {
-        let response = request.send().await.map_err(|err| ApiError::Failed(format!("Can't reach GitHub: {err}")))?;
+        let response = request.send().await.map_err(reach_failed)?;
+        Self::check(response).await
+    }
+
+    async fn check(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
         let status = response.status();
         if status.is_success() {
             return Ok(response);
@@ -451,6 +503,56 @@ impl GitHub {
             )
             .await?;
         Ok(page_from(&data))
+    }
+
+    pub async fn profile(&self, login: &str) -> Result<Profile, ApiError> {
+        if !valid_login(login) {
+            return Err(ApiError::Failed(format!("{login} is not a GitHub user name.")));
+        }
+        self.get(&format!("/users/{login}")).await
+    }
+
+    /// The README a user shows on their profile: the one in their repository
+    /// named like them, when there is one.
+    pub async fn profile_readme(&self, login: &str) -> Result<Option<String>, ApiError> {
+        if !valid_login(login) {
+            return Ok(None);
+        }
+        let request = self.request_as(Method::GET, &format!("/repos/{login}/{login}/readme"), "application/vnd.github.raw");
+        let response = request.send().await.map_err(reach_failed)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let bytes = Self::check(response).await?.bytes().await.map_err(failed)?;
+        if bytes.len() > MAX_README {
+            return Err(ApiError::Failed("The profile README is too big to show here. Open it on GitHub.".to_owned()));
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    pub async fn summary(&self, repo: &Repo) -> Result<Summary, ApiError> {
+        const QUERY: &str = r#"query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequests(states: OPEN) { totalCount }
+    issues(states: OPEN) { totalCount }
+  }
+}"#;
+        let data = self.graphql(QUERY, json!({ "owner": repo.owner, "name": repo.name })).await?;
+        summary_from(&data).ok_or_else(|| ApiError::Failed("GitHub can't find this repository.".to_owned()))
+    }
+
+    /// People who can be @mentioned in `repo` whose name or login matches
+    /// `query`: those with access to it, as in its organization, and those
+    /// who took part in it.
+    pub async fn mentionable(&self, repo: &Repo, query: &str) -> Result<Vec<Person>, ApiError> {
+        const QUERY: &str = r#"query($owner: String!, $name: String!, $query: String!) {
+  repository(owner: $owner, name: $name) {
+    mentionableUsers(first: 8, query: $query) { nodes { login name avatarUrl } }
+  }
+}"#;
+        let data = self.graphql(QUERY, json!({ "owner": repo.owner, "name": repo.name, "query": query })).await?;
+        Ok(people_from(&data))
     }
 
     pub async fn detail(&self, repo: &Repo, kind: Kind, number: u64) -> Result<Detail, ApiError> {
@@ -695,6 +797,35 @@ fn label(value: &Value) -> Label {
     }
 }
 
+fn summary_from(data: &Value) -> Option<Summary> {
+    let node = &data["repository"];
+    let (owner, name) = node["nameWithOwner"].as_str()?.split_once('/')?;
+    Some(Summary {
+        repo: Repo {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        },
+        pulls: node["pullRequests"]["totalCount"].as_u64()?,
+        issues: node["issues"]["totalCount"].as_u64()?,
+    })
+}
+
+fn people_from(data: &Value) -> Vec<Person> {
+    let text = |value: &Value| value.as_str().filter(|text| !text.is_empty()).map(str::to_owned);
+    data["repository"]["mentionableUsers"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            Some(Person {
+                login: text(&node["login"]).filter(|login| valid_login(login))?,
+                name: text(&node["name"]),
+                avatar_url: text(&node["avatarUrl"]),
+            })
+        })
+        .collect()
+}
+
 fn page_from(data: &Value) -> Page {
     let items = data["items"]["nodes"]
         .as_array()
@@ -844,6 +975,28 @@ fn branch_path(branch: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_moved_repository_says_where_it_is_now() {
+        let data = json!({ "repository": {
+            "nameWithOwner": "new-org/site",
+            "pullRequests": { "totalCount": 45 },
+            "issues": { "totalCount": 1 },
+        }});
+        let summary = summary_from(&data).unwrap();
+        assert_eq!(summary.repo.full_name(), "new-org/site");
+        assert_eq!((summary.pulls, summary.issues), (45, 1));
+        assert_eq!(summary_from(&json!({ "repository": null })), None);
+    }
+
+    #[test]
+    fn only_user_names_go_into_paths() {
+        assert!(valid_login("mjm918"));
+        assert!(valid_login("octo-cat"));
+        for bad in ["", "a/b", "..", "a b", "x?y", &"a".repeat(40)] {
+            assert!(!valid_login(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn branch_names_stay_inside_the_url_path() {

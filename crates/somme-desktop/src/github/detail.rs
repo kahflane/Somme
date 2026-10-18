@@ -19,13 +19,14 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, HighlightStyle, Hsla,
     InteractiveElement as _, StyledText,
     IntoElement, ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    Pixels, Subscription, Task, Window, canvas, div, prelude::FluentBuilder as _, px,
 };
 
 use super::api::{
     ApiError, Check, Commit, Detail, Event, GitHub, Kind, Label, LineComment, MergeMethod, RepoInfo, ReviewEvent,
     User, short_sha,
 };
+use super::mentions::{self, Mentions};
 use super::panel::error_line;
 use super::repo::Repo;
 use super::widgets::{self, Tone};
@@ -72,7 +73,11 @@ pub struct DetailView {
     section: Section,
     commits: Lazy<Vec<Commit>>,
     diff: Lazy<Entity<DiffState>>,
+    /// How wide the diff was last drawn. See [`DetailView::diff_width`].
+    diff_width: Option<Pixels>,
+    _diff_heights: Task<()>,
     comment: Entity<TextareaState>,
+    mentions: Entity<Mentions>,
     title: Option<Entity<InputState>>,
     /// The repository's labels, for the label picker.
     repo_labels: Vec<Label>,
@@ -94,6 +99,7 @@ impl DetailView {
             TextareaState::new(window, cx).auto_grow(3, 14).placeholder("Add a comment. Markdown works here.")
         });
         let subscriptions = vec![cx.observe(&comment, |_, _, cx| cx.notify())];
+        let mentions = cx.new(|cx| Mentions::new(comment.clone(), client.clone(), repo.clone(), cx));
         let mut view = Self {
             client,
             repo,
@@ -107,7 +113,10 @@ impl DetailView {
             section: Section::Conversation,
             commits: Lazy::NotYet,
             diff: Lazy::NotYet,
+            diff_width: None,
+            _diff_heights: Task::ready(()),
             comment,
+            mentions,
             title: None,
             repo_labels: Vec::new(),
             busy: false,
@@ -127,7 +136,7 @@ impl DetailView {
     }
 
     /// Reads the page again: the item, the repository's rules and the conversation.
-    fn load(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn load(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
         let (client, repo, kind, number, pull) = (self.client.clone(), self.repo.clone(), self.kind, self.number, self.pull());
@@ -164,6 +173,12 @@ impl DetailView {
                         .find_map(|(allowed, method)| allowed.then_some(method))
                         .unwrap_or(MergeMethod::Merge);
                         let unknown = detail.is_pull() && detail.state == "open" && detail.mergeable.is_none();
+                        let taking_part = std::iter::once(detail.user.clone()).chain(events.iter().filter_map(|event| match event {
+                            Event::Comment { author, .. } | Event::Review { author, .. } => Some(author.clone()),
+                            Event::Note { actor, .. } => Some(actor.clone()),
+                            _ => None,
+                        }));
+                        view.mentions.update(cx, |mentions, _| mentions.set_taking_part(taking_part));
                         view.detail = Some(detail);
                         view.info = info;
                         view.events = events;
@@ -362,6 +377,7 @@ impl DetailView {
 
     fn load_diff(&mut self, cx: &mut Context<Self>) {
         self.diff = Lazy::Loading;
+        self.diff_width = None;
         let (client, repo, number) = (self.client.clone(), self.repo.clone(), self.number);
         cx.spawn(async move |this, cx| {
             let files = runtime::io(async move {
@@ -378,6 +394,30 @@ impl DetailView {
             });
         })
         .detach();
+    }
+
+    /// The diff's list forgets how tall its rows are when it is first drawn
+    /// and whenever its width changes. Rows not drawn yet then count as no
+    /// height, so it stops scrolling early. Once the width settles, each row
+    /// is given a code line's height again.
+    fn diff_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.diff_width == Some(width) {
+            return;
+        }
+        self.diff_width = Some(width);
+        self._diff_heights = cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(Duration::from_millis(150)).await;
+            let _ = view.update(cx, |view, cx| {
+                if let Lazy::Ready(state) = &view.diff {
+                    // Changing a setting and back is the one way to ask for it.
+                    state.update(cx, |state, cx| {
+                        let lines = state.min_collapsed_lines();
+                        state.set_min_collapsed_lines(lines + 1, cx);
+                        state.set_min_collapsed_lines(lines, cx);
+                    });
+                }
+            });
+        });
     }
 
     fn toggle_split(&mut self, cx: &mut Context<Self>) {
@@ -1033,7 +1073,10 @@ impl DetailView {
                     .flex_1()
                     .min_w_0()
                     .gap_2()
-                    .child(div().font_family(theme.mono_font_family.clone()).child(Textarea::new(&self.comment)))
+                    .child(mentions::field(
+                        div().font_family(theme.mono_font_family.clone()).child(Textarea::new(&self.comment)),
+                        &self.mentions,
+                    ))
                     .child(buttons),
             )
             .into_any_element()
@@ -1170,7 +1213,19 @@ impl DetailView {
                             .on_click(cx.listener(|view, _, _, cx| view.toggle_split(cx))),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(Diff::new(state)))
+            .child({
+                let view = cx.entity().downgrade();
+                div().flex_1().min_h_0().relative().child(Diff::new(state)).child(
+                    canvas(
+                        move |bounds, _, cx| {
+                            let _ = view.update(cx, |view, cx| view.diff_width(bounds.size.width, cx));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .into_any_element()
     }
 }

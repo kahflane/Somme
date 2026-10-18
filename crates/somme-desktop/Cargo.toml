@@ -46,6 +46,8 @@ regex = "1"
 # GitHub's API, for pull requests and issues.
 reqwest.workspace = true
 # The same version the editor kit uses, so its `Rope` is this one.
+# Reads web SVG images, to show animated ones as they end up.
+roxmltree = "0.21"
 ropey = { version = "=2.0.0-beta.1", features = ["metric_chars", "metric_lines_lf"] }
 serde.workspace = true
 serde_json.workspace = true

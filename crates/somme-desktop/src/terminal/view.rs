@@ -144,6 +144,8 @@ pub enum TerminalViewEvent {
     StatusChanged,
     /// The shell moved in or out of a GitHub repository.
     RepoChanged,
+    /// A command started, or the shell is back at its prompt.
+    PhaseChanged,
     /// A file was picked to open in the editor.
     OpenFile(std::path::PathBuf),
     /// Show the uncommitted git changes of the repo that holds this folder.
@@ -266,6 +268,7 @@ impl TerminalView {
             let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();
+        cx.emit(TerminalViewEvent::PhaseChanged);
         cx.notify();
     }
 

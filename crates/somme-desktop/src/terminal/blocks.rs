@@ -261,6 +261,30 @@ pub(crate) fn git_raw(dir: &Path, args: &[&str]) -> Option<String> {
 /// name filter programs that git runs on each changed file, so those are blanked
 /// out. Filters from the user's own config, like Git LFS, still run.
 pub(crate) fn git_diff_raw(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = filtered_git_command(dir)?.args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Like [`git_diff_raw`], with `input` given to git, as for `blame --contents -`.
+pub(crate) fn git_input_raw(dir: &Path, args: &[&str], input: &str) -> Option<String> {
+    let mut child = filtered_git_command(dir)?
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = input.to_owned();
+    // Written beside the read, so a big file can't fill both pipes and stall.
+    let writer = std::thread::spawn(move || std::io::Write::write_all(&mut stdin, input.as_bytes()));
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Git in `dir` with the filters a repo's own config names switched off.
+fn filtered_git_command(dir: &Path) -> Option<Command> {
     let listed = git_command(dir)?
         .args(["config", "--show-scope", "-z", "--get-regexp", r"^filter\."])
         .output()
@@ -276,8 +300,7 @@ pub(crate) fn git_diff_raw(dir: &Path, args: &[&str]) -> Option<String> {
     for (i, (key, value)) in blanked.iter().enumerate() {
         command.env(format!("GIT_CONFIG_KEY_{i}"), key).env(format!("GIT_CONFIG_VALUE_{i}"), value);
     }
-    let out = command.args(args).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    Some(command)
 }
 
 /// Settings that switch off each filter named outside the user's and system's own

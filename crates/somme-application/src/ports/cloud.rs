@@ -59,6 +59,9 @@ pub trait CloudAccounts: Send + Sync {
     /// Opens GitHub in the browser to let Somme read and act on the user's
     /// repositories, and waits for the token.
     async fn github_access(&self, session: &CloudSession) -> Result<GitHubAccess, CloudError>;
+    /// The github.com page where the user picks which organizations Somme
+    /// may see, after the first grant.
+    async fn github_access_page(&self) -> Result<String, CloudError>;
 }
 
 /// Keeps one secret, like the GitHub token, in the system keychain.

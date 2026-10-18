@@ -1,5 +1,5 @@
 //! Uncommitted changes in a git repo: what `git diff HEAD` prints, plus new files git
-//! does not track yet.
+//! does not track yet. Or the changes one commit made.
 
 use std::path::{Path, PathBuf};
 
@@ -111,6 +111,35 @@ pub fn load(dir: &Path) -> Result<Changes, String> {
         root,
         branch: branch.trim().to_owned(),
         files,
+    })
+}
+
+/// Whether `sha` is a whole commit id, so it is safe to hand to git.
+pub fn is_sha(sha: &str) -> bool {
+    matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Reads what commit `sha` changed, against its first parent, in the repo that
+/// holds `dir`. Slow: run it off the UI thread.
+pub fn load_commit(dir: &Path, sha: &str) -> Result<Changes, String> {
+    if !is_sha(sha) {
+        return Err("That is not a commit.".to_owned());
+    }
+    let root = git_raw(dir, &["rev-parse", "--show-toplevel"])
+        .map(|out| PathBuf::from(out.trim_end_matches('\n')))
+        .ok_or("This folder is not in a git repo.")?;
+    let flags = ["--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", "--ignore-submodules=all"];
+    let parent = git_raw(&root, &["rev-parse", "--verify", "--quiet", &format!("{sha}^1")]);
+    let patch = match parent.as_deref().map(str::trim).filter(|parent| is_sha(parent)) {
+        Some(parent) => git_diff_raw(&root, &[&["-c", "core.quotePath=false", "diff", parent, sha][..], &flags].concat()),
+        // The first commit: everything in it is new.
+        None => git_diff_raw(&root, &[&["-c", "core.quotePath=false", "diff-tree", "-p", "--root"][..], &flags, &[sha]].concat()),
+    }
+    .ok_or("Git could not show this commit.")?;
+    Ok(Changes {
+        root,
+        branch: String::new(),
+        files: parse(&patch),
     })
 }
 
