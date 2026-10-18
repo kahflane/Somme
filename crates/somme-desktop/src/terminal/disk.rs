@@ -354,6 +354,8 @@ fn is_runnable(meta: &std::fs::Metadata) -> bool {
 mod tests {
     use super::*;
 
+    // Windows has no file modes to take away.
+    #[cfg(unix)]
     #[test]
     fn a_refused_file_says_so() {
         use std::os::unix::fs::PermissionsExt as _;
