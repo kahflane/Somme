@@ -169,6 +169,14 @@ impl Disk {
         }
     }
 
+    /// Copies a file to `local`, on this computer.
+    pub fn download(&self, path: &Path, local: &Path) -> Result<(), DiskError> {
+        match self {
+            Disk::Local => Ok(std::fs::copy(path, local).map(drop)?),
+            Disk::Remote { files, .. } => Ok(block(files.download(&remote(path), local))?),
+        }
+    }
+
     pub fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), DiskError> {
         match self {
             Disk::Local => Ok(std::fs::write(path, bytes)?),
@@ -249,5 +257,121 @@ mod tests {
         assert!(matches!(Disk::Local.read(&dir.path().join("missing"), 1024), Err(DiskError::Other(_))));
         assert_eq!(DiskError::from(GatewayError::SudoWrongPassword), DiskError::Password { wrong: true });
         assert_eq!(DiskError::from(GatewayError::Session("no sudo".into())), DiskError::Other("no sudo".into()));
+    }
+}
+
+/// A server for tests, with its files in a folder on this computer. Paths
+/// work the way they do on a server, with `/`.
+#[cfg(test)]
+pub mod fake {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use somme_application::ports::{GatewayError, RemoteEntry, RemoteFs};
+
+    use super::Disk;
+
+    pub const HOME: &str = "/home/me";
+
+    pub struct Server {
+        root: PathBuf,
+    }
+
+    /// A server whose `/` is `root`, logged in as a user with [`HOME`].
+    pub fn disk(root: &Path) -> Disk {
+        crate::runtime::init().unwrap();
+        Disk::Remote {
+            files: Arc::new(Server { root: root.to_path_buf() }),
+            home: Some(PathBuf::from(HOME)),
+        }
+    }
+
+    impl Server {
+        fn local(&self, path: &str) -> PathBuf {
+            assert!(!path.contains('\\'), "server paths use /: {path}");
+            self.root.join(path.trim_start_matches('/'))
+        }
+    }
+
+    fn error(err: std::io::Error) -> GatewayError {
+        match err.kind() {
+            std::io::ErrorKind::PermissionDenied => GatewayError::PermissionDenied,
+            _ => GatewayError::Transfer(err.to_string()),
+        }
+    }
+
+    fn entry(path: &str, meta: &std::fs::Metadata, is_symlink: bool) -> RemoteEntry {
+        RemoteEntry {
+            name: path.rsplit('/').next().unwrap_or_default().to_owned(),
+            path: path.to_owned(),
+            is_dir: meta.is_dir(),
+            is_symlink,
+            size: meta.len(),
+            modified_at: None,
+            permissions: None,
+        }
+    }
+
+    #[async_trait]
+    impl RemoteFs for Server {
+        async fn home(&self) -> Result<String, GatewayError> {
+            Ok(HOME.into())
+        }
+
+        async fn list(&self, path: &str) -> Result<Vec<RemoteEntry>, GatewayError> {
+            let mut entries = Vec::new();
+            for found in std::fs::read_dir(self.local(path)).map_err(error)? {
+                let found = found.map_err(error)?;
+                // Like SFTP, a link shows as a link, not as what it points at.
+                let meta = std::fs::symlink_metadata(found.path()).map_err(error)?;
+                let name = found.file_name().to_string_lossy().into_owned();
+                entries.push(entry(&format!("{}/{name}", path.trim_end_matches('/')), &meta, meta.is_symlink()));
+            }
+            Ok(entries)
+        }
+
+        async fn mkdir(&self, path: &str) -> Result<(), GatewayError> {
+            std::fs::create_dir(self.local(path)).map_err(error)
+        }
+
+        async fn rename(&self, from: &str, to: &str) -> Result<(), GatewayError> {
+            std::fs::rename(self.local(from), self.local(to)).map_err(error)
+        }
+
+        async fn remove(&self, path: &str, is_dir: bool) -> Result<(), GatewayError> {
+            if is_dir {
+                std::fs::remove_dir_all(self.local(path)).map_err(error)
+            } else {
+                std::fs::remove_file(self.local(path)).map_err(error)
+            }
+        }
+
+        async fn download(&self, remote: &str, local: &Path) -> Result<(), GatewayError> {
+            std::fs::copy(self.local(remote), local).map(drop).map_err(error)
+        }
+
+        async fn upload(&self, local: &Path, remote: &str) -> Result<(), GatewayError> {
+            std::fs::copy(local, self.local(remote)).map(drop).map_err(error)
+        }
+
+        async fn stat(&self, path: &str) -> Result<RemoteEntry, GatewayError> {
+            let meta = std::fs::metadata(self.local(path)).map_err(error)?;
+            Ok(entry(path, &meta, false))
+        }
+
+        async fn read(&self, path: &str, limit: u64) -> Result<Vec<u8>, GatewayError> {
+            let bytes = std::fs::read(self.local(path)).map_err(error)?;
+            if bytes.len() as u64 > limit {
+                return Err(GatewayError::Transfer("too big".into()));
+            }
+            Ok(bytes)
+        }
+
+        async fn write(&self, path: &str, data: &[u8]) -> Result<(), GatewayError> {
+            std::fs::write(self.local(path), data).map_err(error)
+        }
+
+        async fn close(&self) {}
     }
 }

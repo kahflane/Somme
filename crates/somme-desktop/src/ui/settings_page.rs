@@ -26,7 +26,7 @@ pub struct SettingsPage {
     start_page: usize,
 }
 
-const ACCOUNT_PAGE: usize = 4;
+const ACCOUNT_PAGE: usize = 5;
 
 impl SettingsPage {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -330,6 +330,17 @@ fn terminal_page() -> SettingPage {
 
 // Short pages keep to one group: the sidebar lists a page's groups as jump
 // links, which do nothing on a page too short to scroll.
+fn editor_page() -> SettingPage {
+    SettingPage::new("Editor").icon(Icon::new(Lucide::FilePen)).group(
+        SettingGroup::new().title("Files").item(
+            SettingItem::new("Reopen files on start", switch(|s| s.reopen_files, |s, v| s.reopen_files = v))
+                .description(format!(
+                    "Opens the files you had open when you last quit {APP_NAME}, unsaved new files too."
+                )),
+        ),
+    )
+}
+
 fn security_page() -> SettingPage {
     SettingPage::new("Security")
         .icon(Icon::new(Lucide::Lock))
@@ -560,7 +571,14 @@ impl Render for SettingsPage {
                     group_ix: None,
                 })
                 .sidebar_width(gpui_kit::px(220.))
-                .pages([appearance_page(&self.fonts, cx), terminal_page(), security_page(), privacy_page(), account_page(page)]),
+                .pages([
+                    appearance_page(&self.fonts, cx),
+                    terminal_page(),
+                    editor_page(),
+                    security_page(),
+                    privacy_page(),
+                    account_page(page),
+                ]),
         )
     }
 }

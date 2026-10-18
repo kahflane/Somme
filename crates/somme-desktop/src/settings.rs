@@ -71,6 +71,8 @@ pub struct Settings {
     /// Folders where the file editor may start language servers. Servers can run
     /// code from the project, like build scripts, so each folder is trusted by hand.
     pub trusted_folders: Vec<String>,
+    /// Opens the editor files left open last time, scratch files too.
+    pub reopen_files: bool,
 }
 
 impl Default for Settings {
@@ -101,6 +103,7 @@ impl Default for Settings {
             keep_history: true,
             auto_lock_minutes: 0,
             trusted_folders: Vec::new(),
+            reopen_files: true,
         }
     }
 }

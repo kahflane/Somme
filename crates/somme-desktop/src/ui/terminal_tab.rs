@@ -1,20 +1,26 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui_kit::component::{ActiveTheme as _, h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, h_resizable, resizable_panel, v_flex, v_resizable,
+};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement as _, Render, SharedString, Subscription, Window, div,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::editor::pane::{cant_open, read_text, read_text_as_root};
 use crate::editor::sudo;
+use crate::editor::system_open;
 use crate::editor::{EditorPane, EditorPaneEvent};
 use crate::services::Services;
 use crate::terminal::disk::{Disk, DiskError};
 use crate::terminal::session::Status;
 use crate::terminal::view::TerminalViewEvent;
 use crate::terminal::{SessionTarget, TerminalSession, TerminalView};
+use crate::ui::common::Lucide;
 
 enum PaneNode {
     Leaf(Entity<TerminalView>),
@@ -29,12 +35,13 @@ impl PaneNode {
         }
     }
 
-    /// Puts `new` next to `target`, splitting along `axis`.
-    fn split(&mut self, target: EntityId, new: Entity<TerminalView>, axis: Axis) -> bool {
+    /// Puts `new` next to `target`, splitting along `axis`. `before` puts it on
+    /// the left or on top.
+    fn split(&mut self, target: EntityId, new: Entity<TerminalView>, axis: Axis, before: bool) -> bool {
         match self {
             Self::Leaf(view) if view.entity_id() == target => {
-                let old = Self::Leaf(view.clone());
-                *self = Self::Split(axis, vec![old, Self::Leaf(new)]);
+                let (old, new) = (Self::Leaf(view.clone()), Self::Leaf(new));
+                *self = Self::Split(axis, if before { vec![new, old] } else { vec![old, new] });
                 true
             }
             Self::Leaf(_) => false,
@@ -45,10 +52,10 @@ impl PaneNode {
                 if let Some(ix) = found
                     && *split_axis == axis
                 {
-                    children.insert(ix + 1, Self::Leaf(new));
+                    children.insert(if before { ix } else { ix + 1 }, Self::Leaf(new));
                     return true;
                 }
-                children.iter_mut().any(|c| c.split(target, new.clone(), axis))
+                children.iter_mut().any(|c| c.split(target, new.clone(), axis, before))
             }
         }
     }
@@ -94,6 +101,10 @@ pub struct TerminalTab {
     subscriptions: Vec<(EntityId, Subscription)>,
     /// Files opened from the terminal, shown on the right.
     editor: Option<(Entity<EditorPane>, Subscription)>,
+    /// Panes put away in the bar at the bottom. They keep running.
+    minimized: Vec<Entity<TerminalView>>,
+    /// The pane filling the whole tab, with the others kept behind it.
+    maximized: Option<Entity<TerminalView>>,
 }
 
 impl EventEmitter<TerminalTabEvent> for TerminalTab {}
@@ -117,6 +128,8 @@ impl TerminalTab {
             services,
             subscriptions: Vec::new(),
             editor: None,
+            minimized: Vec::new(),
+            maximized: None,
         };
         tab.watch(&view, window, cx);
         tab
@@ -183,7 +196,7 @@ impl TerminalTab {
 
     /// Opens a file from `view`'s shell in the editor beside the terminals. For
     /// an SSH shell, the file is on the server. The editor opens only once the
-    /// file is read.
+    /// file is read. Images, PDFs and the like open in the system's app instead.
     pub fn open_file(&mut self, view: &Entity<TerminalView>, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let session = view.read(cx).session.read(cx);
         // Language servers run here, and are looked for on the shell's PATH.
@@ -191,6 +204,14 @@ impl TerminalTab {
         let disk = session.disk();
         cx.spawn_in(window, async move |tab, cx| {
             let Some(disk) = disk.await else { return };
+            if system_open::opens_outside(&path) {
+                let local = system_open::local_copy(disk, path.clone()).await;
+                let _ = tab.update_in(cx, |_, window, cx| match local {
+                    Ok(local) => cx.open_with_system(&local),
+                    Err(err) => cant_open(&path, &err, window, cx),
+                });
+                return;
+            }
             let open = tab.update_in(cx, |tab, window, cx| {
                 tab.editor.as_ref().is_some_and(|(pane, _)| pane.update(cx, |pane, cx| pane.show_open(&path, &disk, window, cx)))
             });
@@ -242,6 +263,7 @@ impl TerminalTab {
                         window.focus(&tab.active.focus_handle(cx), cx);
                         cx.notify();
                     }
+                    EditorPaneEvent::FilesChanged => {}
                 });
                 self.editor = Some((pane.clone(), subscription));
                 pane
@@ -283,12 +305,14 @@ impl TerminalTab {
         self.panes().iter().any(|p| p.read(cx).session.read(cx).is_running())
     }
 
-    pub fn split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn split(&mut self, axis: Axis, before: bool, window: &mut Window, cx: &mut Context<Self>) {
         // A local split opens in the folder of the pane it splits from.
         let session = self.active.read(cx).session.read(cx);
         let (target, dir) = (session.target.clone(), session.current_dir());
         let view = Self::new_view(&target, dir, &self.services, window, cx);
-        self.root.split(self.active.entity_id(), view.clone(), axis);
+        self.root.split(self.active.entity_id(), view.clone(), axis, before);
+        // The new pane goes beside the old one, so both must show.
+        self.maximized = None;
         self.watch(&view, window, cx);
         self.active = view.clone();
         window.focus(&view.focus_handle(cx), cx);
@@ -300,11 +324,18 @@ impl TerminalTab {
     pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.active.entity_id();
         self.subscriptions.retain(|(view, _)| *view != id);
+        self.minimized.retain(|view| view.entity_id() != id);
+        if self.maximized.as_ref().is_some_and(|view| view.entity_id() == id) {
+            self.maximized = None;
+        }
         if !self.root.remove(id) {
             cx.emit(TerminalTabEvent::Empty);
             return;
         }
-        if let Some(next) = self.panes().into_iter().next() {
+        let next = self.shown().into_iter().next().or_else(|| self.panes().into_iter().next());
+        if let Some(next) = next {
+            // The last pane on screen can't hide in the bar.
+            self.minimized.retain(|view| *view != next);
             self.active = next.clone();
             window.focus(&next.focus_handle(cx), cx);
         }
@@ -312,8 +343,63 @@ impl TerminalTab {
         cx.notify();
     }
 
+    /// Closes one pane, focused or not.
+    fn close_pane(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = view.clone();
+        self.close_active(window, cx);
+    }
+
+    /// The panes on screen: not minimized, or only the maximized one.
+    fn shown(&self) -> Vec<Entity<TerminalView>> {
+        match &self.maximized {
+            Some(view) => vec![view.clone()],
+            None => self.panes().into_iter().filter(|view| !self.minimized.contains(view)).collect(),
+        }
+    }
+
+    /// Puts a pane away in the bar at the bottom. The last pane on screen stays.
+    fn minimize(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.shown();
+        if shown.len() < 2 || !shown.contains(view) {
+            return;
+        }
+        self.minimized.push(view.clone());
+        if *view == self.active
+            && let Some(next) = self.shown().into_iter().next()
+        {
+            self.focus_pane(&next, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Brings a minimized pane back where it was.
+    fn restore(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        self.minimized.retain(|other| other != view);
+        self.maximized = None;
+        self.focus_pane(view, window, cx);
+        cx.notify();
+    }
+
+    /// Fills the tab with one pane, or puts the panes back as they were.
+    fn toggle_maximize(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.maximized.as_ref() == Some(view) {
+            self.maximized = None;
+        } else {
+            self.minimized.retain(|other| other != view);
+            self.maximized = Some(view.clone());
+        }
+        self.focus_pane(view, window, cx);
+        cx.notify();
+    }
+
+    fn focus_pane(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = view.clone();
+        window.focus(&view.focus_handle(cx), cx);
+        cx.emit(TerminalTabEvent::Changed);
+    }
+
     pub fn focus_next(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let panes = self.panes();
+        let panes = self.shown();
         let Some(ix) = panes.iter().position(|p| *p == self.active) else { return };
         let next = if forward { (ix + 1) % panes.len() } else { (ix + panes.len() - 1) % panes.len() };
         self.active = panes[next].clone();
@@ -347,46 +433,133 @@ impl TerminalTab {
         cx.notify();
     }
 
-    fn render_node(&self, node: &PaneNode, path: String, cx: &App) -> AnyElement {
+    /// The panes under `node` that are not minimized. None when all of them are.
+    fn render_node(&self, node: &PaneNode, path: String, cx: &Context<Self>) -> Option<AnyElement> {
         match node {
-            PaneNode::Leaf(view) => {
-                let several = matches!(self.root, PaneNode::Split(..));
-                let active = *view == self.active;
-                let theme = cx.theme();
-                div()
-                    .size_full()
-                    .when_some_border(several, active, theme.primary, theme.border)
-                    .child(view.clone())
-                    .into_any_element()
-            }
+            PaneNode::Leaf(view) if self.minimized.contains(view) => None,
+            PaneNode::Leaf(view) => Some(self.render_pane(view, cx)),
             PaneNode::Split(axis, children) => {
-                let id = SharedString::from(format!("split-{path}"));
-                let panels = children
+                let mut shown: Vec<AnyElement> = children
                     .iter()
                     .enumerate()
-                    .map(|(ix, child)| resizable_panel().child(self.render_node(child, format!("{path}.{ix}"), cx)));
-                match axis {
+                    .filter_map(|(ix, child)| self.render_node(child, format!("{path}.{ix}"), cx))
+                    .collect();
+                if shown.len() < 2 {
+                    return shown.pop();
+                }
+                let id = SharedString::from(format!("split-{path}-{}", shown.len()));
+                let panels = shown.into_iter().map(|child| resizable_panel().child(child));
+                Some(match axis {
                     Axis::Horizontal => h_resizable(id).children(panels).into_any_element(),
                     Axis::Vertical => v_resizable(id).children(panels).into_any_element(),
-                }
+                })
             }
         }
     }
-}
 
-trait PaneBorder: Styled + Sized {
-    /// Outlines panes when there are several, highlighting the focused one.
-    fn when_some_border(self, several: bool, active: bool, on: gpui_kit::Hsla, off: gpui_kit::Hsla) -> Self {
-        if !several {
-            return self;
+    /// A terminal pane. With several panes, a bar on top names it and holds
+    /// its minimize, maximize and close buttons.
+    fn render_pane(&self, view: &Entity<TerminalView>, cx: &Context<Self>) -> AnyElement {
+        if !matches!(self.root, PaneNode::Split(..)) {
+            return div().size_full().child(view.clone()).into_any_element();
         }
-        self.border_1().border_color(if active { on.opacity(0.6) } else { off })
+        let theme = cx.theme();
+        let active = *view == self.active;
+        let maximized = self.maximized.as_ref() == Some(view);
+        let can_minimize = !maximized && self.shown().len() > 1;
+        let title = view.read(cx).session.read(cx).title();
+        let key = view.entity_id().as_u64() as usize;
+        let (minimize, maximize, close, focus) = (view.clone(), view.clone(), view.clone(), view.clone());
+        let header = h_flex()
+            .h(px(24.))
+            .flex_none()
+            .pl_2()
+            .pr_1()
+            .gap_0p5()
+            .items_center()
+            .bg(theme.foreground.opacity(if active { 0.06 } else { 0.03 }))
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(if active { theme.foreground } else { theme.muted_foreground })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |tab, _, window, cx| tab.focus_pane(&focus, window, cx)),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(title))
+            .when(can_minimize, |bar| {
+                bar.child(
+                    Button::new(("pane-minimize", key))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(Lucide::Minus))
+                        .tab_stop(false)
+                        .tooltip("Minimize")
+                        .on_click(cx.listener(move |tab, _, window, cx| tab.minimize(&minimize, window, cx))),
+                )
+            })
+            .child(
+                Button::new(("pane-maximize", key))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(if maximized { Lucide::Minimize2 } else { Lucide::Maximize2 }))
+                    .tab_stop(false)
+                    .tooltip(if maximized { "Restore" } else { "Maximize" })
+                    .on_click(cx.listener(move |tab, _, window, cx| tab.toggle_maximize(&maximize, window, cx))),
+            )
+            .child(
+                Button::new(("pane-close", key))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tab_stop(false)
+                    .tooltip("Close")
+                    .on_click(cx.listener(move |tab, _, window, cx| tab.close_pane(&close, window, cx))),
+            );
+        v_flex()
+            .size_full()
+            .border_1()
+            .border_color(if active { theme.primary.opacity(0.6) } else { theme.border })
+            .child(header)
+            .child(div().flex_1().min_h_0().child(view.clone()))
+            .into_any_element()
+    }
+
+    /// The minimized panes. A click brings one back.
+    fn render_minimized(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let chips = self.minimized.iter().map(|view| {
+            let title = view.read(cx).session.read(cx).title();
+            let restore = view.clone();
+            h_flex()
+                .id(("pane-minimized", view.entity_id().as_u64() as usize))
+                .h(px(22.))
+                .max_w(px(200.))
+                .px_2()
+                .gap_1p5()
+                .items_center()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(theme.foreground.opacity(0.05))
+                .hover(|chip| chip.bg(theme.foreground.opacity(0.1)))
+                .child(Icon::new(Lucide::SquareTerminal).size(px(12.)))
+                .child(div().min_w_0().truncate().child(title))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Restore").build(window, cx))
+                .on_click(cx.listener(move |tab, _, window, cx| tab.restore(&restore, window, cx)))
+        });
+        h_flex()
+            .h(px(30.))
+            .flex_none()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_t_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .children(chips)
     }
 }
-
-use gpui_kit::Styled;
-
-impl<T: Styled> PaneBorder for T {}
 
 impl Focusable for TerminalTab {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -397,7 +570,15 @@ impl Focusable for TerminalTab {
 impl Render for TerminalTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let terminals = self.render_node(&self.root, "0".into(), cx);
+        let panes = match &self.maximized {
+            Some(view) => Some(self.render_pane(view, cx)),
+            None => self.render_node(&self.root, "0".into(), cx),
+        };
+        let terminals = v_flex()
+            .size_full()
+            .child(div().flex_1().min_h_0().children(panes))
+            .when(!self.minimized.is_empty(), |col| col.child(self.render_minimized(cx)))
+            .into_any_element();
         let body = match &self.editor {
             Some((editor, _)) => h_resizable("editor-split")
                 .child(resizable_panel().child(terminals))
