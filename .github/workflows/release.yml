@@ -12,6 +12,15 @@
 # SOMME_UPDATE_SIGNING_KEY, and its public key in
 # crates/somme-desktop/assets/update-key.pub. Without the secret, the release
 # has no signature and Somme only offers to open its page.
+#
+# Mac signing: with these secrets the Mac app is signed with a Developer ID
+# certificate and notarized by Apple, so it opens with no warning. Without
+# them it gets a quick signature, and macOS warns on first open.
+#   MACOS_CERTIFICATE           the Developer ID Application .p12, in base64
+#   MACOS_CERTIFICATE_PASSWORD  the password the .p12 was exported with
+#   APPLE_NOTARY_KEY            an App Store Connect API key's .p8 text
+#   APPLE_NOTARY_KEY_ID         that key's ID
+#   APPLE_NOTARY_ISSUER         the Issuer ID shown above the keys
 
 name: Release
 
@@ -140,12 +149,79 @@ jobs:
           lipo -create "arm/Somme.app/$exe" "intel/Somme.app/$exe" -output universal
           mv universal "arm/Somme.app/$exe"
           lipo "arm/Somme.app/$exe" -verify_arch arm64 x86_64
-          # Joining breaks the old signature, so sign it again the same quick way.
-          codesign --force --sign - arm/Somme.app
-          codesign --verify arm/Somme.app
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          path: source
+          sparse-checkout: crates/somme-desktop/macos.entitlements
+          sparse-checkout-cone-mode: false
+
+      # Joining breaks the old signature, so the app is signed again here.
+      - name: Sign and notarize the Mac app
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          app=arm/Somme.app
+          if [ -z "$CERTIFICATE" ] || [ -z "$NOTARY_KEY" ]; then
+            echo "::warning::MACOS_CERTIFICATE or APPLE_NOTARY_KEY isn't set, so the Mac app has a quick signature and macOS warns when it's first opened."
+            codesign --force --sign - "$app"
+            codesign --verify "$app"
+            exit 0
+          fi
+          # A keychain of its own, holding only the Developer ID certificate.
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 24)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          # Apple's middle certificates, so the signature reaches Apple's root.
+          for ca in DeveloperIDCA DeveloperIDG2CA; do
+            curl -fsSL "https://www.apple.com/certificateauthority/$ca.cer" -o "$RUNNER_TEMP/$ca.cer"
+            security import "$RUNNER_TEMP/$ca.cer" -k "$keychain" >/dev/null || true
+          done
+          read -ra others <<< "$(security list-keychains -d user | xargs)"
+          security list-keychains -d user -s "$keychain" "${others[@]}"
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n 1)
+          if [ -z "$identity" ]; then
+            echo "::error::MACOS_CERTIFICATE holds no Developer ID Application certificate."
+            exit 1
+          fi
+          codesign --force --options runtime --timestamp --keychain "$keychain" \
+            --entitlements source/crates/somme-desktop/macos.entitlements --sign "$identity" "$app"
+          codesign --verify --strict --verbose=2 "$app"
+
+          # Apple checks the app, then macOS opens it with no warning.
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$NOTARY_KEY" > "$key"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize.zip"
+          result=$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait --output-format json)
+          echo "$result"
+          if [ "$(echo "$result" | jq -r .status)" != "Accepted" ]; then
+            xcrun notarytool log "$(echo "$result" | jq -r .id)" --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" || true
+            rm -f "$key"
+            echo "::error::Apple didn't accept the app."
+            exit 1
+          fi
+          rm -f "$key"
+          # Staple the result to the app, so it opens offline too.
+          xcrun stapler staple "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+
+      - name: Zip the Mac app
+        run: |
           mkdir -p dist
           # The updater unpacks this with `ditto -x -k` and wants Somme.app at the top.
-          ditto -c -k --keepParent arm/Somme.app "dist/Somme-$version-macos-universal.zip"
+          ditto -c -k --keepParent arm/Somme.app "dist/Somme-$VERSION-macos-universal.zip"
 
       - uses: actions/upload-artifact@v4
         with:
