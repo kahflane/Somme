@@ -10,10 +10,11 @@ use gpui_kit::component::input::{
     Copy as InputCopy, Escape, IndentInline, InputEvent, MoveDown, MoveEnd, MoveRight, MoveUp, Search as InputSearch,
     Textarea, TextareaState,
 };
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Size, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement,
-    Focusable as _, KeyBinding, MouseButton, MouseDownEvent, ParentElement as _, Styled as _, Subscription, Task, Window,
+    Focusable as _, KeyBinding, StatefulInteractiveElement as _, MouseButton, MouseDownEvent, ParentElement as _, Styled as _, Subscription, Task, Window,
     actions, div, prelude::FluentBuilder as _, px, rems, transparent_black,
 };
 
@@ -542,12 +543,13 @@ impl TerminalView {
         let ready = blocks.is_some_and(|b| b.ready);
         let running = blocks.is_some_and(|b| b.live().is_some());
 
+        // One height for every chip, so a chip with only an icon matches those with words.
         let chip = |icon: Lucide| {
             h_flex()
+                .h(px(20.))
                 .gap_1()
                 .items_center()
                 .px_1p5()
-                .py_0p5()
                 .rounded_md()
                 .bg(foreground.opacity(0.07))
                 .text_xs()
@@ -579,6 +581,22 @@ impl TerminalView {
                                 prompt.menu = None;
                             }
                             view.toggle_picker(PickerKind::Folders, window, cx);
+                        }),
+                    ),
+            );
+            chips = chips.child(
+                chip(Lucide::FolderTree)
+                    .id("files-chip")
+                    .cursor_pointer()
+                    .when(self.explorer_shown, |chip| chip.bg(foreground.opacity(0.14)).text_color(foreground))
+                    .hover(|chip| chip.bg(foreground.opacity(0.12)).text_color(foreground))
+                    .tooltip(|window, cx| Tooltip::new("Files").build(window, cx))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, window, cx| {
+                            cx.stop_propagation();
+                            view.close_history(window, cx);
+                            cx.emit(TerminalViewEvent::ToggleExplorer);
                         }),
                     ),
             );

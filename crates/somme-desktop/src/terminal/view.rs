@@ -154,6 +154,8 @@ pub enum TerminalViewEvent {
     OpenFile(std::path::PathBuf),
     /// Show the uncommitted git changes of the repo that holds this folder.
     OpenChanges(std::path::PathBuf),
+    /// Show or hide the files of the shell's folder beside the terminals.
+    ToggleExplorer,
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
@@ -197,6 +199,8 @@ pub struct TerminalView {
     voice_note: Option<usize>,
     /// Space pressed in the command box, which may become holding to talk.
     space: Option<voice::SpaceHold>,
+    /// The tab shows its files, so the files chip looks pressed.
+    pub explorer_shown: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -262,6 +266,7 @@ impl TerminalView {
             voice_offer: false,
             voice_note: None,
             space: None,
+            explorer_shown: false,
             _subscriptions: subscriptions,
         };
         view.reset_blink(cx);

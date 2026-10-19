@@ -25,6 +25,7 @@ use crate::terminal::session::Status;
 use crate::terminal::view::TerminalViewEvent;
 use crate::terminal::{SessionTarget, TerminalSession, TerminalView};
 use crate::ui::common::Lucide;
+use crate::ui::explorer::{Explorer, ExplorerEvent};
 
 enum PaneNode {
     Leaf(Entity<TerminalView>),
@@ -111,6 +112,8 @@ pub struct TerminalTab {
     github: Option<(Entity<GitHubPanel>, Subscription)>,
     /// The commit graph of the shell's repository, on the right in place of the GitHub panel.
     graph: Option<(Entity<GraphView>, Subscription)>,
+    /// The files of the shell's folder, on the left.
+    explorer: Option<(Entity<Explorer>, Subscription)>,
     /// Panes put away in the bar at the bottom. They keep running.
     minimized: Vec<Entity<TerminalView>>,
     /// The pane filling the whole tab, with the others kept behind it.
@@ -140,6 +143,7 @@ impl TerminalTab {
             editor: None,
             github: None,
             graph: None,
+            explorer: None,
             minimized: Vec::new(),
             maximized: None,
         };
@@ -159,9 +163,13 @@ impl TerminalTab {
     }
 
     fn watch(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.explorer.is_some() {
+            view.update(cx, |view, _| view.explorer_shown = true);
+        }
         let subscription = cx.subscribe_in(view, window, |tab, view, event, window, cx| match event {
             TerminalViewEvent::Focused => {
                 tab.active = view.clone();
+                tab.follow_explorer(cx);
                 cx.emit(TerminalTabEvent::Changed);
                 cx.notify();
             }
@@ -184,7 +192,11 @@ impl TerminalTab {
                 {
                     graph.update(cx, |graph, cx| graph.follow(dir, cx));
                 }
+                if *view == tab.active {
+                    tab.follow_explorer(cx);
+                }
             }
+            TerminalViewEvent::ToggleExplorer => tab.toggle_explorer(window, cx),
             TerminalViewEvent::OpenFile(path) => tab.open_file(view, path.clone(), None, window, cx),
             TerminalViewEvent::OpenChanges(dir) => cx.emit(TerminalTabEvent::OpenChanges(dir.clone())),
             TerminalViewEvent::Typed(bytes) if tab.broadcast => {
@@ -358,6 +370,63 @@ impl TerminalTab {
         let blocks = session.blocks.as_ref().filter(|_| session.is_local())?;
         blocks.git.as_ref()?;
         blocks.cwd.clone()
+    }
+
+    /// The folder the shell is in, on this computer or the server.
+    fn shell_dir(&self, cx: &App) -> Option<PathBuf> {
+        self.active.read(cx).session.read(cx).blocks.as_ref()?.cwd.clone()
+    }
+
+    /// Shows the files of the shell's folder on the left, or hides them.
+    pub fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.explorer.take().is_some() {
+            self.mark_explorer(false, cx);
+            window.focus(&self.active.focus_handle(cx), cx);
+            cx.emit(TerminalTabEvent::Changed);
+            cx.notify();
+            return;
+        }
+        let Some(dir) = self.shell_dir(cx) else { return };
+        let disk = self.active.read(cx).session.read(cx).disk();
+        cx.spawn_in(window, async move |tab, cx| {
+            let Some(disk) = disk.await else { return };
+            let _ = tab.update_in(cx, |tab, window, cx| {
+                if tab.explorer.is_some() {
+                    return;
+                }
+                let explorer = cx.new(|cx| Explorer::new(disk, dir, cx));
+                let subscription = cx.subscribe_in(&explorer, window, |tab, _, event, window, cx| match event {
+                    ExplorerEvent::Open(path) => {
+                        let view = tab.active.clone();
+                        tab.open_file(&view, path.clone(), None, window, cx);
+                    }
+                    ExplorerEvent::Close => tab.toggle_explorer(window, cx),
+                });
+                tab.explorer = Some((explorer, subscription));
+                tab.mark_explorer(true, cx);
+                cx.emit(TerminalTabEvent::Changed);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Moves the files along when the shell changes folder.
+    fn follow_explorer(&mut self, cx: &mut Context<Self>) {
+        if let Some((explorer, _)) = &self.explorer
+            && let Some(dir) = self.shell_dir(cx)
+        {
+            explorer.update(cx, |explorer, cx| explorer.set_root(dir, cx));
+        }
+    }
+
+    fn mark_explorer(&self, shown: bool, cx: &mut Context<Self>) {
+        for pane in self.panes() {
+            pane.update(cx, |pane, cx| {
+                pane.explorer_shown = shown;
+                cx.notify();
+            });
+        }
     }
 
     pub fn graph_shown(&self) -> bool {
@@ -717,6 +786,13 @@ impl Render for TerminalTab {
                 .when_some(editor.as_ref(), |group, (editor, _)| group.child(resizable_panel().child(editor.clone())))
                 .child(resizable_panel().size(px(520.)).flex_none().size_range(px(340.)..px(1600.)).child(side))
                 .into_any_element(),
+        };
+        let body = match &self.explorer {
+            Some((explorer, _)) => h_resizable("explorer-split")
+                .child(resizable_panel().size(px(260.)).flex_none().size_range(px(160.)..px(640.)).child(explorer.clone()))
+                .child(resizable_panel().child(body))
+                .into_any_element(),
+            None => body,
         };
         div().size_full().bg(theme.background).child(body)
     }

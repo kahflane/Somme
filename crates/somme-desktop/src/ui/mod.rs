@@ -2,6 +2,7 @@ pub mod agent_logs;
 pub mod agents;
 pub mod common;
 pub mod credits;
+pub mod explorer;
 pub mod fields;
 pub mod filter;
 pub mod forwards;
