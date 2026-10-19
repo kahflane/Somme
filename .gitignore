@@ -9,3 +9,6 @@ cloud-data
 .playwright-mcp
 # Notes kept out of the repo.
 termius-how-it-works.md
+
+# Notes kept on this computer only.
+/docs/

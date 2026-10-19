@@ -1,48 +1,182 @@
-# Somme
+<div align="center">
+  <img src="crates/somme-desktop/assets/icon.svg" alt="Somme" width="96" />
 
-An SSH client like Termius. Native Rust app built with GPUI. Data in Turso, synced through Somme Cloud.
+  <h1>Somme</h1>
 
-## Run it
+  <p><strong>A native SSH client and terminal, written in Rust.<br />Hosts, keys, SFTP, port forwarding, a code editor and git, in one fast app.</strong></p>
 
-- `crates/somme-desktop/macos-app.sh` builds `target/debug/Somme.app` with the name and icon, then prints its path. Add `--release` for a release build.
-- `cargo run -p somme-desktop` runs it without the app bundle.
+  <p>
+    <a href="https://github.com/kahflane/Somme/releases/latest"><img src="https://img.shields.io/github/v/release/kahflane/Somme?style=for-the-badge&color=3B82F6&label=release" alt="Latest release" /></a>
+    <a href="https://github.com/kahflane/Somme/releases"><img src="https://img.shields.io/github/downloads/kahflane/Somme/total?style=for-the-badge&color=22C55E" alt="Downloads" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-8B5CF6?style=for-the-badge" alt="AGPL-3.0" /></a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS" />
+    <img src="https://img.shields.io/badge/Windows-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows" />
+    <img src="https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux" />
+    <img src="https://img.shields.io/badge/Rust-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust" />
+    <img src="https://img.shields.io/badge/GPUI-GPU%20drawn-0EA5E9?style=flat-square" alt="GPUI" />
+    <img src="https://img.shields.io/badge/MCP-server-111827?style=flat-square" alt="MCP server" />
+  </p>
 
-The app uses the hosted Somme Cloud at `https://somme-cloud.fly.dev`. Set `SOMME_CLOUD_URL=http://127.0.0.1:8787` to use a local one instead.
+  <p>
+    <img src=".github/images/terminal.png" alt="Somme: a terminal with the file tree and the code editor beside it" width="820" />
+  </p>
 
-## Release
+  <p>
+    <a href=".github/images/hosts.png"><img src=".github/images/hosts.png" alt="Saved hosts" width="395" /></a>
+    <a href=".github/images/graph.png"><img src=".github/images/graph.png" alt="Commit graph beside the terminal" width="395" /></a>
+  </p>
+  <p>
+    <a href=".github/images/markdown.png"><img src=".github/images/markdown.png" alt="Markdown preview in the editor" width="395" /></a>
+    <a href=".github/images/themes.png"><img src=".github/images/themes.png" alt="App themes and terminal colors" width="395" /></a>
+  </p>
+</div>
 
-Somme looks for a newer GitHub release every few hours and shows a button on the rail. On macOS it can update itself, but only with releases signed by your update key.
+## Why Somme?
 
-1. Once: `cargo run -p somme-desktop -- --update-keygen ~/somme-update.key`. It saves the private key there (keep it safe, never in the repo) and prints the public key. Put that line in `crates/somme-desktop/assets/update-key.pub` and commit it. Then `gh secret set SOMME_UPDATE_SIGNING_KEY < ~/somme-update.key`.
-2. Raise `version` in the root `Cargo.toml` and commit it.
-3. Push a tag `v<version>`. The Release workflow builds every system and publishes the release: one Mac app for Apple chip and Intel (`Somme-<version>-macos-universal.zip`), Windows, Linux, `SHA256SUMS` and `SHA256SUMS.sig`.
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>⚡ Native, not a web page</h3>
+      <p>Built in Rust on GPUI, the GPU-drawn UI toolkit behind the Zed editor. No Electron, no bundled browser. It opens fast and scrolls smoothly, even with huge logs.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h3>🔐 Your secrets stay yours</h3>
+      <p>Passwords, keys and passphrases are sealed with XChaCha20-Poly1305 under your master password (Argon2) before they are saved or synced. The password never leaves your computer.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>🧰 Everything for a server, in one place</h3>
+      <p>Hosts, groups, tags, SSH keys, jump hosts, SFTP, port forwarding, snippets and known hosts. Sign in, and they follow you to every computer.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h3>🧑‍💻 More than a terminal</h3>
+      <p>A file tree, a code editor with language servers, git changes, a commit graph, and GitHub pull requests and issues, all beside the terminal. On your computer or on the server.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>🤖 Ready for AI agents</h3>
+      <p>Somme is an MCP server. Claude Code and other agents can run scripts on your saved servers, and every script is logged before it runs. Off until you turn it on.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h3>🎙️ Talk instead of type</h3>
+      <p>Hold Space in the command box and speak. Whisper turns it into text on your computer. Nothing is sent anywhere.</p>
+    </td>
+  </tr>
+</table>
 
-Copies built before step 1 still see the update, but only offer its release page.
+## Features
 
-## Somme Cloud
+### SSH and hosts
 
-To run it locally: `cp env.example .env`, fill `TURSO_API` (Turso platform token) and `TURSO_ORG`, then `cargo run -p somme-cloud`. It listens on `127.0.0.1:8787`.
+- **Hosts** with groups, tags, colors and the server's system logo
+- **Keychain** for SSH keys and identities: generate, import or paste
+- **Jump hosts**, startup snippets and per-host session logs
+- **Known hosts** you can check and clean up
+- **Import** your hosts from `~/.ssh/config` in one click
+- **Quick connect**: type `user@host` in the search box
 
-### Deploy
+### Terminal
 
-It runs on Fly.io (`fly.toml`, `crates/somme-cloud/Dockerfile`). From the repo root:
+- **Command blocks**: each command and its output is a block you can copy, search or share
+- **Command box** with history, Tab completion and the current folder, branch and changes at a glance
+- **Split panes** in any direction, and **broadcast** typing to all of them
+- **Pinned tabs** that come back at the next start
+- **Programs get their keys**: Tab, Shift+Tab and Ctrl+C reach Vim, Claude Code and other full-screen tools
 
-1. Once: `fly secrets set TURSO_API=... TURSO_ORG=... -a somme-cloud`
-2. `fly deploy --remote-only --ha=false`
+### Files
 
-## Layout
+- **SFTP** between your computer and any host, in any direction
+- **File tree** beside the terminal. It follows the shell into folders, on your computer or over SSH
+- **Command palette** finds files by name or by the text in them
+- **Open with Somme** from Finder, Explorer or your file manager, or run `Somme <path>`
 
-| Path | Layer |
+### Editor
+
+- **Syntax colors** for 35 languages
+- **Language servers** for code help: suggestions, errors and go to definition. Somme downloads them when you ask, and checks each download
+- **Markdown preview** with Mermaid diagrams, and **jq** for JSON files
+- **Git blame** on the current line
+- Minimize, maximize and restore the editor beside the terminals
+
+### Git and GitHub
+
+- **Changes**: see, stage and commit what changed, then push or publish a branch
+- **Commit graph** of the shell's repository
+- **Pull requests and issues** of the GitHub repository you are in
+
+### Port forwarding
+
+- **Local**, **remote** and **dynamic** (SOCKS) tunnels, saved per host
+
+### Sync and security
+
+- **Encrypted vault** behind a master password, with auto unlock on your own computer
+- **Somme Cloud** syncs hosts, keys, snippets and your look between computers
+- **Signed updates**: Somme installs an update only when its signature checks out
+
+### Look
+
+- **15 app themes** and many terminal color schemes, light and dark, each mode with its own
+- **JetBrains Mono** built in, so code lines up on any computer
+
+## Install
+
+Download the latest build from [**Releases**](https://github.com/kahflane/Somme/releases/latest).
+
+| System | File | How |
+|---|---|---|
+| macOS (Apple chip and Intel) | `Somme-<version>-macos-universal.zip` | Unzip, then drag `Somme.app` to Applications. |
+| Windows | `Somme-<version>-windows-x86_64.zip` | Unzip, then run `Somme.exe`. |
+| Linux | `Somme-<version>-linux-x86_64.tar.gz` | Unpack, then run `somme`. A `.desktop` file and icon are inside. |
+
+Somme checks for new versions by itself and shows a button when one is ready.
+
+## Build from source
+
+You need Rust 1.88 or newer.
+
+```sh
+git clone https://github.com/kahflane/Somme.git
+cd Somme
+cargo run -p somme-desktop
+```
+
+On macOS, `crates/somme-desktop/macos-app.sh --release` builds `Somme.app` with its name and icon. On Linux, install these first (Debian and Ubuntu names):
+
+```sh
+sudo apt-get install pkg-config cmake clang libssl-dev libdbus-1-dev libasound2-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev \
+  libxcb1-dev libvulkan-dev libfontconfig1-dev libfreetype6-dev libzstd-dev
+```
+
+Run the tests with `cargo test --workspace`.
+
+## Tech stack
+
+| Part | Built with |
 |---|---|
-| `crates/somme-domain` | entities, rules, repository traits |
-| `crates/somme-application` | use cases, ports, DTOs |
-| `crates/somme-infrastructure` | Turso, russh (SSH, SFTP, tunnels), PTY, crypto, keychain, cloud client |
-| `crates/somme-cloud` | Somme Cloud server: accounts, one Turso database per user |
-| `crates/somme-desktop` | the GPUI app |
+| UI | [GPUI](https://www.gpui.rs) |
+| Terminal | [alacritty_terminal](https://github.com/alacritty/alacritty), [portable-pty](https://github.com/wezterm/wezterm) |
+| SSH, SFTP and tunnels | [russh](https://github.com/Eugeny/russh), [russh-sftp](https://github.com/AspectUnk/russh-sftp) |
+| Data and sync | [Turso](https://turso.tech) |
+| Encryption | XChaCha20-Poly1305 and Argon2, from [RustCrypto](https://github.com/RustCrypto) |
+| Editor | [tree-sitter](https://tree-sitter.github.io), [ropey](https://github.com/cessen/ropey), language servers over LSP |
+| Voice | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) through [whisper-rs](https://github.com/tazz4843/whisper-rs) |
 
-## Tests
+Every library Somme ships with is listed in the app, under Settings › Credits.
 
-- `cargo test --workspace` runs the unit tests.
-- Live tests are marked `#[ignore]`:
-  - `SOMME_TEST_SSHD_DIR=<dir> cargo test -p somme-infrastructure --test ssh_e2e -- --ignored` needs an sshd on `127.0.0.1:2222`.
-  - `SOMME_CLOUD_URL=http://127.0.0.1:8787 cargo test -p somme-infrastructure --test managed_sync -- --ignored` needs Somme Cloud running.
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. Open an [issue](https://github.com/kahflane/Somme/issues) first for big changes.
+
+<a href="https://github.com/kahflane/Somme/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=kahflane/Somme" alt="Contributors" />
+</a>
+
+## License
+
+Somme is free software under the [GNU Affero General Public License v3.0](LICENSE). You can use, change and share it. If you share a changed version, or run one for others over a network, you must share its source under the same license.
