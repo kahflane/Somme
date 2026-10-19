@@ -133,7 +133,39 @@ Download the latest build from [**Releases**](https://github.com/kahflane/Somme/
 | Windows | `Somme-<version>-windows-x86_64.zip` | Unzip, then run `Somme.exe`. |
 | Linux | `Somme-<version>-linux-x86_64.tar.gz` | Unpack, then run `somme`. A `.desktop` file and icon are inside. |
 
+The Windows build isn't signed yet, so Windows may say "Windows protected your PC" the first time. Click **More info**, then **Run anyway**.
+
 Somme checks for new versions by itself and shows a button when one is ready.
+
+Somme changes your system only when you say so. On Windows and Linux it asks before it adds itself to Open With. It starts at login only if you turn on the background service for agents.
+
+### Uninstall
+
+1. Run `Somme --uninstall`. On macOS that is `/Applications/Somme.app/Contents/MacOS/Somme --uninstall`. It takes Somme out of Open With and stops it starting at login.
+2. Delete `Somme.app`, `Somme.exe` or the `somme` folder.
+3. To remove your data too, delete Somme's data folder:
+   - macOS: `~/Library/Application Support/app.somme.desktop`
+   - Windows: `%APPDATA%\app.somme.desktop`
+   - Linux: `~/.local/share/app.somme.desktop`
+4. If you used auto unlock, delete the key named `app.somme.vault` from the system keychain.
+
+## Privacy
+
+Somme has no ads, no analytics and no tracking. It connects only to the servers you add, and to these, for the reasons given:
+
+| Where | When | Why |
+|---|---|---|
+| GitHub (`api.github.com`) | Every few hours, unless you turn off Settings › Updates › Check for updates | To see if a new Somme is out |
+| Somme Cloud | Only after you sign in | To sync your hosts, snippets and look. Passwords and keys are encrypted with your master password first |
+| GitHub | Only after you sign in with GitHub | To show pull requests, issues and profile pictures |
+| Hugging Face, Node.js, npm, GitHub | Only when you ask for voice typing or code help | To download the voice model or a language server, each checked against its known hash |
+| Web addresses in a Markdown file | When you open that file | To show its images. Only secure addresses on the open internet are fetched |
+
+Somme Cloud runs on [Fly.io](https://fly.io) and stores data with [Turso](https://turso.tech). See their privacy policies: [Fly.io](https://fly.io/legal/privacy-policy), [Turso](https://turso.tech/privacy-policy).
+
+## Code signing
+
+Mac builds are signed with our Apple Developer ID and notarized by Apple. Windows builds aren't signed yet. Every release is built from this repository by [GitHub Actions](.github/workflows/release.yml), and each file's SHA-256 is in `SHA256SUMS` on the release.
 
 ## Build from source
 

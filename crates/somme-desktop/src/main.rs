@@ -93,6 +93,46 @@ fn pump_events(mut events: mpsc::UnboundedReceiver<BackendEvent>, window: AnyWin
     .detach();
 }
 
+/// Takes out what Somme added to the system, before its files are deleted.
+const UNINSTALL_ARG: &str = "--uninstall";
+
+/// Takes Somme out of "Open With" and login. The user's data stays where it
+/// is, and this says where. Gives the exit code.
+fn uninstall() -> i32 {
+    let data_dir = match services::data_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("{err:#}");
+            return 1;
+        }
+    };
+    let mut code = 0;
+    if let Err(err) = open_with::apply(&data_dir, false) {
+        eprintln!("Could not take Somme out of Open With: {err:#}");
+        code = 1;
+    }
+    if let Err(err) = mcp::remove_service(&data_dir) {
+        eprintln!("Could not stop Somme from starting at login: {err:#}");
+        code = 1;
+    }
+    if data_dir.exists() {
+        // A Somme started again asks again, and the service sees it is off and stops.
+        let mut settings = Settings::load(&data_dir);
+        settings.open_with = None;
+        settings.agent_service = false;
+        settings.save(&data_dir);
+    }
+    if code == 0 {
+        println!("Somme is out of Open With and no longer starts at login.");
+        println!("Now delete the Somme app itself.");
+    }
+    println!(
+        "Your hosts, keys and settings are still in {}. Delete that folder to remove them too.",
+        data_dir.display()
+    );
+    code
+}
+
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         // Agents start the app this way. It only passes messages to the running
@@ -101,6 +141,7 @@ fn main() -> anyhow::Result<()> {
         // Keeps agents working while the app is closed.
         Some(mcp::SERVICE_ARG) => std::process::exit(mcp::run_service()),
         Some(mcp::WORKER_ARG) => std::process::exit(mcp::run_worker()),
+        Some(UNINSTALL_ARG) => std::process::exit(uninstall()),
         // Release tools: make the update key, sign a release.
         Some(update::verify::KEYGEN_ARG | update::verify::SIGN_ARG) => {
             let args: Vec<String> = std::env::args().skip(1).collect();
@@ -180,11 +221,7 @@ fn main() -> anyhow::Result<()> {
             .inspect_err(|err| tracing::warn!(%err, "other copies of Somme can't hand files to this one"))
             .ok();
         open_with::pump(asks_rx, window, workspace, cx);
-        std::thread::spawn(move || {
-            if let Err(err) = open_with::register(&data_dir) {
-                tracing::warn!("could not add Somme to Open With: {err:#}");
-            }
-        });
+        open_with::init(data_dir, window, cx);
         let mut listening = Some(listening);
         cx.on_app_quit(move |_| {
             // A copy started from now on opens by itself.

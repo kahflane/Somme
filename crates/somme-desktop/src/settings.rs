@@ -76,6 +76,9 @@ pub struct Settings {
     pub trusted_folders: Vec<String>,
     /// Opens the editor files left open last time, scratch files too.
     pub reopen_files: bool,
+    /// Lists Somme in the system's "Open With" for text files and folders.
+    /// Unset until the user is asked, which is only on Windows and Linux.
+    pub open_with: Option<bool>,
     /// Shows who last changed the line the cursor is on, and when.
     pub line_blame: bool,
     /// Lets agents connect over MCP and run scripts on saved hosts.
@@ -121,6 +124,7 @@ impl Default for Settings {
             auto_lock_minutes: 0,
             trusted_folders: Vec::new(),
             reopen_files: true,
+            open_with: None,
             line_blame: true,
             agent_access: false,
             agent_service: false,
@@ -171,19 +175,22 @@ impl Settings {
     /// Changes settings, saves them, and redraws every window.
     pub fn update(cx: &mut App, change: impl FnOnce(&mut Self)) {
         change(cx.global_mut::<Self>());
-        let settings = cx.global::<Self>().clone();
         if let Some(file) = cx.try_global::<SettingsFile>() {
-            let path = file.0.join(FILE_NAME);
-            match serde_json::to_string_pretty(&settings) {
-                Ok(raw) => {
-                    if let Err(err) = std::fs::write(&path, raw) {
-                        tracing::warn!(%err, "could not save settings");
-                    }
-                }
-                Err(err) => tracing::warn!(%err, "could not encode settings"),
-            }
+            cx.global::<Self>().save(&file.0);
         }
         cx.refresh_windows();
+    }
+
+    /// Writes the settings to the folder `dir`.
+    pub fn save(&self, dir: &Path) {
+        match serde_json::to_string_pretty(self) {
+            Ok(raw) => {
+                if let Err(err) = std::fs::write(dir.join(FILE_NAME), raw) {
+                    tracing::warn!(%err, "could not save settings");
+                }
+            }
+            Err(err) => tracing::warn!(%err, "could not encode settings"),
+        }
     }
 }
 

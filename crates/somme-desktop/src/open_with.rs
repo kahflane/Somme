@@ -10,13 +10,14 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use gpui_kit::{AnyWindowHandle, App, Entity};
+use gpui_kit::{AnyWindowHandle, App, AppContext as _, Entity, Global, PromptButton, PromptLevel};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 
 use crate::mcp::install::{self, Step};
 use crate::mcp::make_private_dir;
 use crate::mcp::transport::{self, Listener, Mark, Stream};
 use crate::runtime;
+use crate::settings::Settings;
 use crate::ui::workspace::Workspace;
 
 /// Holds the link to the running Somme.
@@ -26,6 +27,9 @@ const MARKER: &str = "open-with.txt";
 const MAX_MESSAGE: u64 = 1024 * 1024;
 /// The name file managers know Somme by. Wayland matches windows to it.
 const APP_ID: &str = "app.somme.desktop";
+/// Whether Somme asks before it goes in "Open With". The Mac app says by
+/// itself what it opens, so there is nothing to set up there.
+pub const ASKS: bool = !cfg!(target_os = "macos");
 
 /// Kinds of text files Somme offers to open, by extension. The macOS app
 /// claims the same ones (see `macos-app.sh`).
@@ -195,10 +199,17 @@ struct Target {
 }
 
 /// The Linux steps: a desktop entry that file managers list under "Open
-/// With", and its icon.
-fn linux(target: &Target) -> Vec<Step> {
+/// With", and its icon. Or, when `on` is false, taking them out.
+fn linux(target: &Target, on: bool) -> Vec<Step> {
     let apps = target.home.join(".local/share/applications");
+    let entry_path = apps.join(format!("{APP_ID}.desktop"));
     let icon = target.home.join(".local/share/icons/hicolor/scalable/apps").join(format!("{APP_ID}.svg"));
+    let apps_arg = apps.to_string_lossy().into_owned();
+    // Some file managers only see changed entries once this runs.
+    let refresh = install::run("update-desktop-database", &[&apps_arg], true);
+    if !on {
+        return vec![Step::Remove(entry_path), Step::Remove(icon), refresh];
+    }
     let entry = format!(
         "[Desktop Entry]\nType=Application\nName=Somme\nGenericName=Terminal and SSH client\nComment=Terminals, servers and files\n\
          Exec={} %F\nIcon={APP_ID}\nTerminal=false\nStartupWMClass={APP_ID}\nCategories=Development;System;TerminalEmulator;\n\
@@ -206,12 +217,10 @@ fn linux(target: &Target) -> Vec<Step> {
         desktop_word(&target.exe.to_string_lossy()),
         MIME_TYPES.join(";"),
     );
-    let apps_arg = apps.to_string_lossy().into_owned();
     vec![
-        Step::Write(apps.join(format!("{APP_ID}.desktop")), entry),
+        Step::Write(entry_path, entry),
         Step::Write(icon, include_str!("../assets/icon.svg").to_owned()),
-        // Some file managers only see new entries once this runs.
-        install::run("update-desktop-database", &[&apps_arg], true),
+        refresh,
     ]
 }
 
@@ -230,14 +239,27 @@ fn desktop_word(text: &str) -> String {
 }
 
 /// The Windows steps: Somme in "Open with" for text files, and "Open with
-/// Somme" on folders. All of it is for this user only.
-fn windows(target: &Target, out: &Path) -> Vec<Step> {
+/// Somme" on folders. All of it is for this user only. When `on` is false,
+/// the same keys are taken out.
+fn windows(target: &Target, out: &Path, on: bool) -> Vec<Step> {
     let exe = target.exe.to_string_lossy().into_owned();
     let name = exe.rsplit(['\\', '/']).next().filter(|name| !name.is_empty()).unwrap_or("Somme.exe").to_owned();
     let classes = r"HKEY_CURRENT_USER\Software\Classes";
     let value = |text: &str| format!("\"{}\"", text.replace('\\', r"\\").replace('"', "\\\""));
     let icon = value(&format!("\"{exe}\",0"));
     let mut reg = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
+    let app = format!(r"Applications\{name}");
+    let places = [r"Directory\shell\Somme", r"Directory\Background\shell\Somme"];
+    let file = out.join("open-with.reg");
+    let file_arg = file.to_string_lossy().into_owned();
+    if !on {
+        // A minus before a key deletes it, with all under it.
+        let opened_with = EXTENSIONS.iter().map(|ext| format!(r".{ext}\OpenWithList\{name}"));
+        for path in [app].into_iter().chain(opened_with).chain(places.map(str::to_owned)) {
+            reg.push_str(&format!("[-{classes}\\{path}]\r\n\r\n"));
+        }
+        return vec![Step::WriteUtf16(file, reg), install::run("reg", &["import", &file_arg], false)];
+    }
     let mut key = |path: String, values: &[(&str, String)]| {
         reg.push_str(&format!("[{classes}\\{path}]\r\n"));
         for (name, data) in values {
@@ -246,7 +268,6 @@ fn windows(target: &Target, out: &Path) -> Vec<Step> {
         }
         reg.push_str("\r\n");
     };
-    let app = format!(r"Applications\{name}");
     key(app.clone(), &[("FriendlyAppName", value("Somme"))]);
     key(format!(r"{app}\DefaultIcon"), &[("", icon.clone())]);
     key(format!(r"{app}\shell\open\command"), &[("", value(&format!("\"{exe}\" \"%1\"")))]);
@@ -256,40 +277,39 @@ fn windows(target: &Target, out: &Path) -> Vec<Step> {
     for ext in EXTENSIONS {
         key(format!(r".{ext}\OpenWithList\{name}"), &[]);
     }
-    for place in [r"Directory\shell\Somme", r"Directory\Background\shell\Somme"] {
+    for place in places {
         key(place.to_owned(), &[("", value("Open with Somme")), ("Icon", icon.clone())]);
         key(format!(r"{place}\command"), &[("", value(&format!("\"{exe}\" \"%V\"")))]);
     }
-    let file = out.join("open-with.reg");
-    let file_arg = file.to_string_lossy().into_owned();
     vec![Step::WriteUtf16(file, reg), install::run("reg", &["import", &file_arg], false)]
 }
 
-fn steps(target: &Target, data_dir: &Path) -> Vec<Step> {
-    if cfg!(target_os = "macos") {
+fn steps(target: &Target, data_dir: &Path, on: bool) -> Vec<Step> {
+    if !ASKS {
         // The app bundle says what it opens (see `macos-app.sh`).
         Vec::new()
     } else if cfg!(windows) {
-        windows(target, data_dir)
+        windows(target, data_dir, on)
     } else {
-        linux(target)
+        linux(target, on)
     }
 }
 
-/// Lists Somme in the system's "Open With" for text files and folders. Runs
-/// the system's tools, so call it off the UI thread. Test data folders get
-/// the files written into them instead.
-pub fn register(data_dir: &Path) -> anyhow::Result<()> {
+/// Puts Somme in the system's "Open With" for text files and folders, or
+/// takes it out when `on` is false. Runs the system's tools, so call it off
+/// the UI thread. Test data folders get the files written into them instead.
+pub fn apply(data_dir: &Path, on: bool) -> anyhow::Result<()> {
     // An AppImage runs from a folder that is gone once it quits.
     let exe = match std::env::var_os("APPIMAGE") {
         Some(image) => PathBuf::from(image),
         None => std::env::current_exe()?,
     };
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot find the home folder"))?;
-    let steps = steps(&Target { exe, home }, data_dir);
+    let steps = steps(&Target { exe, home }, data_dir, on);
     let marker = data_dir.join(MARKER);
-    let wanted = install::describe(&steps);
-    if steps.is_empty() || std::fs::read_to_string(&marker).ok().as_deref() == Some(wanted.as_str()) {
+    // Nothing to take out when it was never put in.
+    let wanted = on.then(|| install::describe(&steps));
+    if steps.is_empty() || std::fs::read_to_string(&marker).ok() == wanted {
         return Ok(());
     }
     if std::env::var_os("SOMME_DATA_DIR").is_some() {
@@ -299,8 +319,79 @@ pub fn register(data_dir: &Path) -> anyhow::Result<()> {
             install::perform(step)?;
         }
     }
-    std::fs::write(marker, wanted)?;
+    match wanted {
+        Some(text) => std::fs::write(marker, text)?,
+        None => drop(std::fs::remove_file(marker)),
+    }
     Ok(())
+}
+
+/// What was last done for "Open With", so only a change is done again.
+struct Applied {
+    data_dir: PathBuf,
+    done: Option<bool>,
+    busy: bool,
+}
+
+impl Global for Applied {}
+
+/// Keeps "Open With" in step with the setting, and asks the first time
+/// whether Somme may go in it.
+pub fn init(data_dir: PathBuf, window: AnyWindowHandle, cx: &mut App) {
+    if !ASKS {
+        return;
+    }
+    cx.set_global(Applied { data_dir, done: None, busy: false });
+    cx.observe_global::<Settings>(sync).detach();
+    sync(cx);
+    // A scripted check runs beside someone's work, so it must not wait on them.
+    if Settings::get(cx).open_with.is_some() || std::env::var_os("SOMME_SCRIPT").is_some() {
+        return;
+    }
+    let _ = window.update(cx, |_, window, cx| {
+        let buttons = [PromptButton::ok("Add"), PromptButton::cancel("Don't Add")];
+        let answer = crate::ui::native::ask(
+            PromptLevel::Info,
+            "Add Somme to Open With?",
+            Some("Somme can show up under Open With for text files, and as Open with Somme on folders. This is only for your user. You can change it later in Settings › Editor."),
+            &buttons,
+            window,
+            cx,
+        );
+        cx.spawn(async move |cx| {
+            let add = answer.await == Ok(0);
+            cx.update(|cx| Settings::update(cx, |s| s.open_with = Some(add)));
+        })
+        .detach();
+    });
+}
+
+/// Puts Somme in "Open With", or takes it out, when the setting changed.
+fn sync(cx: &mut App) {
+    let Some(wanted) = Settings::get(cx).open_with else { return };
+    let applied = cx.global_mut::<Applied>();
+    if applied.busy || applied.done == Some(wanted) {
+        return;
+    }
+    applied.busy = true;
+    let data_dir = applied.data_dir.clone();
+    cx.spawn(async move |cx| {
+        let result = cx.background_spawn(async move { apply(&data_dir, wanted) }).await;
+        cx.update(|cx| {
+            let applied = cx.global_mut::<Applied>();
+            applied.busy = false;
+            // Tried once. The next start tries again.
+            applied.done = Some(wanted);
+            if let Err(err) = result {
+                tracing::warn!("could not change Open With: {err:#}");
+                let what = if wanted { "add Somme to" } else { "take Somme out of" };
+                crate::ui::native::notify(&format!("Could not {what} Open With"), &format!("{err:#}"), cx);
+            }
+            // The setting may have changed meanwhile.
+            sync(cx);
+        });
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -336,7 +427,7 @@ mod tests {
             exe: PathBuf::from("/opt/Somme 1.0/somme"),
             home: PathBuf::from("/home/me"),
         };
-        let steps = linux(&target);
+        let steps = linux(&target, true);
         let entry = written(&steps)[0];
         assert!(entry.contains("Exec=\"/opt/Somme 1.0/somme\" %F\n"), "{entry}");
         assert!(entry.contains("MimeType=inode/directory;text/plain;"), "{entry}");
@@ -345,6 +436,11 @@ mod tests {
             Step::Write("/home/me/.local/share/applications/app.somme.desktop.desktop".into(), entry.to_owned())
         );
         assert_eq!(desktop_word(r#"/a "b"/100%/c\d"#), r#""/a \\"b\\"/100%%/c\\\\d""#);
+
+        let off = linux(&target, false);
+        assert_eq!(off[0], Step::Remove("/home/me/.local/share/applications/app.somme.desktop.desktop".into()));
+        assert_eq!(off[1], Step::Remove("/home/me/.local/share/icons/hicolor/scalable/apps/app.somme.desktop.svg".into()));
+        assert!(written(&off).is_empty());
     }
 
     #[test]
@@ -353,7 +449,7 @@ mod tests {
             exe: PathBuf::from(r"C:\Users\Me\AppData\Local\Somme\Somme.exe"),
             home: PathBuf::from(r"C:\Users\Me"),
         };
-        let steps = windows(&target, Path::new("/data"));
+        let steps = windows(&target, Path::new("/data"), true);
         let reg = written(&steps)[0];
         assert!(reg.starts_with("Windows Registry Editor Version 5.00\r\n"));
         assert!(reg.contains(
@@ -364,6 +460,30 @@ mod tests {
         assert!(reg.contains("[HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\Somme\\command]\r\n@=\"\\\"C:\\\\Users\\\\Me\\\\AppData\\\\Local\\\\Somme\\\\Somme.exe\\\" \\\"%V\\\"\""));
         assert!(!reg.contains("HKEY_LOCAL_MACHINE"));
         assert!(matches!(&steps[1], Step::Run { program, args, .. } if program == "reg" && args[0] == "import"));
+    }
+
+    #[test]
+    fn windows_takes_out_what_it_added() {
+        let target = Target {
+            exe: PathBuf::from(r"C:\Users\Me\AppData\Local\Somme\Somme.exe"),
+            home: PathBuf::from(r"C:\Users\Me"),
+        };
+        let added = windows(&target, Path::new("/data"), true);
+        let removed = windows(&target, Path::new("/data"), false);
+        let reg = written(&removed)[0];
+        for key in [
+            r"Applications\Somme.exe",
+            r".json\OpenWithList\Somme.exe",
+            r"Directory\shell\Somme",
+            r"Directory\Background\shell\Somme",
+        ] {
+            assert!(reg.contains(&format!("[-HKEY_CURRENT_USER\\Software\\Classes\\{key}]\r\n")), "{reg}");
+        }
+        // Only deletions, and none of the keys above the ones Somme added.
+        assert!(reg.lines().skip(1).all(|line| line.is_empty() || line.starts_with("[-HKEY_CURRENT_USER\\Software\\Classes\\")));
+        assert!(!reg.contains("[-HKEY_CURRENT_USER\\Software\\Classes\\Directory]"));
+        assert!(!reg.contains(r"Classes\.json]"));
+        assert_eq!(removed[1], added[1]);
     }
 
     #[test]

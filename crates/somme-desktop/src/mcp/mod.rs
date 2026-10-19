@@ -64,6 +64,15 @@ fn dir(data_dir: &Path) -> PathBuf {
     data_dir.join("agents")
 }
 
+/// Takes the background service out of login, for `Somme --uninstall`.
+pub fn remove_service(data_dir: &Path) -> anyhow::Result<()> {
+    let dir = dir(data_dir);
+    if !dir.exists() {
+        return Ok(());
+    }
+    install::apply(&dir, false)
+}
+
 /// For `Somme --mcp`. Gives the exit code.
 pub fn run_bridge() -> i32 {
     match crate::services::data_dir() {

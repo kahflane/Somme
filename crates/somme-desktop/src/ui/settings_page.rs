@@ -398,14 +398,20 @@ fn terminal_page() -> SettingPage {
 // Short pages keep to one group: the sidebar lists a page's groups as jump
 // links, which do nothing on a page too short to scroll.
 fn editor_page() -> SettingPage {
-    SettingPage::new("Editor").icon(Icon::new(Lucide::FilePen)).group(
-        SettingGroup::new().title("Files").item(
-            SettingItem::new("Reopen files on start", switch(|s| s.reopen_files, |s, v| s.reopen_files = v))
+    let mut files = SettingGroup::new().title("Files").item(
+        SettingItem::new("Reopen files on start", switch(|s| s.reopen_files, |s, v| s.reopen_files = v))
+            .description(format!("Opens the files you had open when you last quit {APP_NAME}, unsaved new files too.")),
+    );
+    // The Mac app says by itself what it opens, so there is nothing to change there.
+    if crate::open_with::ASKS {
+        files = files.item(
+            SettingItem::new("Show in Open With", switch(|s| s.open_with == Some(true), |s, v| s.open_with = Some(v)))
                 .description(format!(
-                    "Opens the files you had open when you last quit {APP_NAME}, unsaved new files too."
+                    "Lists {APP_NAME} under Open With for text files, and adds Open with {APP_NAME} to folders. Only for your user. Turning it off takes them out again."
                 )),
-        ),
-    )
+        );
+    }
+    SettingPage::new("Editor").icon(Icon::new(Lucide::FilePen)).group(files)
 }
 
 fn security_page() -> SettingPage {
