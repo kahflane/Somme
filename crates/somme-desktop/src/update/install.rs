@@ -483,15 +483,15 @@ mod tests {
         let app = fake_app(dir.path(), "0.1.0", "old");
         let exe = app.join("Contents/MacOS/Somme");
         let key = Some(test_key().verifying_key());
-        let full = release(&["Somme-0.2.0-macos-aarch64.zip", "Somme-0.2.0-macos-x86_64.zip", SUMS, SIGNATURE]);
+        let full = release(&["Somme-0.2.0-macos-universal.zip", SUMS, SIGNATURE]);
 
         assert!(page(way_for(&full, false, key, Some(&exe))).contains("release page"));
         assert!(page(way_for(&full, true, None, Some(&exe))).contains("can't check"));
         assert!(page(way_for(&full, true, key, Some(Path::new("/tmp/somme-desktop")))).contains("isn't running from its app"));
-        let unsigned = release(&["Somme-0.2.0-macos-aarch64.zip", "Somme-0.2.0-macos-x86_64.zip", SUMS]);
+        let unsigned = release(&["Somme-0.2.0-macos-universal.zip", SUMS]);
         assert!(page(way_for(&unsigned, true, key, Some(&exe))).contains("no signed download"));
-        let other_arch = release(&["Somme-0.2.0-macos-arm.zip", SUMS, SIGNATURE]);
-        assert!(page(way_for(&other_arch, true, key, Some(&exe))).contains("no signed download"));
+        let per_chip = release(&["Somme-0.2.0-macos-aarch64.zip", "Somme-0.2.0-macos-x86_64.zip", SUMS, SIGNATURE]);
+        assert!(page(way_for(&per_chip, true, key, Some(&exe))).contains("no signed download"));
         let mut huge = full.clone();
         huge.assets.iter_mut().for_each(|asset| asset.size = MAX_ZIP + 1);
         assert!(page(way_for(&huge, true, key, Some(&exe))).contains("too big"));
@@ -510,7 +510,7 @@ mod tests {
         std::fs::create_dir(&locked).unwrap();
         let app = fake_app(&locked, "0.1.0", "old");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let full = release(&["Somme-0.2.0-macos-aarch64.zip", "Somme-0.2.0-macos-x86_64.zip", SUMS, SIGNATURE]);
+        let full = release(&["Somme-0.2.0-macos-universal.zip", SUMS, SIGNATURE]);
         let why = page(way_for(&full, true, Some(test_key().verifying_key()), Some(&app.join("Contents/MacOS/Somme"))));
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(why.contains("can't change"), "{why}");
@@ -594,7 +594,7 @@ mod tests {
         }
     }
 
-    /// Zips a fake new app the way `release.sh` does.
+    /// Zips a fake new app the way the release workflow does.
     #[cfg(target_os = "macos")]
     fn fake_zip(dir: &Path, version: &str) -> Vec<u8> {
         let staging = dir.join("staging");
@@ -614,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn downloads_checks_and_unpacks_the_update() {
         let dir = tempfile::tempdir().unwrap();
-        let name = "Somme-0.2.0-macos-aarch64.zip";
+        let name = "Somme-0.2.0-macos-universal.zip";
         let zip = fake_zip(dir.path(), "0.2.0");
         let sums = format!("{}  {name}\n", verify::hex(&Sha256::digest(&zip)));
         let signature = sign(&test_key(), sums.as_bytes());
@@ -641,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_bad_signatures_damage_and_other_hosts() {
         let dir = tempfile::tempdir().unwrap();
-        let name = "Somme-0.2.0-macos-aarch64.zip";
+        let name = "Somme-0.2.0-macos-universal.zip";
         let zip = b"zip bytes".to_vec();
         let good = format!("{}  {name}\n", verify::hex(&Sha256::digest(&zip)));
         let wrong = format!("{}  {name}\n", "00".repeat(32));

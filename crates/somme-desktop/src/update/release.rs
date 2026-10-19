@@ -110,9 +110,9 @@ impl Release {
         self.assets.iter().find(|asset| asset.name == name)
     }
 
-    /// The zipped app for this Mac.
+    /// The zipped app. One app runs on both Apple chip and Intel Macs.
     pub fn mac_zip(&self) -> String {
-        format!("Somme-{}-macos-{}.zip", self.version, std::env::consts::ARCH)
+        format!("Somme-{}-macos-universal.zip", self.version)
     }
 }
 
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(release.asset("SHA256SUMS.sig"), None);
         // The page is Somme's own, whatever the answer says.
         assert_eq!(release.page(), "https://github.com/kahflane/Somme/releases/tag/v0.2.0");
-        assert!(release.mac_zip().starts_with("Somme-0.2.0-macos-"));
+        assert_eq!(release.mac_zip(), "Somme-0.2.0-macos-universal.zip");
         assert_eq!(Release::parse(&release_json("v0.2.0", true, false)), None);
         assert_eq!(Release::parse(&release_json("v0.2.0", false, true)), None);
         assert_eq!(Release::parse(&release_json("nightly", false, false)), None);

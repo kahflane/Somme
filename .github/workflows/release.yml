@@ -1,4 +1,5 @@
-# Builds Somme for macOS, Windows and Linux.
+# Builds Somme for macOS, Windows and Linux. The Apple chip and Intel Mac
+# builds are joined into one app that runs on both.
 #
 # Push a tag like v0.2.0 (matching `version` in Cargo.toml) to publish a
 # GitHub release with every build, SHA256SUMS and, when the signing key is
@@ -80,7 +81,7 @@ jobs:
           arch=$(rustc -vV | sed -n 's/^host: //p' | cut -d- -f1)
           app=$(crates/somme-desktop/macos-app.sh --release | tail -n 1)
           mkdir -p dist
-          # The updater unpacks this with `ditto -x -k` and wants Somme.app at the top.
+          # The universal job below joins this with the other chip's.
           ditto -c -k --keepParent "$app" "dist/Somme-$VERSION-macos-$arch.zip"
 
       - name: Build for Linux
@@ -119,9 +120,42 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  universal:
+    name: Build macos-universal
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: parts
+
+      - name: Join the Apple chip and Intel apps
+        run: |
+          arm=$(ls parts/macos-aarch64/Somme-*-macos-aarch64.zip)
+          version=$(basename "$arm" | sed 's/^Somme-\(.*\)-macos-aarch64\.zip$/\1/')
+          ditto -x -k "$arm" arm
+          ditto -x -k parts/macos-x86_64/Somme-"$version"-macos-x86_64.zip intel
+          exe=Contents/MacOS/Somme
+          lipo -create "arm/Somme.app/$exe" "intel/Somme.app/$exe" -output universal
+          mv universal "arm/Somme.app/$exe"
+          lipo "arm/Somme.app/$exe" -verify_arch arm64 x86_64
+          # Joining breaks the old signature, so sign it again the same quick way.
+          codesign --force --sign - arm/Somme.app
+          codesign --verify arm/Somme.app
+          mkdir -p dist
+          # The updater unpacks this with `ditto -x -k` and wants Somme.app at the top.
+          ditto -c -k --keepParent arm/Somme.app "dist/Somme-$version-macos-universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Publish
-    needs: build
+    needs: [build, universal]
     if: github.ref_type == 'tag'
     # macOS, so the signing tool in the Mac build runs as it is.
     runs-on: macos-15
@@ -135,7 +169,10 @@ jobs:
 
       - name: List the checksums
         working-directory: dist
-        run: shasum -a 256 Somme-* > SHA256SUMS && cat SHA256SUMS
+        run: |
+          # Only the joined Mac app is published.
+          rm -f Somme-*-macos-aarch64.zip Somme-*-macos-x86_64.zip
+          shasum -a 256 Somme-* > SHA256SUMS && cat SHA256SUMS
 
       - name: Sign the checksums
         working-directory: dist
@@ -147,7 +184,7 @@ jobs:
             exit 0
           fi
           tool=$(mktemp -d)
-          ditto -x -k Somme-*-macos-aarch64.zip "$tool"
+          ditto -x -k Somme-*-macos-universal.zip "$tool"
           key="$RUNNER_TEMP/update.key"
           printf '%s\n' "$SIGNING_KEY" > "$key"
           chmod 600 "$key"

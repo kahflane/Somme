@@ -5,7 +5,7 @@
 //!
 //! Also the release tools: `somme-desktop --update-keygen PATH` makes a key
 //! pair, and `somme-desktop --update-sign KEY FILE` signs a file. See
-//! `release.sh`.
+//! `.github/workflows/release.yml`.
 
 use std::io::Write as _;
 use std::path::Path;

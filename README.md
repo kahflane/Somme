@@ -13,10 +13,9 @@ The app uses the hosted Somme Cloud at `https://somme-cloud.fly.dev`. Set `SOMME
 
 Somme looks for a newer GitHub release every few hours and shows a button on the rail. On macOS it can update itself, but only with releases signed by your update key.
 
-1. Once: `cargo run -p somme-desktop -- --update-keygen ~/somme-update.key`. It saves the private key there (keep it safe, never in the repo) and prints the public key. Put that line in `crates/somme-desktop/assets/update-key.pub` and commit it.
-2. Raise `version` in the root `Cargo.toml`.
-3. On a Mac: `SOMME_UPDATE_SIGNING_KEY=~/somme-update.key crates/somme-desktop/release.sh`. It prints a folder with `Somme-<version>-macos-<arch>.zip`, `SHA256SUMS` and `SHA256SUMS.sig`. It only makes the zip for the kind of Mac it runs on; to ship both, put the other zip in that folder and run it again.
-4. Make a GitHub release tagged `v<version>` (not a draft or pre-release) and upload those files.
+1. Once: `cargo run -p somme-desktop -- --update-keygen ~/somme-update.key`. It saves the private key there (keep it safe, never in the repo) and prints the public key. Put that line in `crates/somme-desktop/assets/update-key.pub` and commit it. Then `gh secret set SOMME_UPDATE_SIGNING_KEY < ~/somme-update.key`.
+2. Raise `version` in the root `Cargo.toml` and commit it.
+3. Push a tag `v<version>`. The Release workflow builds every system and publishes the release: one Mac app for Apple chip and Intel (`Somme-<version>-macos-universal.zip`), Windows, Linux, `SHA256SUMS` and `SHA256SUMS.sig`.
 
 Copies built before step 1 still see the update, but only offer its release page.
 
