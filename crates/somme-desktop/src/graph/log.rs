@@ -60,7 +60,9 @@ pub fn load(dir: &Path, count: usize) -> Result<Log, String> {
             "--remotes",
             "--tags",
             "HEAD",
-            "--date-order",
+            // Each branch's commits stay together, as in other graphs, so
+            // its line is short instead of winding past other branches.
+            "--topo-order",
             "--decorate=full",
             &max,
             "--format=%H%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s%x1e",
@@ -162,6 +164,8 @@ impl Row {
 
 /// Lays the commits out in columns. Each column holds the commit it waits
 /// for next; a commit goes in the first column waiting for it, or a free one.
+/// A commit's first parent stays in its column, so a branch's line runs
+/// straight down, and lines waiting for the same commit meet at its dot.
 pub fn layout(commits: &[Commit]) -> Vec<Row> {
     // What each column waits for, and its colour.
     let mut lanes: Vec<Option<(&str, usize)>> = Vec::new();
@@ -189,14 +193,19 @@ pub fn layout(commits: &[Commit]) -> Vec<Row> {
         row.column = column;
         row.color = color;
         for (n, parent) in commit.parents.iter().enumerate() {
-            // A parent another line already goes to: join it.
+            if n == 0 {
+                lanes[column] = Some((parent.as_str(), color));
+                row.out.push((column, color));
+                continue;
+            }
+            // A merged parent another line already goes to: join it.
             if let Some((joined, (_, color))) =
                 lanes.iter().enumerate().find_map(|(ix, lane)| lane.filter(|(sha, _)| *sha == parent.as_str()).map(|lane| (ix, lane)))
             {
                 row.out.push((joined, color));
                 continue;
             }
-            let (lane, color) = if n == 0 { (column, color) } else { (free(&mut lanes), next_color()) };
+            let (lane, color) = (free(&mut lanes), next_color());
             lanes[lane] = Some((parent.as_str(), color));
             row.out.push((lane, color));
         }
@@ -298,9 +307,10 @@ mod tests {
         let rows = layout(&[commit('m', &['c', 'f']), commit('f', &['r']), commit('c', &['r']), commit('r', &[])]);
         assert_eq!(rows[0], Row { column: 0, color: 0, through: vec![], into: vec![], out: vec![(0, 0), (1, 1)] });
         assert_eq!(rows[1], Row { column: 1, color: 1, through: vec![(0, 0)], into: vec![(1, 1)], out: vec![(1, 1)] });
-        // c's parent r is already waited for in column 1, so c's line joins it.
-        assert_eq!(rows[2], Row { column: 0, color: 0, through: vec![(1, 1)], into: vec![(0, 0)], out: vec![(1, 1)] });
-        assert_eq!(rows[3], Row { column: 1, color: 1, through: vec![], into: vec![(1, 1)], out: vec![] });
+        // c keeps its column, though f's line waits for r too.
+        assert_eq!(rows[2], Row { column: 0, color: 0, through: vec![(1, 1)], into: vec![(0, 0)], out: vec![(0, 0)] });
+        // Both lines meet at r, in the leftmost column.
+        assert_eq!(rows[3], Row { column: 0, color: 0, through: vec![], into: vec![(0, 0), (1, 1)], out: vec![] });
         assert_eq!(rows.iter().map(Row::width).max(), Some(2));
     }
 
@@ -360,10 +370,30 @@ mod tests {
     }
 
     #[test]
+    fn the_main_line_keeps_its_column_through_merges() {
+        // m2 and m1 are merges on the main line; b1 and b2 are branch commits
+        // made from r, which m1 also comes from.
+        let rows = layout(&[
+            commit('d', &['c', 'b']),
+            commit('b', &['r']),
+            commit('c', &['e', 'f']),
+            commit('f', &['r']),
+            commit('e', &['r']),
+            commit('r', &[]),
+        ]);
+        let main: Vec<usize> = ["d", "c", "e", "r"]
+            .iter()
+            .map(|sha| rows[["d", "b", "c", "f", "e", "r"].iter().position(|s| s == sha).unwrap()].column)
+            .collect();
+        assert_eq!(main, [0, 0, 0, 0]);
+    }
+
+    #[test]
     fn a_new_branch_tip_takes_a_free_column() {
         let rows = layout(&[commit('x', &['r']), commit('y', &['r']), commit('r', &[])]);
         assert_eq!((rows[0].column, rows[1].column), (0, 1));
-        assert_eq!(rows[1].out, [(0, 0)]);
-        assert_eq!(rows[2].into, [(0, 0)]);
+        assert_eq!(rows[1].out, [(1, 1)]);
+        assert_eq!(rows[2].into, [(0, 0), (1, 1)]);
+        assert_eq!(rows[2].column, 0);
     }
 }
