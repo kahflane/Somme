@@ -13,9 +13,9 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    IntoElement, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement as _, Pixels, Point, Render, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
-    Subscription, UTF16Selection, Window, actions, div, prelude::FluentBuilder as _, px,
+    NoAction, Subscription, UTF16Selection, Window, actions, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::settings::{BellSetting, Settings};
@@ -69,6 +69,17 @@ const BELL_FLASH: Duration = Duration::from_millis(150);
 
 pub fn init(cx: &mut App) {
     let ctx = Some(CONTEXT);
+    // A program in the terminal gets every key except the app's own
+    // shortcuts, which use Cmd on macOS and Ctrl+Shift elsewhere. The UI
+    // library takes these keys window-wide (Tab moves the focus; off macOS,
+    // Ctrl+C copies), so the terminal turns that off. Bound first, so the
+    // command box's own bindings still win.
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction, ctx),
+        KeyBinding::new("shift-tab", NoAction, ctx),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([KeyBinding::new("ctrl-c", NoAction, ctx)]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, ctx),
@@ -383,6 +394,10 @@ impl TerminalView {
         if self.find_focused(window, cx) {
             return;
         }
+        if self.copy_on_ctrl_c(&event.keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.wants_prompt(cx) {
             // Typing over the blocks goes to the editor.
             self.focus_prompt(window, cx);
@@ -397,14 +412,38 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        let text = if self.session.read(cx).shows_blocks() {
+        if let Some(text) = self.selected_text(cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn selected_text(&self, cx: &App) -> Option<String> {
+        if self.session.read(cx).shows_blocks() {
             self.blocks_selection_text(cx)
         } else {
             self.session.read(cx).selection_text()
-        };
-        if let Some(text) = text {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// Off macOS, Ctrl+C copies what is selected, as in Windows Terminal, and
+    /// lets go of it, so the next Ctrl+C stops the program.
+    fn copy_on_ctrl_c(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let ctrl_c = keystroke.key == "c" && keystroke.modifiers == Modifiers::control();
+        if cfg!(target_os = "macos") || !ctrl_c {
+            return false;
+        }
+        let Some(text) = self.selected_text(cx) else { return false };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.session.update(cx, |session, cx| {
+            session.clear_selection();
+            if let Some(blocks) = session.blocks.as_mut() {
+                for block in &mut blocks.list {
+                    block.term.selection = None;
+                }
+            }
+            cx.notify();
+        });
+        true
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
@@ -436,6 +475,11 @@ impl TerminalView {
     }
 
     fn scroll_lines(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
+        // A full-screen program has no scrollback, so it gets the key instead.
+        if !self.session.read(cx).shows_blocks() && self.session.read(cx).mode().contains(TermMode::ALT_SCREEN) {
+            cx.propagate();
+            return;
+        }
         if self.session.read(cx).shows_blocks() {
             self.blocks_scroll_to(scroll, cx);
         } else {
@@ -715,12 +759,19 @@ impl TerminalView {
         });
     }
 
+    // With nothing being found, the key goes to the program, which may use F3.
     fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
-        self.step_search(true, cx);
+        match self.search {
+            Some(_) => self.step_search(true, cx),
+            None => cx.propagate(),
+        }
     }
 
     fn find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
-        self.step_search(false, cx);
+        match self.search {
+            Some(_) => self.step_search(false, cx),
+            None => cx.propagate(),
+        }
     }
 
     /// Matches to highlight, as (start, end, is_active).
