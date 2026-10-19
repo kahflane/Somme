@@ -21,6 +21,10 @@
 #   APPLE_NOTARY_KEY            an App Store Connect API key's .p8 text
 #   APPLE_NOTARY_KEY_ID         that key's ID
 #   APPLE_NOTARY_ISSUER         the Issuer ID shown above the keys
+#
+# Windows signing: with the secret SIGNPATH_API_TOKEN and the repository
+# variable SIGNPATH_ORGANIZATION_ID, a release sends Somme.exe to SignPath
+# and waits until an approver signs it there.
 
 name: Release
 
@@ -55,7 +59,11 @@ jobs:
           - name: windows-x86_64
             os: windows-2022
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    # Windows may wait hours for a person to approve its signing.
+    timeout-minutes: ${{ matrix.os == 'windows-2022' && 360 || 120 }}
+    env:
+      # Windows releases are signed through SignPath once it is set up.
+      SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN != '' && github.ref_type == 'tag' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -119,8 +127,49 @@ jobs:
         shell: bash
         run: |
           cargo build --release --locked -p somme-desktop
+          mkdir -p unsigned
+          cp target/release/somme-desktop.exe unsigned/Somme.exe
+
+      # SignPath signs Somme.exe for free, as Somme is open source. Only
+      # releases are signed, and each waits for an approver on signpath.io.
+      - name: Upload Somme.exe for signing
+        id: unsigned
+        if: runner.os == 'Windows' && env.SIGNPATH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-unsigned
+          path: unsigned/Somme.exe
+          if-no-files-found: error
+
+      - name: Sign Somme.exe
+        if: runner.os == 'Windows' && env.SIGNPATH == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: somme
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          # SignPath checks that Somme.exe says this version inside.
+          parameters: |
+            version: ${{ toJSON(env.VERSION) }}
+          wait-for-completion: true
+          # Long enough for a person to approve it.
+          wait-for-completion-timeout-in-seconds: 14400
+          output-artifact-directory: signed
+
+      - name: Zip for Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          exe=unsigned/Somme.exe
+          if [ "$SIGNPATH" = true ]; then
+            exe=signed/Somme.exe
+          else
+            echo "::warning::SIGNPATH_API_TOKEN isn't set or this isn't a release, so Somme.exe isn't signed."
+          fi
           mkdir -p dist
-          cp target/release/somme-desktop.exe dist/Somme.exe
+          cp "$exe" dist/Somme.exe
           (cd dist && 7z a "Somme-$VERSION-windows-x86_64.zip" Somme.exe >/dev/null && rm Somme.exe)
 
       - uses: actions/upload-artifact@v4
@@ -179,8 +228,16 @@ jobs:
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
+          # A secret pasted with Enter or a space at its end keeps them.
+          certificate_password=$(printf '%s' "$CERTIFICATE_PASSWORD" | sed -e 's/[[:space:]]*$//')
+          NOTARY_KEY_ID=$(printf '%s' "$NOTARY_KEY_ID" | tr -d '[:space:]')
+          NOTARY_ISSUER=$(printf '%s' "$NOTARY_ISSUER" | tr -d '[:space:]')
           printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          if ! security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$certificate_password" -T /usr/bin/codesign; then
+            rm -f "$RUNNER_TEMP/certificate.p12"
+            echo "::error::The .p12 in MACOS_CERTIFICATE didn't open with MACOS_CERTIFICATE_PASSWORD."
+            exit 1
+          fi
           rm -f "$RUNNER_TEMP/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
           # Apple's middle certificates, so the signature reaches Apple's root.
@@ -246,8 +303,8 @@ jobs:
       - name: List the checksums
         working-directory: dist
         run: |
-          # Only the joined Mac app is published.
-          rm -f Somme-*-macos-aarch64.zip Somme-*-macos-x86_64.zip
+          # Only the joined Mac app and the zipped Windows program are published.
+          rm -f Somme-*-macos-aarch64.zip Somme-*-macos-x86_64.zip Somme.exe
           shasum -a 256 Somme-* > SHA256SUMS && cat SHA256SUMS
 
       - name: Sign the checksums
@@ -270,8 +327,15 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
         run: |
+          notes=""
+          if [ "$SIGNPATH" = true ]; then
+            # SignPath asks for this on every release page.
+            notes="[Code signing policy](https://github.com/$GITHUB_REPOSITORY#code-signing-policy): free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org)."
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "Somme ${GITHUB_REF_NAME#v}" \
+            --notes "$notes" \
             --generate-notes

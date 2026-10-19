@@ -71,6 +71,10 @@ zeroize.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
 
+[build-dependencies]
+# The icon, name and version inside Somme.exe.
+winresource = "0.1"
+
 [features]
 snapshot = ["gpui-kit/test-support"]
 
