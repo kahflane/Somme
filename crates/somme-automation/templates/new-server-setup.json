@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "name": "New server setup",
+  "description": "A user with your SSH key, a firewall, fail2ban, automatic updates and Docker, then a check that it all works. For servers tagged new.",
+  "inputs": [
+    {
+      "name": "user",
+      "default": "deploy"
+    },
+    {
+      "name": "ssh_key",
+      "label": "Public SSH key",
+      "default": ""
+    }
+  ],
+  "nodes": [
+    {
+      "id": "user",
+      "type": "command",
+      "hosts": {
+        "tag": "new"
+      },
+      "sudo": true,
+      "command": "set -e\nid {{input.user}} >/dev/null 2>&1 || adduser --disabled-password --gecos '' {{input.user}}\nusermod -aG sudo {{input.user}}\nmkdir -p /home/{{input.user}}/.ssh\necho '{{input.ssh_key}}' >> /home/{{input.user}}/.ssh/authorized_keys\nchown -R {{input.user}}: /home/{{input.user}}/.ssh\nchmod 700 /home/{{input.user}}/.ssh\nchmod 600 /home/{{input.user}}/.ssh/authorized_keys"
+    },
+    {
+      "id": "firewall",
+      "type": "command",
+      "hosts": {
+        "tag": "new"
+      },
+      "sudo": true,
+      "command": "set -e\napt-get update -q\nDEBIAN_FRONTEND=noninteractive apt-get install -y ufw\nufw allow OpenSSH\nufw --force enable"
+    },
+    {
+      "id": "tools",
+      "type": "command",
+      "hosts": {
+        "tag": "new"
+      },
+      "sudo": true,
+      "timeout_seconds": 1200,
+      "command": "set -e\nDEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban unattended-upgrades docker.io\nsystemctl enable --now fail2ban docker\nusermod -aG docker {{input.user}}"
+    },
+    {
+      "id": "verify",
+      "type": "command",
+      "hosts": {
+        "tag": "new"
+      },
+      "sudo": true,
+      "command": "id {{input.user}}\nufw status | head -3\nsystemctl is-active fail2ban docker unattended-upgrades"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "New server ready",
+      "body": "{{nodes.verify.output}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "user",
+      "to": "firewall"
+    },
+    {
+      "from": "firewall",
+      "to": "tools"
+    },
+    {
+      "from": "tools",
+      "to": "verify"
+    },
+    {
+      "from": "verify",
+      "to": "tell"
+    }
+  ]
+}

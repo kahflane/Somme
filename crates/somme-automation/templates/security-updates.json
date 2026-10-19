@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "name": "Security updates",
+  "description": "Every Monday: lists upgradable packages, has your LLM pick the security ones, and upgrades one server at a time once you allow it.",
+  "start": {
+    "schedule": "0 9 * * 1",
+    "missed": "run_once"
+  },
+  "nodes": [
+    {
+      "id": "list",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "command": "apt list --upgradable 2>/dev/null | tail -n +2"
+    },
+    {
+      "id": "pick",
+      "type": "write",
+      "prompt": "Which of these packages have security updates? Reply with only their names, one a line, and nothing else:\n{{nodes.list.output}}"
+    },
+    {
+      "id": "ok",
+      "type": "ask",
+      "title": "Upgrade these packages on your web servers?",
+      "message": "{{nodes.pick.text}}"
+    },
+    {
+      "id": "upgrade",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "one_by_one": true,
+      "sudo": true,
+      "command": "apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade $(cat <<'NAMES'\n{{nodes.pick.text}}\nNAMES\n)",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "health",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "command": "systemctl --failed --no-legend\nuptime"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "Security updates done",
+      "body": "{{nodes.health.output}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "list",
+      "to": "pick"
+    },
+    {
+      "from": "pick",
+      "to": "ok"
+    },
+    {
+      "from": "ok",
+      "to": "upgrade",
+      "port": "allowed"
+    },
+    {
+      "from": "upgrade",
+      "to": "health"
+    },
+    {
+      "from": "health",
+      "to": "tell"
+    }
+  ]
+}

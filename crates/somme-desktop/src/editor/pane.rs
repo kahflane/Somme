@@ -589,8 +589,8 @@ impl EditorPane {
         Some((file.path.parent()?.to_path_buf(), file.disk.clone()))
     }
 
-    pub fn holds(&self, path: &Path) -> bool {
-        self.files.iter().any(|file| file.path == path && file.disk.is_local())
+    pub fn holds(&self, path: &Path, disk: &Disk) -> bool {
+        self.files.iter().any(|file| file.path == path && file.disk.same(disk))
     }
 
     /// How many files are open, on this computer or a server.
@@ -634,7 +634,8 @@ impl EditorPane {
         cx: &mut Context<Self>,
     ) -> Help {
         let managed = Installer::global(cx).map(|installer| installer.read(cx).dir().to_path_buf());
-        let found = match lsp::find_server(language, shell_path, managed.as_deref()) {
+        let root = language::project_root(path, language.roots);
+        let found = match lsp::find_server(language, shell_path, managed.as_deref(), &root) {
             Ok(found) => found,
             Err(Missing {
                 reason,
@@ -645,7 +646,6 @@ impl EditorPane {
             }
             Err(Missing { reason, .. }) => return Help::None(reason),
         };
-        let root = language::project_root(path, language.roots);
         if !lsp::is_trusted(&root, cx) {
             return Help::Untrusted { root, found };
         }

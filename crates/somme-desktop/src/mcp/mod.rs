@@ -20,11 +20,13 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::{self, UnboundedSender};
 use gpui_kit::{App, AppContext as _, Context, Entity, Global};
 
-pub use log::Run;
+pub use log::{GuardNote, Run};
+pub use server::explain;
 use log::{Record, ScriptLog};
 
 use crate::services::Services;
 use crate::settings::Settings;
+use crate::ai::GuardAsk;
 
 /// Runs kept in the app; the file keeps them all.
 const SHOWN: usize = 200;
@@ -32,7 +34,10 @@ const SHOWN: usize = 200;
 pub enum AgentEvent {
     Connections(usize),
     Record(Record),
+    /// The guard wants the user to allow a script first.
+    Ask(GuardAsk),
 }
+
 
 /// What agents are doing, for the settings page.
 pub struct Agents {
@@ -98,6 +103,11 @@ pub use service::{SERVICE_ARG, WORKER_ARG};
 
 /// Held while the app runs, so the background service leaves the agents to it.
 static APP_LOCK: OnceLock<std::fs::File> = OnceLock::new();
+
+/// Whether this app holds the lock, so it, and not the worker, runs schedules.
+pub fn holds_lock() -> bool {
+    APP_LOCK.get().is_some()
+}
 
 /// Takes the agents from the background service, if it has them, so only one
 /// Somme opens the database. Call before the database opens.
@@ -177,7 +187,7 @@ impl Agents {
     /// Sets the background service up, or removes it, to match the setting.
     /// When that fails, the setting goes back.
     fn sync_service(&mut self, cx: &mut Context<Self>) {
-        let wanted = Settings::get(cx).agent_service;
+        let wanted = Settings::get(cx).wants_service();
         if self.installing || self.service == Some(wanted) {
             return;
         }
@@ -197,7 +207,12 @@ impl Agents {
                         tracing::warn!("{err:#}");
                         agents.service = Some(!wanted);
                         agents.service_problem = Some(format!("Could not {} the background service: {err:#}", if wanted { "set up" } else { "remove" }));
-                        Settings::update(cx, |s| s.agent_service = !wanted);
+                        if wanted {
+                            Settings::update(cx, |s| {
+                                s.agent_service = false;
+                                s.automation_service = false;
+                            });
+                        }
                     }
                 }
                 cx.notify();
@@ -231,6 +246,7 @@ impl Agents {
 
     fn apply(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
+            AgentEvent::Ask(ask) => cx.defer(move |cx| crate::ui::guard::ask_user(ask, cx)),
             AgentEvent::Connections(count) => self.connections = if self.is_on() { count } else { 0 },
             AgentEvent::Record(record) => {
                 let id = record.id().to_owned();

@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "name": "Fix it for me",
+  "description": "Tell the Agent what is wrong, like \"the site is slow\". It looks at your web servers, explains what it found, and asks before it changes anything.",
+  "inputs": [
+    {
+      "name": "problem",
+      "default": "The site is slow."
+    }
+  ],
+  "nodes": [
+    {
+      "id": "agent",
+      "type": "agent",
+      "goal": "{{input.problem}}\n\nLook at the servers first: load, memory, disk, the web server and app logs. Find the cause. Then fix it if a small, safe change does it, and check that it worked. Explain what you found and what you changed.",
+      "hosts": {
+        "tag": "web"
+      },
+      "ask_first": true,
+      "max_steps": 25
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "Agent done",
+      "body": "{{nodes.agent.answer}}"
+    },
+    {
+      "id": "stuck",
+      "type": "notify",
+      "title": "Agent stopped",
+      "body": "{{nodes.agent.error}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "agent",
+      "to": "tell"
+    },
+    {
+      "from": "agent",
+      "port": "failed",
+      "to": "stuck"
+    }
+  ]
+}

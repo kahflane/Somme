@@ -102,6 +102,10 @@ pub enum TerminalTabEvent {
     OpenChanges(PathBuf),
     /// Show what a commit changed in the repo that holds this folder.
     OpenCommit(PathBuf, String),
+    /// Open a file in a tab of its own.
+    OpenInTab(PathBuf, Disk),
+    /// Open a terminal on the same computer or server, in this folder.
+    NewTerminal(SessionTarget, PathBuf),
 }
 
 /// One tab of terminals: a tree of split panes with an optional broadcast mode.
@@ -206,6 +210,11 @@ impl TerminalTab {
                 }
                 if *view == tab.active {
                     tab.follow_explorer(cx);
+                    if view.read(cx).session.read(cx).at_prompt()
+                        && let Some((explorer, _)) = &tab.explorer
+                    {
+                        explorer.update(cx, |explorer, cx| explorer.command_ended(cx));
+                    }
                 }
             }
             TerminalViewEvent::ToggleExplorer => tab.toggle_explorer(window, cx),
@@ -444,6 +453,19 @@ impl TerminalTab {
                         let view = tab.active.clone();
                         tab.open_file(&view, path.clone(), None, window, cx);
                     }
+                    ExplorerEvent::OpenInTab(path) => {
+                        if let Some((explorer, _)) = &tab.explorer {
+                            let disk = explorer.read(cx).disk().clone();
+                            cx.emit(TerminalTabEvent::OpenInTab(path.clone(), disk));
+                        }
+                    }
+                    ExplorerEvent::Cd(dir) => {
+                        let local = tab.active.read(cx).session.read(cx).is_local();
+                        let cd = format!("cd {}", cd_quote(&dir.to_string_lossy(), local));
+                        tab.active.update(cx, |view, cx| view.run_text(&cd, cx));
+                        window.focus(&tab.active.focus_handle(cx), cx);
+                    }
+                    ExplorerEvent::NewTerminal(dir) => cx.emit(TerminalTabEvent::NewTerminal(tab.target.clone(), dir.clone())),
                     ExplorerEvent::Close => tab.toggle_explorer(window, cx),
                 });
                 tab.explorer = Some((explorer, subscription));
@@ -863,5 +885,15 @@ impl Render for TerminalTab {
             None => body,
         };
         div().size_full().bg(theme.background).child(body)
+    }
+}
+
+/// A folder quoted for `cd`: single quotes for a POSIX shell, and for
+/// PowerShell on Windows, which doubles a quote inside instead.
+fn cd_quote(dir: &str, local: bool) -> String {
+    if local && cfg!(windows) {
+        format!("'{}'", dir.replace('\'', "''"))
+    } else {
+        format!("'{}'", dir.replace('\'', r"'\''"))
     }
 }

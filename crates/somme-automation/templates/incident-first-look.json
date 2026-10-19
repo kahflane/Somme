@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "name": "Incident first look",
+  "description": "Reads the service's logs, nginx and Docker, has your LLM give the likely cause and a fix, and runs the fix once you allow it.",
+  "inputs": [
+    {
+      "name": "service",
+      "default": "app"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "logs",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "command": "journalctl -u {{input.service}} -n 150 --no-pager 2>/dev/null\ntail -n 80 /var/log/nginx/error.log 2>/dev/null\ndocker ps -a 2>/dev/null | head -20\ntrue"
+    },
+    {
+      "id": "cause",
+      "type": "write",
+      "prompt": "These are logs from my servers. In 4 short lines: what is the likely cause of the trouble, and what would fix it?\n{{nodes.logs.output}}"
+    },
+    {
+      "id": "fix",
+      "type": "write",
+      "prompt": "From this finding, give the one shell command that fixes it. Reply with only the command, on one line:\n{{nodes.cause.text}}"
+    },
+    {
+      "id": "ok",
+      "type": "ask",
+      "title": "Run this fix on your web servers?",
+      "message": "{{nodes.cause.text}}\n\nCommand: {{nodes.fix.text}}"
+    },
+    {
+      "id": "run",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "command": "{{nodes.fix.text}}"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "Fix ran",
+      "body": "{{nodes.run.output}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "logs",
+      "to": "cause"
+    },
+    {
+      "from": "cause",
+      "to": "fix"
+    },
+    {
+      "from": "fix",
+      "to": "ok"
+    },
+    {
+      "from": "ok",
+      "to": "run",
+      "port": "allowed"
+    },
+    {
+      "from": "run",
+      "to": "tell"
+    }
+  ]
+}

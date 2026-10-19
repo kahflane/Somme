@@ -18,6 +18,7 @@ use crate::store::{Store, mutate_weak, report};
 use crate::ui::common::{APP_NAME, Lucide, ago, avatar, notify_error, notify_ok};
 use crate::ui::agent_logs::{AgentLogsEvent, AgentLogsPanel, RunDetailEvent, RunDetailPanel};
 use crate::ui::agents::agents_page;
+use crate::ui::ai_settings::ai_page;
 use crate::ui::credits::{ARTWORK, CreditsList};
 use crate::ui::native;
 use crate::ui::theme_picker::{self, section};
@@ -38,6 +39,7 @@ pub struct SettingsPage {
 
 const ACCOUNT_PAGE: usize = 5;
 const AGENTS_PAGE: usize = 6;
+const AI_PAGE: usize = 7;
 
 impl SettingsPage {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -111,6 +113,12 @@ impl SettingsPage {
         self.start_page = ACCOUNT_PAGE;
         cx.notify();
     }
+
+    pub fn show_ai(&mut self, cx: &mut Context<Self>) {
+        self.visit += 1;
+        self.start_page = AI_PAGE;
+        cx.notify();
+    }
 }
 
 /// The scrolling menu shows a single row, so it is only used for long lists.
@@ -140,13 +148,13 @@ pub(crate) fn monospace_fonts() -> Vec<SharedString> {
 }
 
 /// A switch bound to one settings field.
-fn switch(get: fn(&Settings) -> bool, set: fn(&mut Settings, bool)) -> SettingField<bool> {
+pub(crate) fn switch(get: fn(&Settings) -> bool, set: fn(&mut Settings, bool)) -> SettingField<bool> {
     SettingField::switch(move |cx| get(Settings::get(cx)), move |on, cx| Settings::update(cx, |s| set(s, on)))
         .default_value(get(&Settings::default()))
 }
 
 /// A dropdown over a fixed list of values, stored as an enum or number.
-fn choice<T: PartialEq + Copy + 'static>(
+pub(crate) fn choice<T: PartialEq + Copy + 'static>(
     options: &'static [(T, &'static str)],
     get: fn(&Settings) -> T,
     set: fn(&mut Settings, T),
@@ -745,7 +753,7 @@ fn credits_page() -> SettingPage {
                 });
                 v_flex()
                     .w_full()
-                    .child(heading("Fonts, icons, logos and models".into()))
+                    .child(heading("Fonts, icons, logos, models and code".into()))
                     .children(artwork)
                     .child(heading("Libraries".into()))
                     .child(window.use_keyed_state("credits-list", cx, |window, cx| CreditsList::new(window, cx)))
@@ -770,7 +778,8 @@ impl Render for SettingsPage {
                     security_page(),
                     privacy_page(),
                     account_page(page.clone()),
-                    agents_page(page),
+                    agents_page(page, cx),
+                    ai_page(cx),
                     updates_page(),
                     voice_page(),
                     credits_page(),

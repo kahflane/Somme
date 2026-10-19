@@ -10,7 +10,7 @@ use somme_application::ports::{
     PromptAnswer, PromptKind, Prompter, SecretStore, SessionStore, SshGateway, SyncState,
 };
 use somme_application::services::{
-    ConnectionPlanner, ForwardService, GroupService, HostService, IdentityService, ImportService, KeyService,
+    AutomationService, ConnectionPlanner, ForwardService, GroupService, HostService, IdentityService, ImportService, KeyService,
     KnownHostService, KnownHostsVerifier, Links, PreferenceService, ScriptService, SessionService, SftpService, SnippetService,
     SyncService, VaultService,
 };
@@ -151,6 +151,7 @@ pub struct Services {
     pub identities: Arc<IdentityService>,
     pub keys: Arc<KeyService>,
     pub snippets: Arc<SnippetService>,
+    pub automations: Arc<AutomationService>,
     pub forwards: Arc<ForwardService>,
     pub known_hosts: Arc<KnownHostService>,
     pub sessions: Arc<SessionService>,
@@ -276,6 +277,7 @@ impl Services {
             groups: Arc::new(GroupService::new(repo.clone(), links.clone())),
             identities: Arc::new(IdentityService::new(repo.clone(), vault.clone(), links)),
             preferences: Arc::new(PreferenceService::new(repo.clone())),
+            automations: Arc::new(AutomationService::new(repo.clone(), vault.clone())),
             scripts: Arc::new(ScriptService::new(planner.clone(), ssh.clone(), repo.clone())),
             known_hosts: Arc::new(KnownHostService::new(repo)),
             sftp: Arc::new(SftpService::new(planner, ssh, ctx)),

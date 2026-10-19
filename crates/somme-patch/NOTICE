@@ -1,0 +1,12 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+This crate is changed by Somme from the apply-patch crate of OpenAI Codex
+(https://github.com/openai/codex, codex-rs/apply-patch, commit eb354a9).
+It is licensed under the Apache License, Version 2.0, in LICENSE.
+
+What Somme changed:
+- Files are read and written through a `Files` trait, so a patch can change
+  files on this computer or on a server over SFTP.
+- The command line, the shell parsing and the progress streaming were removed.
+- The patch text format is the same.

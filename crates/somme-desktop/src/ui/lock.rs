@@ -43,7 +43,8 @@ impl LockScreen {
         Self {
             password,
             confirm,
-            remember: true,
+            // Scripted UI checks never keep a key in the system's keychain.
+            remember: !(cfg!(feature = "snapshot") && std::env::var_os("SOMME_SCRIPT").is_some()),
             busy: false,
             error: None,
             focus_handle: cx.focus_handle(),

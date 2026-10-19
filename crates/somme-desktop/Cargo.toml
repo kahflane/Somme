@@ -14,6 +14,10 @@ path = "src/main.rs"
 somme-domain.workspace = true
 somme-application.workspace = true
 somme-infrastructure.workspace = true
+somme-ai.workspace = true
+somme-automation.workspace = true
+somme-patch.workspace = true
+somme-computer.workspace = true
 alacritty_terminal = "0.26"
 anyhow.workspace = true
 async-trait.workspace = true
@@ -21,6 +25,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dashmap.workspace = true
 dirs.workspace = true
+notify = "8.2"
 # Checks that an update was signed by Somme's release key.
 ed25519-dalek = "3.0"
 fontdb.workspace = true
@@ -62,6 +67,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio-util.workspace = true
+trash = "5"
 uuid.workspace = true
 # Speech to text for the voice button: whisper.cpp, and the microphone.
 whisper-rs = "0.16"

@@ -282,6 +282,39 @@ impl Disk {
         upload(files.as_ref(), local, &remote(dir), 0)
     }
 
+    /// Renames or moves a file or folder.
+    pub fn rename(&self, from: &Path, to: &Path) -> Result<(), DiskError> {
+        if self.is_dir(to).is_some() {
+            return Err(DiskError::Other(format!("{} is there already.", name_of(to))));
+        }
+        match self {
+            Disk::Local => Ok(std::fs::rename(from, to)?),
+            Disk::Remote { files, .. } => Ok(block(files.rename(&remote(from), &remote(to)))?),
+        }
+    }
+
+    /// Deletes a file or folder. On this computer it goes to the Trash, so it
+    /// can be brought back. A server has no Trash.
+    pub fn remove(&self, path: &Path, is_dir: bool) -> Result<(), DiskError> {
+        match self {
+            Disk::Local => trash::delete(path).map_err(|err| DiskError::Other(format!("Could not move it to the Trash: {err}"))),
+            Disk::Remote { files, .. } => Ok(block(files.remove(&remote(path), is_dir))?),
+        }
+    }
+
+    /// Makes an empty file, or a folder. Refuses a name that is taken.
+    pub fn create(&self, path: &Path, folder: bool) -> Result<(), DiskError> {
+        if self.is_dir(path).is_some() {
+            return Err(DiskError::Other(format!("{} is there already.", name_of(path))));
+        }
+        match (self, folder) {
+            (Disk::Local, true) => Ok(std::fs::create_dir(path)?),
+            (Disk::Local, false) => Ok(std::fs::OpenOptions::new().write(true).create_new(true).open(path).map(drop)?),
+            (Disk::Remote { files, .. }, true) => Ok(block(files.mkdir(&remote(path)))?),
+            (Disk::Remote { files, .. }, false) => Ok(block(files.write(&remote(path), &[]))?),
+        }
+    }
+
     /// Runs `work` with this disk on a thread that may block.
     pub fn run<T: Send + 'static>(self, work: impl FnOnce(&Disk) -> T + Send + 'static) -> impl Future<Output = T> {
         runtime::io(async move {
@@ -330,6 +363,10 @@ fn upload(files: &dyn RemoteFs, local: &Path, dir: &str, depth: usize) -> Result
 }
 
 /// A server path as the server writes it.
+fn name_of(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
 fn remote(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }

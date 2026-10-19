@@ -1,0 +1,18 @@
+[package]
+name = "somme-patch"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+rust-version.workspace = true
+description = "Reads and applies patches in the Begin Patch format. Changed by Somme from OpenAI Codex's apply-patch; see NOTICE."
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

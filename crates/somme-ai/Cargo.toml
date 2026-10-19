@@ -1,0 +1,26 @@
+[package]
+name = "somme-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Somme's AI parts: the LLM and Jev clients, questions with a fallback, the guard, and cleaning secrets out"
+
+[dependencies]
+async-openai = { version = "0.42", default-features = false, features = ["rustls", "chat-completion", "model", "byot"] }
+async-trait.workspace = true
+base64.workspace = true
+futures = "0.3"
+regex = "1"
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+
+[lints]
+workspace = true

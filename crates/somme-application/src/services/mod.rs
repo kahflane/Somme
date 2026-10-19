@@ -1,3 +1,4 @@
+mod automations;
 mod forwards;
 mod groups;
 mod hosts;
@@ -16,6 +17,7 @@ mod snippets;
 mod sync;
 mod vault;
 
+pub use automations::AutomationService;
 pub use forwards::ForwardService;
 pub use groups::GroupService;
 pub use hosts::HostService;

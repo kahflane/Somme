@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "name": "Disk cleanup",
+  "description": "Finds the biggest folders and old compressed logs, asks AI if they look safe to delete, then asks you. Your guard rules may still stop the delete.",
+  "nodes": [
+    {
+      "id": "find",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "sudo": true,
+      "command": "df -h / | tail -1\ndu -xh / 2>/dev/null | sort -rh | head -15\nfind /var/log -name '*.gz' -mtime +14 2>/dev/null | head -50"
+    },
+    {
+      "id": "safe",
+      "type": "decide",
+      "yes_no": "Are the old compressed logs listed here safe to delete?",
+      "about": "{{nodes.find.output}}"
+    },
+    {
+      "id": "ok",
+      "type": "ask",
+      "title": "Delete compressed logs older than 14 days?",
+      "message": "{{nodes.find.output}}"
+    },
+    {
+      "id": "clean",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "sudo": true,
+      "command": "find /var/log -name '*.gz' -mtime +14 -delete\ndf -h / | tail -1"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "Disk cleaned",
+      "body": "{{nodes.clean.output}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "find",
+      "to": "safe"
+    },
+    {
+      "from": "safe",
+      "to": "ok",
+      "port": "yes"
+    },
+    {
+      "from": "safe",
+      "to": "ok",
+      "port": "unsure"
+    },
+    {
+      "from": "ok",
+      "to": "clean",
+      "port": "allowed"
+    },
+    {
+      "from": "clean",
+      "to": "tell"
+    }
+  ]
+}

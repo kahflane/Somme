@@ -1,5 +1,5 @@
 use somme_domain::{
-    Group, Host, Id, Identity, KnownHost, PortForward, RepositoryError, Sealed, Snippet, SshKey,
+    Automation, Group, Host, Id, Identity, KnownHost, PortForward, RepositoryError, Sealed, Snippet, SshKey,
 };
 use turso::{Row, Value};
 
@@ -297,6 +297,28 @@ impl SqlEntity for SshKey {
             passphrase: r.opt_sealed(6)?,
             created_at: r.int(7)?,
             updated_at: r.int(8)?,
+        })
+    }
+}
+
+impl SqlEntity for Automation {
+    const TABLE: &'static str = "automations";
+    const COLUMNS: &'static [&'static str] = &["id", "document", "created_at", "updated_at"];
+
+    fn id(&self) -> Id {
+        self.id
+    }
+
+    fn values(&self) -> Vec<Value> {
+        vec![id(self.id), sealed(Some(&self.document)), int(self.created_at), int(self.updated_at)]
+    }
+
+    fn from_row(r: &RowReader<'_>) -> Result<Self, RepositoryError> {
+        Ok(Self {
+            id: r.id(0)?,
+            document: r.sealed(1)?,
+            created_at: r.int(2)?,
+            updated_at: r.int(3)?,
         })
     }
 }

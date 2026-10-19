@@ -208,6 +208,8 @@ pub fn format_took(took: Duration) -> String {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitInfo {
+    /// The repo's top folder.
+    pub root: PathBuf,
     pub branch: String,
     pub files: usize,
     pub added: usize,
@@ -332,6 +334,7 @@ fn blanked_filters(listed: &str) -> Vec<(String, &'static str)> {
 
 /// Branch and uncommitted changes for the repo that holds `dir`. Slow: run it off the UI thread.
 pub fn git_info(dir: &Path) -> Option<GitInfo> {
+    let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
     let mut branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch == "HEAD" {
         branch = git(dir, &["rev-parse", "--short", "HEAD"]).unwrap_or(branch);
@@ -344,6 +347,7 @@ pub fn git_info(dir: &Path) -> Option<GitInfo> {
     let stat = stat.trim();
     let (files, added, removed) = parse_shortstat(stat);
     Some(GitInfo {
+        root,
         branch,
         files,
         added,

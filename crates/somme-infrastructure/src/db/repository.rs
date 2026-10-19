@@ -167,7 +167,7 @@ impl VaultRepository for SqlRepository {
 mod tests {
     use super::*;
     use crate::db::store::Backend;
-    use somme_domain::{Host, Snippet, new_id, now};
+    use somme_domain::{Automation, Host, Snippet, new_id, now};
 
     async fn repo() -> (tempfile::TempDir, SqlRepository) {
         let dir = tempfile::tempdir().unwrap();
@@ -195,6 +195,15 @@ mod tests {
         Repository::<Snippet>::delete(&repo, snippet.id).await.unwrap();
         let none: Option<Snippet> = repo.get(snippet.id).await.unwrap();
         assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn automations_keep_their_sealed_document() {
+        let (_dir, repo) = repo().await;
+        let automation = Automation { id: new_id(), document: Sealed::new("v1:sealed"), created_at: 1, updated_at: 2 };
+        Repository::<Automation>::save(&repo, &automation).await.unwrap();
+        let loaded: Option<Automation> = repo.get(automation.id).await.unwrap();
+        assert_eq!(loaded.unwrap(), automation);
     }
 
     #[tokio::test]

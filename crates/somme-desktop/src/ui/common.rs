@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::{ActiveTheme as _, Icon, StyledExt as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
@@ -13,6 +13,18 @@ use gpui_kit::{
 pub use gpui_kit::assets::IconName as Lucide;
 
 use crate::ui::native;
+
+/// A button lightly filled with the text colour, for the main action on
+/// screens kept to plain colours: automations and screen control. The fill
+/// is the colour at a fifth, as the button draws it.
+pub fn ink_button(cx: &App) -> ButtonCustomVariant {
+    let theme = cx.theme();
+    ButtonCustomVariant::new(cx)
+        .color(theme.foreground)
+        .foreground(theme.foreground)
+        .hover(theme.foreground.opacity(0.28))
+        .active(theme.foreground.opacity(0.36))
+}
 
 /// The name people see. Data folders and keychain entries keep their old names.
 pub const APP_NAME: &str = "Somme";

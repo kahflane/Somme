@@ -35,13 +35,15 @@ pub struct Library {
     pub link: String,
 }
 
-/// Icons, logos and speech models, which are not Rust libraries.
+/// Icons, logos, speech models and code taken in, which are not libraries
+/// from crates.io.
 pub const ARTWORK: &[(&str, &str, &str)] = &[
     ("JetBrains Mono font", "OFL-1.1", "https://github.com/JetBrains/JetBrainsMono"),
     ("Lucide icons", "ISC", "https://lucide.dev"),
     ("Simple Icons, for system logos", "CC0-1.0", "https://simpleicons.org"),
     ("Whisper speech model, by OpenAI", "MIT", "https://github.com/openai/whisper"),
     ("Silero VAD, which finds speech", "MIT", "https://github.com/snakers4/silero-vad"),
+    ("apply-patch from OpenAI Codex, changed for the Agent's file edits", "Apache-2.0", "https://github.com/openai/codex"),
 ];
 
 static CREDITS: LazyLock<Credits> =

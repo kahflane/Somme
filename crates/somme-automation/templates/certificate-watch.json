@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "name": "Certificate watch",
+  "description": "Every morning: checks your site's TLS certificate, and tells you when it expires within 14 days or can't be checked.",
+  "start": {
+    "schedule": "0 8 * * *",
+    "missed": "run_once"
+  },
+  "inputs": [
+    {
+      "name": "domain",
+      "default": "example.com"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "cert",
+      "type": "tls",
+      "host": "{{input.domain}}",
+      "port": 443
+    },
+    {
+      "id": "soon",
+      "type": "if",
+      "value": "{{nodes.cert.days_left}}",
+      "test": "below",
+      "against": "14"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "{{input.domain}}: certificate expires soon",
+      "body": "{{nodes.cert.output}}"
+    },
+    {
+      "id": "oops",
+      "type": "notify",
+      "title": "Couldn't check {{input.domain}}",
+      "body": "{{nodes.cert.error}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "cert",
+      "to": "soon"
+    },
+    {
+      "from": "soon",
+      "to": "tell",
+      "port": "yes"
+    },
+    {
+      "from": "cert",
+      "to": "oops",
+      "port": "failed"
+    }
+  ]
+}

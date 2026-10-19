@@ -52,6 +52,12 @@ pub fn error(title: &str, detail: &str, window: &mut Window, cx: &mut App) {
 /// Posts a note to the system's notification center. A newer note with the same
 /// title replaces the older one.
 pub fn notify(title: &str, body: &str, cx: &App) {
+    // Scripted test runs don't post real notifications.
+    #[cfg(feature = "snapshot")]
+    if std::env::var_os("SOMME_SCRIPT").is_some() {
+        tracing::info!(title, body, "notification");
+        return;
+    }
     cx.show_system_notification(SystemNotification {
         tag: title.to_owned().into(),
         title: title.to_owned().into(),

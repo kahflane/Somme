@@ -43,6 +43,7 @@ use crate::ui::common::{Lucide, avatar, notify_error, parse_color};
 use crate::ui::native;
 use crate::ui::fields::host_input;
 use crate::ui::filter::parse_quick_connect;
+use crate::ui::automations::AutomationsPage;
 use crate::ui::forwards::ForwardsPage;
 use crate::ui::hosts::HostsPage;
 use crate::ui::keychain::KeychainPage;
@@ -69,6 +70,7 @@ actions!(
         NextTab,
         PreviousTab,
         ShowHome,
+        ShowAutomations,
         SplitRight,
         SplitLeft,
         SplitDown,
@@ -123,6 +125,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&format!("{m}-alt-i"), ToggleBroadcast, None),
         KeyBinding::new(&format!("{m}-shift-l"), LockVault, None),
         KeyBinding::new(&format!("{m}-shift-h"), ShowHome, None),
+        KeyBinding::new(&format!("{m}-shift-u"), ShowAutomations, None),
         KeyBinding::new(&format!("{m}-,"), OpenSettings, None),
         KeyBinding::new(&format!("{m}-p"), TogglePalette, None),
         KeyBinding::new(&format!("{m}-shift-s"), ToggleSidePanel, None),
@@ -146,6 +149,8 @@ enum Section {
     Cli,
     /// Hosts and the rest of the vault. Asks for the master password first.
     Ssh,
+    /// Saved automations on a canvas. Sealed in the vault, so it asks first too.
+    Automations,
     Settings,
 }
 
@@ -307,6 +312,7 @@ pub struct Workspace {
     known_hosts: Option<Entity<KnownHostsPage>>,
     settings: Option<Entity<SettingsPage>>,
     sftp: Option<Entity<SftpPage>>,
+    automations: Option<Entity<AutomationsPage>>,
     focus_handle: FocusHandle,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
     /// What was in front when the palette opened, for its picks to act on.
@@ -366,6 +372,7 @@ impl Workspace {
             known_hosts: None,
             settings: None,
             sftp: None,
+            automations: None,
             focus_handle: cx.focus_handle(),
             palette: None,
             palette_target: PaletteTarget::default(),
@@ -460,10 +467,10 @@ impl Workspace {
                 }) => window.focus(&pane.focus_handle(cx), cx),
                 None => window.focus(&self.focus_handle, cx),
             },
-            Section::Ssh if !Store::global(cx).read(cx).is_unlocked() => {
+            Section::Ssh | Section::Automations if !Store::global(cx).read(cx).is_unlocked() => {
                 self.lock_screen.update(cx, |lock, cx| lock.focus_password(window, cx));
             }
-            Section::Ssh | Section::Settings => window.focus(&self.focus_handle, cx),
+            Section::Ssh | Section::Automations | Section::Settings => window.focus(&self.focus_handle, cx),
         }
     }
 
@@ -478,6 +485,36 @@ impl Workspace {
     fn open_terminal_in(&mut self, target: SessionTarget, dir: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.add_terminal(target, dir, window, cx);
         self.activate(Some(self.tabs.len() - 1), window, cx);
+    }
+
+    /// Opens a terminal in `dir`: started there on this computer, or with a
+    /// `cd` once a server's shell is ready.
+    fn new_terminal_at(&mut self, target: SessionTarget, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(target, SessionTarget::Local) {
+            self.open_terminal_in(target, Some(dir), window, cx);
+            return;
+        }
+        self.open_terminal_in(target, None, window, cx);
+        if let Some(Tab { content: TabContent::Terminal(tab), .. }) = self.tabs.last() {
+            let cd = format!("cd {}", shell_quote(&dir.to_string_lossy()));
+            tab.update(cx, |tab, cx| tab.run_when_connected(cd, cx));
+        }
+    }
+
+    /// Opens a file from a shell's file tree in a tab of its own.
+    fn open_in_tab(&mut self, path: PathBuf, disk: Disk, window: &mut Window, cx: &mut Context<Self>) {
+        if !system_open::opens_outside(&path) {
+            self.edit_file(path, disk, None, window, cx);
+            return;
+        }
+        cx.spawn_in(window, async move |_, cx| {
+            let local = system_open::local_copy(disk, path.clone()).await;
+            let _ = cx.update(|window, cx| match local {
+                Ok(local) => cx.open_with_system(&local),
+                Err(err) => cant_open(&path, &err, window, cx),
+            });
+        })
+        .detach();
     }
 
     /// Adds a terminal tab at the end without bringing it to the front.
@@ -495,6 +532,8 @@ impl Workspace {
             TerminalTabEvent::Empty => workspace.remove_tab(id, window, cx),
             TerminalTabEvent::OpenChanges(dir) => workspace.open_changes(dir.clone(), None, window, cx),
             TerminalTabEvent::OpenCommit(dir, sha) => workspace.open_changes(dir.clone(), Some(sha.clone()), window, cx),
+            TerminalTabEvent::OpenInTab(path, disk) => workspace.open_in_tab(path.clone(), disk.clone(), window, cx),
+            TerminalTabEvent::NewTerminal(target, dir) => workspace.new_terminal_at(target.clone(), dir.clone(), window, cx),
         });
         self.tabs.push(Tab {
             id,
@@ -637,16 +676,18 @@ impl Workspace {
     /// folder until it is saved somewhere.
     fn new_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match scratch::create(&scratch::dir(&self.services.data_dir)) {
-            Ok(path) => self.open_editor(path, FileText::Code(String::new()), true, true, window, cx),
+            Ok(path) => self.open_editor(path, Disk::Local, FileText::Code(String::new()), true, true, window, cx),
             Err(err) => notify_error(window, cx, "Can't make a new file", err),
         }
     }
 
     /// Opens a file in a tab of its own. `show` brings that tab, or the one the
     /// file is open in already, to the front.
+    #[allow(clippy::too_many_arguments)]
     fn open_editor(
         &mut self,
         path: PathBuf,
+        disk: Disk,
         text: FileText,
         scratch: bool,
         show: bool,
@@ -654,7 +695,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let open = self.tabs.iter().position(|tab| match &tab.content {
-            TabContent::Editor(pane) => pane.read(cx).holds(&path),
+            TabContent::Editor(pane) => pane.read(cx).holds(&path, &disk),
             TabContent::Terminal(_) | TabContent::Changes(_) => false,
         });
         if let Some(ix) = open {
@@ -668,7 +709,7 @@ impl Workspace {
             if scratch {
                 pane.add_scratch(path, text, window, cx);
             } else {
-                pane.add(path, Disk::Local, text, false, None, window, cx);
+                pane.add(path, disk, text, false, None, window, cx);
             }
         });
         let id = self.next_tab_id;
@@ -720,7 +761,7 @@ impl Workspace {
                 });
                 let text = text.await;
                 let _ = workspace.update_in(cx, |workspace, window, cx| match text {
-                    Ok(text) => workspace.open_editor(path, text, false, true, window, cx),
+                    Ok(text) => workspace.open_editor(path, Disk::Local, text, false, true, window, cx),
                     Err(err) => cant_open(&path, &err, window, cx),
                 });
             }
@@ -743,7 +784,7 @@ impl Workspace {
             let files = files.await;
             let _ = workspace.update_in(cx, |workspace, window, cx| {
                 for (entry, text) in files {
-                    workspace.open_editor(entry.path, text, entry.scratch, false, window, cx);
+                    workspace.open_editor(entry.path, Disk::Local, text, entry.scratch, false, window, cx);
                 }
             });
         })
@@ -959,7 +1000,7 @@ impl Workspace {
             if path.is_dir() {
                 self.open_terminal_in(SessionTarget::Local, Some(path), window, cx);
             } else {
-                self.edit_local_file(path, None, window, cx);
+                self.edit_file(path, Disk::Local, None, window, cx);
             }
         }
     }
@@ -971,15 +1012,15 @@ impl Workspace {
             cx.open_with_system(&path);
             return;
         }
-        self.edit_local_file(path, line, window, cx);
+        self.edit_file(path, Disk::Local, line, window, cx);
     }
 
-    /// Opens a file on this computer in the editor, or says why it can't.
-    fn edit_local_file(&mut self, path: PathBuf, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_local_file(&path, line, window, cx) {
+    /// Opens a file in an editor tab of its own, or says why it can't.
+    fn edit_file(&mut self, path: PathBuf, disk: Disk, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_file(&path, &disk, line, window, cx) {
             return;
         }
-        let text = Disk::Local.run({
+        let text = disk.clone().run({
             let path = path.clone();
             move |disk| read_text(disk, &path)
         });
@@ -987,8 +1028,8 @@ impl Workspace {
             let text = text.await;
             let _ = workspace.update_in(cx, |workspace, window, cx| match text {
                 Ok(text) => {
-                    workspace.open_editor(path.clone(), text, false, true, window, cx);
-                    workspace.show_local_file(&path, line, window, cx);
+                    workspace.open_editor(path.clone(), disk.clone(), text, false, true, window, cx);
+                    workspace.show_file(&path, &disk, line, window, cx);
                 }
                 Err(err) => cant_open(&path, &err, window, cx),
             });
@@ -998,13 +1039,13 @@ impl Workspace {
 
     /// Brings the tab holding `path` to the front, with the cursor on `line`.
     /// False when no tab holds it.
-    fn show_local_file(&mut self, path: &Path, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let found = self.tabs.iter().position(|tab| matches!(&tab.content, TabContent::Editor(pane) if pane.read(cx).holds(path)));
+    fn show_file(&mut self, path: &Path, disk: &Disk, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let found = self.tabs.iter().position(|tab| matches!(&tab.content, TabContent::Editor(pane) if pane.read(cx).holds(path, disk)));
         let Some(ix) = found else { return false };
         self.activate(Some(ix), window, cx);
         if let TabContent::Editor(pane) = &self.tabs[ix].content {
             pane.update(cx, |pane, cx| {
-                pane.show_open(path, &Disk::Local, window, cx);
+                pane.show_open(path, disk, window, cx);
                 if let Some(line) = line {
                     pane.go_to_line(line, window, cx);
                 }
@@ -1238,6 +1279,9 @@ impl Workspace {
         if section == Section::Ssh {
             Store::global(cx).update(cx, |store, cx| store.open_vault(cx));
             self.reload_page(cx);
+        }
+        if section == Section::Automations {
+            Store::global(cx).update(cx, |store, cx| store.open_vault(cx));
         }
         self.focus_current(window, cx);
         cx.notify();
@@ -1911,6 +1955,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(item("rail-cli", Lucide::SquareTerminal, Section::Cli, "Terminal", Box::new(NewLocalTerminal)))
             .child(item("rail-ssh", Lucide::Server, Section::Ssh, "SSH", Box::new(ShowHome)))
+            .child(item("rail-automations", Lucide::Workflow, Section::Automations, "Automations", Box::new(ShowAutomations)))
             .child(div().flex_1())
             .child(account)
             .children(update_button)
@@ -2008,8 +2053,10 @@ impl Render for Workspace {
         let unlocked = Store::global(cx).read(cx).is_unlocked();
         let theme = cx.theme().clone();
         let tab = self.active.and_then(|ix| self.tabs.get(ix)).filter(|_| self.section == Section::Cli);
-        let body: AnyElement = if self.section == Section::Ssh && !unlocked {
+        let body: AnyElement = if matches!(self.section, Section::Ssh | Section::Automations) && !unlocked {
             self.lock_screen.clone().into_any_element()
+        } else if self.section == Section::Automations {
+            self.automations.get_or_insert_with(|| cx.new(|cx| AutomationsPage::new(window, cx))).clone().into_any_element()
         } else if self.section == Section::Settings {
             self.render_page(window, cx)
         } else if self.section == Section::Cli && tab.is_none() {
@@ -2075,6 +2122,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|w, _: &NextTab, window, cx| w.cycle_tab(true, window, cx)))
             .on_action(cx.listener(|w, _: &PreviousTab, window, cx| w.cycle_tab(false, window, cx)))
             .on_action(cx.listener(|w, _: &ShowHome, window, cx| w.show_section(Section::Ssh, window, cx)))
+            .on_action(cx.listener(|w, _: &ShowAutomations, window, cx| w.show_section(Section::Automations, window, cx)))
             .on_action(cx.listener(|w, _: &SplitRight, window, cx| w.on_split(Axis::Horizontal, false, window, cx)))
             .on_action(cx.listener(|w, _: &SplitLeft, window, cx| w.on_split(Axis::Horizontal, true, window, cx)))
             .on_action(cx.listener(|w, _: &SplitDown, window, cx| w.on_split(Axis::Vertical, false, window, cx)))

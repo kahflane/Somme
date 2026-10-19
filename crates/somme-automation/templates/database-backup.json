@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "name": "Database backup",
+  "description": "Every night: dumps the database, keeps a week of copies on the server, brings the newest one to this computer and checks it.",
+  "start": {
+    "schedule": "0 2 * * *",
+    "missed": "run_once"
+  },
+  "inputs": [
+    {
+      "name": "database",
+      "default": "app"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "dump",
+      "type": "command",
+      "hosts": {
+        "tag": "db"
+      },
+      "command": "set -e\nmkdir -p /var/backups/somme\nf=/var/backups/somme/{{input.database}}-$(date +%a).sql.gz\npg_dump {{input.database}} | gzip > \"$f\"\ncp \"$f\" /var/backups/somme/{{input.database}}-latest.sql.gz\nls -l \"$f\"",
+      "timeout_seconds": 3600
+    },
+    {
+      "id": "copy",
+      "type": "copy",
+      "host": {
+        "tag": "db"
+      },
+      "direction": "download",
+      "local": "~/Backups/{{input.database}}-latest.sql.gz",
+      "remote": "/var/backups/somme/{{input.database}}-latest.sql.gz"
+    },
+    {
+      "id": "verify",
+      "type": "local",
+      "command": "gzip -t ~/Backups/{{input.database}}-latest.sql.gz && ls -l ~/Backups/{{input.database}}-latest.sql.gz"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "Backup of {{input.database}} failed",
+      "body": "{{nodes.dump.error}}{{nodes.copy.error}}{{nodes.verify.error}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "dump",
+      "to": "copy"
+    },
+    {
+      "from": "copy",
+      "to": "verify"
+    },
+    {
+      "from": "dump",
+      "to": "tell",
+      "port": "failed"
+    },
+    {
+      "from": "copy",
+      "to": "tell",
+      "port": "failed"
+    },
+    {
+      "from": "verify",
+      "to": "tell",
+      "port": "failed"
+    }
+  ]
+}

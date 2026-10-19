@@ -1,6 +1,7 @@
-//! `Somme --service`: keeps agents working while the app is closed. It starts
-//! at login (see `install`) and only watches. Whenever agents are on and the
-//! app is closed, it starts `Somme --service-worker`, which takes the agents.
+//! `Somme --service`: keeps agents and scheduled automations working while
+//! the app is closed. It starts at login (see `install`) and only watches.
+//! Whenever agents or background schedules are on and the app is closed, it
+//! starts `Somme --service-worker`, which takes the agents and the schedules.
 //!
 //! Only one Somme may open the database, so whoever holds `app.lock` in the
 //! agents folder opens it. The app holds it for as long as it runs. When the
@@ -19,6 +20,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 
 use super::log::ScriptLog;
+use crate::automations::{runner::{self, Runner}, scheduler};
 use super::{dir, make_private_dir, server, transport};
 use crate::runtime;
 use crate::services::{Services, data_dir};
@@ -111,14 +113,14 @@ pub fn run() -> i32 {
             return 1;
         }
     };
-    tracing::info!("watching for when agents need Somme");
+    tracing::info!("watching for when agents or schedules need Somme");
     loop {
         let settings = Settings::load(&data_dir);
-        if !settings.agent_service {
+        if !settings.wants_service() {
             tracing::info!("turned off");
             return 0;
         }
-        if settings.agent_access && is_free(&dir) {
+        if settings.wants_worker() && is_free(&dir) {
             let began = Instant::now();
             let mut command = Command::new(&exe);
             command.arg(WORKER_ARG).stdin(Stdio::piped()).stdout(Stdio::null());
@@ -194,24 +196,42 @@ async fn serve(data_dir: PathBuf, dir: PathBuf) -> anyhow::Result<()> {
     }
     let log = Arc::new(ScriptLog::new(&dir));
     let (yields, mut yielded) = mpsc::unbounded();
+    // Agents reach it here too, when the automation lets them.
+    let runner = Runner::new(services.clone(), None, None, None, None);
+    runner::share(runner.clone());
+    // Always listens, so the app can ask for the lock back. Agents are
+    // refused while they are off.
     let server = server::start(&dir, services.clone(), log, agent_events, Some(yields))?;
-    tracing::info!("taking agents");
+    let mut schedules: Option<tokio::task::JoinHandle<()>> = None;
+    tracing::info!("taking agents and schedules");
     loop {
+        let settings = Settings::load(&data_dir);
+        if !settings.wants_worker() {
+            tracing::info!("agents and background schedules were turned off");
+            break;
+        }
+        match (&schedules, settings.automation_service) {
+            (None, true) => schedules = Some(runtime::handle().spawn(scheduler::run(runner.clone()))),
+            (Some(task), false) => {
+                task.abort();
+                schedules = None;
+            }
+            _ => {}
+        }
         tokio::select! {
             _ = yielded.next() => {
                 tracing::info!("the app took the agents back");
                 break;
             }
             _ = stopped.next() => break,
-            () = tokio::time::sleep(Duration::from_secs(1)) => {
-                let settings = Settings::load(&data_dir);
-                if !settings.agent_access || !settings.agent_service {
-                    tracing::info!("agents were turned off");
-                    break;
-                }
-            }
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
+    if let Some(task) = schedules {
+        task.abort();
+    }
+    // Runs going now stop, and their logs say so.
+    runner.cancel_all();
     drop(server);
     // Stopped runs log their end as their tasks drop.
     let began = Instant::now();

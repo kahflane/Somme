@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "name": "Server health",
+  "description": "Every hour: disk, memory, load, failed services and pending reboots. Tells you when a server needs attention.",
+  "start": {
+    "schedule": "0 * * * *",
+    "missed": "skip"
+  },
+  "nodes": [
+    {
+      "id": "check",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "command": "df -h / | tail -1\nfree -m | awk '/Mem:/ {print \"memory used: \" $3 \" of \" $2 \" MB\"}'\nuptime\nsystemctl --failed --no-legend 2>/dev/null\n[ -f /var/run/reboot-required ] && echo 'reboot required'\ntrue"
+    },
+    {
+      "id": "unhealthy",
+      "type": "decide",
+      "yes_no": "Is any server unhealthy: disk over 90%, little free memory, high load, failed services, or a reboot required?",
+      "about": "{{nodes.check.output}}"
+    },
+    {
+      "id": "summary",
+      "type": "write",
+      "prompt": "In 3 short lines, say which servers need attention and why:\n{{nodes.check.output}}"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "A server needs attention",
+      "body": "{{nodes.summary.text}}"
+    },
+    {
+      "id": "unsure",
+      "type": "notify",
+      "title": "Check your servers",
+      "body": "Somme couldn't tell if your servers are healthy. Open the run to read what they said."
+    }
+  ],
+  "edges": [
+    {
+      "from": "check",
+      "to": "unhealthy"
+    },
+    {
+      "from": "unhealthy",
+      "to": "summary",
+      "port": "yes"
+    },
+    {
+      "from": "summary",
+      "to": "tell"
+    },
+    {
+      "from": "unhealthy",
+      "to": "unsure",
+      "port": "unsure"
+    }
+  ]
+}

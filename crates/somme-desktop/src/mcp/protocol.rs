@@ -1,6 +1,8 @@
-//! MCP messages: JSON-RPC in, answers out. Agents get two tools,
-//! `list_hosts` and `run_script`.
+//! MCP messages: JSON-RPC in, answers out. Agents get `list_hosts` and
+//! `run_script`, and the automations the user lets them run:
+//! `list_automations`, `run_automation` and `automation_status`.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,7 +18,11 @@ const MAX_SCRIPT: usize = 1024 * 1024;
 const INSTRUCTIONS: &str = "Somme is the user's SSH app. list_hosts shows the servers they saved; \
 run_script runs a shell script on one of them over SSH and returns the exit code and output. \
 Scripts run without a terminal and get no input, so use non-interactive flags (for example `sudo -n`, `apt-get -y`). \
-Somme writes every script to a log the user can see.";
+Somme writes every script to a log the user can see. \
+list_automations shows the automations the user lets agents start; run_automation starts one and automation_status tells how it went.";
+
+/// The longest run_automation waits for a run to end.
+const MAX_WAIT: u64 = 10 * 60;
 
 /// A saved server, as agents see it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -43,12 +49,39 @@ pub struct ScriptRun {
     pub seconds: f64,
 }
 
+/// An automation agents may start.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AutomationInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Each input's name and default.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, String>,
+}
+
 /// What the tools reach: the saved servers and SSH. Errors are written for
 /// the agent to read.
 #[async_trait]
 pub trait Backend: Send + Sync {
     async fn hosts(&self) -> Result<Vec<HostInfo>, String>;
     async fn run(&self, agent: &str, host: &HostInfo, script: &str, timeout: Duration) -> Result<ScriptRun, String>;
+
+    /// The automations the user lets agents start.
+    async fn automations(&self) -> Result<Vec<AutomationInfo>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Starts one and gives the run's id.
+    async fn run_automation(&self, _agent: &str, _id: &str, _inputs: BTreeMap<String, String>) -> Result<String, String> {
+        Err("Automations are not available here.".into())
+    }
+
+    /// Whether a run ended, and how it went, as text.
+    async fn automation_status(&self, _run: &str) -> Result<(bool, String), String> {
+        Err("Automations are not available here.".into())
+    }
 }
 
 /// One agent's connection.
@@ -129,6 +162,9 @@ impl Session {
         match params["name"].as_str().unwrap_or_default() {
             "list_hosts" => Ok(tool_result(list_hosts(backend).await)),
             "run_script" => Ok(tool_result(self.run_script(backend, args).await)),
+            "list_automations" => Ok(tool_result(list_automations(backend).await)),
+            "run_automation" => Ok(tool_result(self.run_automation(backend, args).await)),
+            "automation_status" => Ok(tool_result(automation_status(backend, args).await)),
             other => Err((-32602, format!("Unknown tool: {other}"))),
         }
     }
@@ -152,6 +188,64 @@ impl Session {
         let run = backend.run(&self.agent(), host, script, Duration::from_secs(seconds)).await?;
         Ok(report(&run, seconds))
     }
+}
+
+impl Session {
+    async fn run_automation(&self, backend: &dyn Backend, args: &Value) -> Result<String, String> {
+        let wanted = args["automation"].as_str().map(str::trim).filter(|a| !a.is_empty());
+        let wanted = wanted.ok_or("`automation` is required: a name or id from list_automations.")?;
+        let mut inputs = BTreeMap::new();
+        match &args["inputs"] {
+            Value::Null => {}
+            Value::Object(fields) => {
+                for (name, value) in fields {
+                    let text = match value {
+                        Value::String(text) => text.clone(),
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    };
+                    inputs.insert(name.clone(), text);
+                }
+            }
+            _ => return Err("`inputs` must be an object of names to values.".into()),
+        }
+        let wait = match &args["wait_seconds"] {
+            Value::Null => 0,
+            value => value.as_u64().filter(|s| *s <= MAX_WAIT).ok_or(format!("`wait_seconds` must be a whole number from 0 to {MAX_WAIT}."))?,
+        };
+        let automations = backend.automations().await?;
+        let automation = automations
+            .iter()
+            .find(|a| a.id == wanted)
+            .or_else(|| automations.iter().find(|a| a.name.eq_ignore_ascii_case(wanted)))
+            .ok_or(format!("No automation agents may run is called \"{wanted}\". Call list_automations to see them."))?;
+        if let Some(unknown) = inputs.keys().find(|name| !automation.inputs.contains_key(*name)) {
+            return Err(format!("\"{}\" has no input called \"{unknown}\".", automation.name));
+        }
+        let run = backend.run_automation(&self.agent(), &automation.id, inputs).await?;
+        let began = std::time::Instant::now();
+        while began.elapsed().as_secs() < wait {
+            let (done, text) = backend.automation_status(&run).await?;
+            if done {
+                return Ok(text);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Ok(format!("Started run {run} of \"{}\". Call automation_status with this run id to see how it goes.", automation.name))
+    }
+}
+
+async fn list_automations(backend: &dyn Backend) -> Result<String, String> {
+    let automations = backend.automations().await?;
+    if automations.is_empty() {
+        return Ok("The user has not let agents run any automation. They can turn on \"AI agents can run this\" on one in Somme.".to_owned());
+    }
+    serde_json::to_string_pretty(&automations).map_err(|err| err.to_string())
+}
+
+async fn automation_status(backend: &dyn Backend, args: &Value) -> Result<String, String> {
+    let run = args["run"].as_str().map(str::trim).filter(|r| !r.is_empty()).ok_or("`run` is required: the run id run_automation gave.")?;
+    Ok(backend.automation_status(run).await?.1)
 }
 
 async fn list_hosts(backend: &dyn Backend) -> Result<String, String> {
@@ -244,6 +338,41 @@ fn tools() -> Value {
                 "additionalProperties": false
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true }
+        },
+        {
+            "name": "list_automations",
+            "title": "List automations",
+            "description": "Lists the Somme automations the user lets agents start: id, name, what it does and its inputs with their defaults.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "run_automation",
+            "title": "Run an automation",
+            "description": "Starts one of the user's automations, from list_automations. Its steps run as the user built them, checked by the user's guard rules. Gives a run id for automation_status, or the result when it ends within wait_seconds.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "automation": { "type": "string", "description": "The automation's name or id, from list_automations." },
+                    "inputs": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Values for its inputs, by name. Missing ones use their defaults." },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0, "description": "Wait this long for the run to end and give its result." }
+                },
+                "required": ["automation"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true }
+        },
+        {
+            "name": "automation_status",
+            "title": "How an automation run went",
+            "description": "Tells whether a run started by run_automation is still going, and what each step said.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "run": { "type": "string", "description": "The run id from run_automation." } },
+                "required": ["run"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
         }
     ])
 }
@@ -258,9 +387,13 @@ mod tests {
 
     use super::*;
 
+    /// An agent, an automation and its inputs.
+    type Started = (String, String, BTreeMap<String, String>);
+
     #[derive(Default)]
     struct Fake {
         ran: Mutex<Vec<(String, String, String, u64)>>,
+        started: Mutex<Vec<Started>>,
     }
 
     #[async_trait]
@@ -286,6 +419,24 @@ mod tests {
                 seconds: 0.4,
                 ..ScriptRun::default()
             })
+        }
+
+        async fn automations(&self) -> Result<Vec<AutomationInfo>, String> {
+            Ok(vec![AutomationInfo {
+                id: "a1".into(),
+                name: "Deploy".into(),
+                description: String::new(),
+                inputs: BTreeMap::from([("branch".to_owned(), "main".to_owned())]),
+            }])
+        }
+
+        async fn run_automation(&self, agent: &str, id: &str, inputs: BTreeMap<String, String>) -> Result<String, String> {
+            self.started.lock().push((agent.into(), id.into(), inputs));
+            Ok("r1".into())
+        }
+
+        async fn automation_status(&self, run: &str) -> Result<(bool, String), String> {
+            Ok((true, format!("Run {run}: done.")))
         }
     }
 
@@ -314,7 +465,7 @@ mod tests {
 
         let list = session.handle(&fake, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).await.unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["list_hosts", "run_script"]);
+        assert_eq!(names, ["list_hosts", "run_script", "list_automations", "run_automation", "automation_status"]);
     }
 
     #[tokio::test]
@@ -326,6 +477,23 @@ mod tests {
         assert!(text(&answer).starts_with("Exit code 0."));
         assert!(text(&answer).contains("stdout:\nup 3 days"));
         assert_eq!(fake.ran.lock()[0], ("unknown agent".into(), "1".into(), "uptime".into(), DEFAULT_TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn agents_start_allowed_automations_by_name() {
+        let fake = Fake::default();
+        let session = Session::default();
+        let list = session.handle(&fake, call(1, "list_automations", json!({}))).await.unwrap();
+        assert!(text(&list).contains("\"Deploy\""));
+        let wrong = session.handle(&fake, call(2, "run_automation", json!({ "automation": "deploy", "inputs": { "tag": "v2" } }))).await.unwrap();
+        assert_eq!(wrong["result"]["isError"], true);
+        let missing = session.handle(&fake, call(3, "run_automation", json!({ "automation": "Backup" }))).await.unwrap();
+        assert!(text(&missing).contains("list_automations"));
+        assert!(fake.started.lock().is_empty());
+        let run = json!({ "automation": "deploy", "inputs": { "branch": "dev" }, "wait_seconds": 5 });
+        let done = session.handle(&fake, call(4, "run_automation", run)).await.unwrap();
+        assert_eq!(text(&done), "Run r1: done.");
+        assert_eq!(fake.started.lock()[0], ("unknown agent".into(), "a1".into(), BTreeMap::from([("branch".to_owned(), "dev".to_owned())])));
     }
 
     #[tokio::test]

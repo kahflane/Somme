@@ -1,11 +1,16 @@
 pub mod agent_logs;
 pub mod agents;
+pub mod ai_settings;
+pub mod attachments;
+pub mod automations;
 pub mod common;
+pub mod control_bar;
 pub mod credits;
 pub mod explorer;
 pub mod fields;
 pub mod filter;
 pub mod forwards;
+pub mod guard;
 pub mod host_editor;
 pub mod hosts;
 pub mod keychain;

@@ -71,6 +71,26 @@ impl SftpService {
         Ok(remote)
     }
 
+    /// Uploads to `remote`, the whole path, replacing what is there.
+    pub async fn upload_as(&self, id: Id, local: &Path, remote: &str) -> AppResult<()> {
+        Ok(self.get(id)?.upload(local, remote).await?)
+    }
+
+    /// A file's bytes. Files over `limit` bytes are refused.
+    pub async fn read(&self, id: Id, path: &str, limit: u64) -> AppResult<Vec<u8>> {
+        Ok(self.get(id)?.read(path, limit).await?)
+    }
+
+    /// Replaces a file's contents, making the file when it is missing.
+    pub async fn write(&self, id: Id, path: &str, data: &[u8]) -> AppResult<()> {
+        Ok(self.get(id)?.write(path, data).await?)
+    }
+
+    /// Whether `path` is a folder, following links.
+    pub async fn is_dir(&self, id: Id, path: &str) -> AppResult<bool> {
+        Ok(self.get(id)?.stat(path).await?.is_dir)
+    }
+
     pub async fn close(&self, id: Id) {
         if let Some((_, fs)) = self.sessions.remove(&id) {
             fs.close().await;

@@ -1,3 +1,4 @@
+mod automation;
 mod group;
 pub mod host;
 mod identity;
@@ -7,6 +8,7 @@ mod snippet;
 mod ssh_key;
 mod vault;
 
+pub use automation::Automation;
 pub use group::Group;
 pub use host::Host;
 pub use identity::Identity;

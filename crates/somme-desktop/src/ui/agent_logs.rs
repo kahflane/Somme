@@ -14,15 +14,19 @@ use gpui_kit::{
     Window, div, px,
 };
 
-use crate::mcp::{Agents, Run};
+use somme_ai::guard::Decision;
+
+use crate::mcp::{Agents, GuardNote, Run};
 use crate::settings::Settings;
 use crate::ui::common::{APP_NAME, Lucide, ago, copy_text, notify_ok};
+use crate::ui::guard::checked_by;
 
 /// How a run went, for its icon, colour and word.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Outcome {
     Running,
     Unknown,
+    Blocked,
     Failed,
     TimedOut,
     Error,
@@ -31,6 +35,9 @@ enum Outcome {
 
 impl Outcome {
     fn of(run: &Run, live: bool) -> Self {
+        if run.guard.as_ref().is_some_and(|guard| !guard.allowed()) {
+            return Outcome::Blocked;
+        }
         let Some(end) = &run.end else {
             return if live { Outcome::Running } else { Outcome::Unknown };
         };
@@ -49,6 +56,7 @@ impl Outcome {
         match self {
             Outcome::Running => Lucide::LoaderCircle,
             Outcome::Unknown => Lucide::CircleQuestionMark,
+            Outcome::Blocked => Lucide::ShieldX,
             Outcome::Failed => Lucide::CircleAlert,
             Outcome::TimedOut => Lucide::Clock,
             Outcome::Error => Lucide::CircleX,
@@ -61,7 +69,7 @@ impl Outcome {
         match self {
             Outcome::Running => theme.info,
             Outcome::Unknown => theme.muted_foreground,
-            Outcome::Failed | Outcome::Error => theme.danger,
+            Outcome::Blocked | Outcome::Failed | Outcome::Error => theme.danger,
             Outcome::TimedOut => theme.warning,
             Outcome::Ok => theme.success,
         }
@@ -73,6 +81,8 @@ impl Outcome {
         match self {
             Outcome::Running => "Running".into(),
             Outcome::Unknown => "No end".into(),
+            Outcome::Blocked if run.guard.as_ref().is_some_and(|guard| guard.answer == Some(false)) => "Denied".into(),
+            Outcome::Blocked => "Blocked".into(),
             Outcome::Failed => "Did not run".into(),
             Outcome::TimedOut => "Timed out".into(),
             Outcome::Ok => "Exit 0".into(),
@@ -89,12 +99,25 @@ impl Outcome {
         match self {
             Outcome::Running => "Running now.".into(),
             Outcome::Unknown => format!("{APP_NAME} closed before the script ended."),
-            Outcome::Failed => end.and_then(|end| end.error.clone()).unwrap_or_default(),
+            Outcome::Blocked | Outcome::Failed => end.and_then(|end| end.error.clone()).unwrap_or_default(),
             Outcome::TimedOut => format!("Stopped after its {} s limit.", run.timeout_seconds),
             Outcome::Ok => "Ended with exit code 0.".into(),
             Outcome::Error => self.word(run),
         }
     }
+}
+
+/// What the guard said, for the details.
+fn guard_sentence(guard: &GuardNote) -> String {
+    let what = match (guard.decision, guard.answer) {
+        (Decision::Run, _) => "Passed the guard.".to_owned(),
+        (Decision::Ask, Some(true)) => "You allowed it.".to_owned(),
+        (Decision::Ask, Some(false)) => "You denied it.".to_owned(),
+        (Decision::Ask, None) => "Needed your OK, which it did not get.".to_owned(),
+        (Decision::Block, _) => "Blocked.".to_owned(),
+    };
+    let sure = guard.percent.map(|p| format!(" {p}% sure the rule applies.")).unwrap_or_default();
+    format!("{what} {} {}{sure}", guard.reason, checked_by(guard.by))
 }
 
 fn took(run: &Run) -> Option<f64> {
@@ -429,6 +452,7 @@ impl Render for RunDetailPanel {
         let mut facts = v_flex()
             .gap_1p5()
             .child(fact("Result", outcome.sentence(&run)))
+            .children(run.guard.as_ref().map(|guard| fact("Guard", guard_sentence(guard))))
             .child(fact("Server", format!("{} ({})", run.host.name, run.host.address)))
             .child(fact("Agent", run.agent.clone()))
             .child(fact("Started", format!("{} · {}", local_time(run.started), ago(run.started))));

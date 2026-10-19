@@ -187,6 +187,23 @@ pub struct KeyGenerateInput {
     pub algorithm: String,
 }
 
+/// An automation with its JSON opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationView {
+    pub id: Id,
+    pub document: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationInput {
+    pub id: Option<Id>,
+    pub document: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnippetView {

@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "name": "Safe deploy",
+  "description": "Asks you first, then pulls, builds and restarts one server at a time. Checks the site, and rolls back if anything fails.",
+  "inputs": [
+    {
+      "name": "branch",
+      "default": "main"
+    },
+    {
+      "name": "health_url",
+      "label": "Health check address",
+      "default": "https://example.com/health"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "ok",
+      "type": "ask",
+      "title": "Deploy {{input.branch}} to your web servers?",
+      "message": "One server at a time: git pull, build, restart."
+    },
+    {
+      "id": "deploy",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "one_by_one": true,
+      "command": "set -e\ncd /srv/app\ngit fetch origin {{input.branch}}\ngit checkout -q {{input.branch}}\ngit pull --ff-only origin {{input.branch}}\n./build.sh\nsudo -n systemctl restart app",
+      "timeout_seconds": 900
+    },
+    {
+      "id": "health",
+      "type": "http",
+      "method": "GET",
+      "url": "{{input.health_url}}",
+      "retries": 3,
+      "retry_wait_seconds": 10
+    },
+    {
+      "id": "done",
+      "type": "notify",
+      "title": "Deployed {{input.branch}}",
+      "body": "Every server is on {{input.branch}} and the health check answered {{nodes.health.status}}."
+    },
+    {
+      "id": "rollback",
+      "type": "command",
+      "hosts": {
+        "tag": "web"
+      },
+      "one_by_one": true,
+      "command": "set -e\ncd /srv/app\ngit checkout -q ORIG_HEAD\n./build.sh\nsudo -n systemctl restart app"
+    },
+    {
+      "id": "tell",
+      "type": "notify",
+      "title": "Deploy failed and was rolled back",
+      "body": "{{nodes.deploy.error}}{{nodes.health.error}}"
+    }
+  ],
+  "edges": [
+    {
+      "from": "ok",
+      "to": "deploy",
+      "port": "allowed"
+    },
+    {
+      "from": "deploy",
+      "to": "health"
+    },
+    {
+      "from": "health",
+      "to": "done"
+    },
+    {
+      "from": "deploy",
+      "to": "rollback",
+      "port": "failed"
+    },
+    {
+      "from": "health",
+      "to": "rollback",
+      "port": "failed"
+    },
+    {
+      "from": "rollback",
+      "to": "tell"
+    }
+  ]
+}

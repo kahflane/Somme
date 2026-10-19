@@ -10,6 +10,7 @@ pub const DATA_TABLES: &[&str] = &[
     "port_forwards",
     "known_hosts",
     "preferences",
+    "automations",
 ];
 
 const VAULT_TABLES: &[&str] = &[
@@ -20,6 +21,7 @@ const VAULT_TABLES: &[&str] = &[
     "hosts",
     "port_forwards",
     "known_hosts",
+    "automations",
 ];
 
 const SCHEMA: &str = r"
@@ -53,6 +55,12 @@ CREATE TABLE IF NOT EXISTS identities (
     username TEXT NOT NULL,
     password TEXT,
     key_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS automations (
+    id TEXT PRIMARY KEY NOT NULL,
+    document TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );

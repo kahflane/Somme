@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use somme_ai::guard::{CheckedBy, Decision, Verdict};
 
 const FILE: &str = "script-log.jsonl";
 /// Output kept in the log for each run. The agent gets more.
@@ -22,6 +23,47 @@ pub struct HostRef {
     pub address: String,
 }
 
+/// What the guard said about a script, kept with its run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardNote {
+    pub decision: Decision,
+    /// The rule that decided, as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// How sure Jev or the LLM was that the rule applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    pub by: CheckedBy,
+    pub reason: String,
+    /// What the user said when asked: true when they allowed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<bool>,
+}
+
+impl GuardNote {
+    /// None when there was nothing to check.
+    pub fn from(verdict: &Verdict, answer: Option<bool>) -> Option<Self> {
+        (verdict.by != CheckedBy::Nothing).then(|| Self {
+            decision: verdict.decision,
+            rule: verdict.rule.clone(),
+            percent: verdict.probability.map(|p| (p.clamp(0.0, 1.0) * 100.0).round() as u8),
+            by: verdict.by,
+            reason: verdict.reason.clone(),
+            answer,
+        })
+    }
+
+    /// Whether the script ran past the guard.
+    pub fn allowed(&self) -> bool {
+        match self.decision {
+            Decision::Run => true,
+            Decision::Ask => self.answer == Some(true),
+            Decision::Block => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub enum Record {
@@ -35,6 +77,8 @@ pub enum Record {
         host: HostRef,
         script: String,
         timeout_seconds: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guard: Option<GuardNote>,
     },
     #[serde(rename_all = "camelCase")]
     End {
@@ -67,6 +111,7 @@ pub struct Run {
     pub host: HostRef,
     pub script: String,
     pub timeout_seconds: u64,
+    pub guard: Option<GuardNote>,
     pub end: Option<RunEnd>,
 }
 
@@ -90,13 +135,14 @@ impl Run {
 
     pub fn from_start(record: Record) -> Option<Self> {
         match record {
-            Record::Start { id, at, agent, host, script, timeout_seconds } => Some(Self {
+            Record::Start { id, at, agent, host, script, timeout_seconds, guard } => Some(Self {
                 id,
                 started: at,
                 agent,
                 host,
                 script,
                 timeout_seconds,
+                guard,
                 end: None,
             }),
             Record::End { .. } => None,
@@ -213,6 +259,7 @@ mod tests {
             },
             script: script.into(),
             timeout_seconds: 60,
+            guard: None,
         }
     }
 
@@ -253,6 +300,38 @@ mod tests {
         log.write(&start("a", "id")).unwrap();
         let mode = std::fs::metadata(log.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn the_guards_word_is_kept_with_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ScriptLog::new(dir.path());
+        let verdict = Verdict {
+            decision: Decision::Ask,
+            rule: Some("Ask before restarts".into()),
+            probability: Some(0.874),
+            by: CheckedBy::Jev,
+            reason: "Your rule says to ask first.".into(),
+        };
+        let mut record = start("a", "systemctl restart nginx");
+        if let Record::Start { guard, .. } = &mut record {
+            *guard = GuardNote::from(&verdict, Some(false));
+        }
+        log.write(&record).unwrap();
+        let note = log.recent(1)[0].guard.clone().unwrap();
+        assert_eq!(note.percent, Some(87));
+        assert!(!note.allowed());
+        // Nothing checked, nothing noted.
+        let nothing = Verdict { decision: Decision::Run, rule: None, probability: None, by: CheckedBy::Nothing, reason: String::new() };
+        assert!(GuardNote::from(&nothing, None).is_none());
+    }
+
+    #[test]
+    fn runs_from_before_the_guard_still_read() {
+        let line = br#"{"event":"start","id":"a","at":1,"agent":"x","host":{"id":"h","name":"web","address":"w:22"},"script":"ls","timeoutSeconds":60}"#;
+        let runs = runs_from(line, 10);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].guard.is_none());
     }
 
     #[test]

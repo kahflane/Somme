@@ -1,6 +1,9 @@
+mod ai;
 #[cfg(feature = "snapshot")]
 mod automation;
+mod automations;
 mod changes;
+mod computer;
 mod download;
 mod editor;
 mod fonts;
@@ -120,6 +123,7 @@ fn uninstall() -> i32 {
         let mut settings = Settings::load(&data_dir);
         settings.open_with = None;
         settings.agent_service = false;
+        settings.automation_service = false;
         settings.save(&data_dir);
     }
     if code == 0 {
@@ -199,6 +203,8 @@ fn main() -> anyhow::Result<()> {
         editor::servers::Installer::init(&services.data_dir, cx);
         look::init(services.clone(), cx);
         mcp::init(services.clone(), cx);
+        automations::init(services.clone(), cx);
+        ai::check_saved_keys(services.clone(), cx);
         update::init(services.data_dir.clone(), cx);
 
         let options = WindowOptions {

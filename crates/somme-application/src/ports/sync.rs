@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use somme_domain::{
-    Group, Host, Identity, KnownHostRepository, PortForward, Repository, Snippet, SshKey, VaultRepository,
+    Automation, Group, Host, Identity, KnownHostRepository, PortForward, Repository, Snippet, SshKey, VaultRepository,
 };
 
 use crate::ports::GatewayError;
@@ -12,6 +12,7 @@ pub trait VaultData:
     + Repository<SshKey>
     + Repository<Identity>
     + Repository<Snippet>
+    + Repository<Automation>
     + Repository<Host>
     + Repository<PortForward>
     + KnownHostRepository
@@ -24,6 +25,7 @@ impl<T> VaultData for T where
         + Repository<SshKey>
         + Repository<Identity>
         + Repository<Snippet>
+        + Repository<Automation>
         + Repository<Host>
         + Repository<PortForward>
         + KnownHostRepository

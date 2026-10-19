@@ -5,7 +5,8 @@
 //! `wait 500`, `key cmd-t`, `type hello`, `click 120 40`, `move 120 40`, `drag 10 10 200 10`, `scroll 120 40 -300`,
 //! `down space` and `up space` (press and let go, for holding a key), `action workspace::NewTab`, `bench X Y N` (scrolls N times and prints the average frame time),
 //! `files X Y a.txt | my folder` (drags files from outside over the window), `release X Y` (drops them),
-//! `shot out.png`, `quit`. Lines starting with `#` are skipped.
+//! `shot out.png`, `quit`. `bar` before a step runs it in the bar shown while an agent uses the screen,
+//! like `bar shot bar.png`. Lines starting with `#` are skipped.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,6 +45,10 @@ pub fn start(window: AnyWindowHandle, cx: &mut App) {
 async fn run_step(line: &str, base: &Path, window: AnyWindowHandle, cx: &mut AsyncApp) -> anyhow::Result<()> {
     let (command, arg) = line.split_once(' ').unwrap_or((line, ""));
     match command {
+        "bar" => {
+            let bar = crate::ui::control_bar::window().ok_or_else(|| anyhow::anyhow!("the bar is not up"))?;
+            return Box::pin(run_step(arg.trim(), base, bar, cx)).await;
+        }
         "wait" => {
             let ms: u64 = arg.trim().parse()?;
             cx.background_executor().timer(Duration::from_millis(ms)).await;

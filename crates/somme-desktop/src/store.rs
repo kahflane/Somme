@@ -5,7 +5,7 @@ use std::sync::Arc;
 use gpui_kit::{App, AppContext as _, Context, Entity, EventEmitter, Global, Image, ImageFormat};
 use somme_application::AppResult;
 use somme_application::dto::{
-    AccountStatus, GroupView, HostView, IdentityView, KeyView, KnownHostView, PortForwardView, SnippetView,
+    AccountStatus, AutomationView, GroupView, HostView, IdentityView, KeyView, KnownHostView, PortForwardView, SnippetView,
     SyncStatusView, VaultStatus,
 };
 use somme_domain::Id;
@@ -22,6 +22,8 @@ pub struct Store {
     pub identities: Vec<IdentityView>,
     pub keys: Vec<KeyView>,
     pub snippets: Vec<SnippetView>,
+    /// Opened with the vault, so empty while it is locked.
+    pub automations: Vec<AutomationView>,
     pub forwards: Vec<PortForwardView>,
     pub active_forwards: HashSet<Id>,
     pub known_hosts: Vec<KnownHostView>,
@@ -53,6 +55,7 @@ struct Lists {
     identities: Vec<IdentityView>,
     keys: Vec<KeyView>,
     snippets: Vec<SnippetView>,
+    automations: Vec<AutomationView>,
     forwards: Vec<PortForwardView>,
     known_hosts: Vec<KnownHostView>,
 }
@@ -64,6 +67,7 @@ async fn load_lists(services: Arc<Services>) -> AppResult<Lists> {
         identities: services.identities.list().await?,
         keys: services.keys.list().await?,
         snippets: services.snippets.list().await?,
+        automations: services.automations.list().await?,
         forwards: services.forwards.list().await?,
         known_hosts: services.known_hosts.list().await?,
     })
@@ -87,6 +91,7 @@ impl Store {
                 identities: Vec::new(),
                 keys: Vec::new(),
                 snippets: Vec::new(),
+                automations: Vec::new(),
                 forwards: Vec::new(),
                 active_forwards: HashSet::new(),
                 known_hosts: Vec::new(),
@@ -172,6 +177,7 @@ impl Store {
         self.hosts.clear();
         self.identities.clear();
         self.keys.clear();
+        self.automations.clear();
         self.forwards.clear();
         self.known_hosts.clear();
     }
@@ -200,6 +206,7 @@ impl Store {
                         store.identities = lists.identities;
                         store.keys = lists.keys;
                         store.snippets = lists.snippets;
+                        store.automations = lists.automations;
                         store.forwards = lists.forwards;
                         store.known_hosts = lists.known_hosts;
                         store.load_error = None;

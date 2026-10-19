@@ -14,8 +14,8 @@ use crate::settings::Settings;
 use crate::ui::common::{APP_NAME, Lucide, ago, copy_text, notify_ok};
 use crate::ui::settings_page::SettingsPage;
 
-pub fn agents_page(page: WeakEntity<SettingsPage>) -> SettingPage {
-    // One group, so the sidebar shows Agents alone, without sub items.
+pub fn agents_page(page: WeakEntity<SettingsPage>, cx: &App) -> SettingPage {
+    let guard = crate::ui::guard::guard_group(page.clone(), cx);
     SettingPage::new("Agents").icon(Icon::new(Lucide::Bot)).group(
         SettingGroup::new()
             .title("MCP server")
@@ -51,6 +51,29 @@ pub fn agents_page(page: WeakEntity<SettingsPage>) -> SettingPage {
                 div().w_full().child(window.use_keyed_state("agent-setup", cx, |_, cx| AgentSetup::new(page, cx)))
             })),
     )
+    .group(
+        SettingGroup::new()
+            .title("Automations")
+            .item(
+                SettingItem::new(
+                    "Run schedules when Somme is closed",
+                    SettingField::switch(
+                        |cx| Settings::get(cx).automation_service,
+                        |on, cx| {
+                            Settings::update(cx, |s| {
+                                s.automation_service = on;
+                                s.automation_service_asked = true;
+                            })
+                        },
+                    )
+                    .default_value(false),
+                )
+                .description(format!(
+                    "Starts {APP_NAME} in the background when you log in, so scheduled automations run while the app is closed. It can unlock only if you chose to remember the master password."
+                )),
+            ),
+    )
+    .group(guard)
 }
 
 /// The status, the connect steps and the log button. Redraws as agents work.

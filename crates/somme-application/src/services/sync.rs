@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use somme_domain::{
-    Group, Host, Id, Identity, KnownHost, PortForward, Repository, Sealed, Snippet,
+    Automation, Group, Host, Id, Identity, KnownHost, PortForward, Repository, Sealed, Snippet,
     SshKey, VaultRepository,
 };
 use tokio::sync::oneshot;
@@ -209,6 +209,17 @@ impl SyncService {
         })
         .await?;
         added += copy_missing(old, new, |s: &Snippet| s.id, Some).await?;
+        added += copy_missing(old, new, |a: &Automation| a.id, |mut a: Automation| match reseal(&a.document) {
+            Some(document) => {
+                a.document = document;
+                Some(a)
+            }
+            None => {
+                lost += 1;
+                None
+            }
+        })
+        .await?;
         added += copy_missing(old, new, |h: &Host| h.id, |mut h: Host| {
             if let Some(password) = h.password.take() {
                 h.password = reseal(&password);

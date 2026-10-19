@@ -111,7 +111,8 @@ pub fn init(cx: &mut App) {
 /// waits until it is free.
 fn with_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut App) + 'static) {
     cx.defer(|cx| {
-        if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
+        let is_bar = crate::ui::control_bar::is_bar;
+        if let Some(handle) = cx.active_window().filter(|window| !is_bar(window)).or_else(|| cx.windows().into_iter().find(|window| !is_bar(window))) {
             let _ = handle.update(cx, |_, window, cx| f(window, cx));
         }
     });

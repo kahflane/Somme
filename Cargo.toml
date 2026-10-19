@@ -4,6 +4,10 @@ members = [
     "crates/somme-domain",
     "crates/somme-application",
     "crates/somme-infrastructure",
+    "crates/somme-ai",
+    "crates/somme-automation",
+    "crates/somme-patch",
+    "crates/somme-computer",
     "crates/somme-cloud",
     "crates/somme-desktop",
 ]
@@ -18,6 +22,10 @@ rust-version = "1.88"
 somme-domain = { path = "crates/somme-domain" }
 somme-application = { path = "crates/somme-application" }
 somme-infrastructure = { path = "crates/somme-infrastructure" }
+somme-ai = { path = "crates/somme-ai" }
+somme-automation = { path = "crates/somme-automation" }
+somme-patch = { path = "crates/somme-patch" }
+somme-computer = { path = "crates/somme-computer" }
 
 anyhow = "1"
 axum = "0.8"

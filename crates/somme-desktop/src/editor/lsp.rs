@@ -70,8 +70,8 @@ pub struct Missing {
 }
 
 /// The first installed server for `language`: one on the search path, else
-/// one Somme installed in `managed`.
-pub fn find_server(language: &Language, shell_path: Option<&str>, managed: Option<&Path>) -> Result<Found, Missing> {
+/// one Somme installed in `managed`. `root` is the project's folder.
+pub fn find_server(language: &Language, shell_path: Option<&str>, managed: Option<&Path>, root: &Path) -> Result<Found, Missing> {
     let Some(first) = language.servers.first() else {
         return Err(Missing {
             reason: String::new(),
@@ -80,8 +80,11 @@ pub fn find_server(language: &Language, shell_path: Option<&str>, managed: Optio
     };
     let search = search_path(shell_path);
     let args = |command: &[&str]| command[1..].iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    let mut not_in_toolchain = None;
     let on_path = language.servers.iter().find_map(|command| {
-        find_program(command[0], &search).map(|program| Found {
+        let program = find_program(command[0], &search)?;
+        let program = through_rustup(command[0], program, &search, root).map_err(|reason| not_in_toolchain = Some(reason)).ok()?;
+        Some(Found {
             name: command[0].to_owned(),
             program,
             args: args(command),
@@ -106,9 +109,10 @@ pub fn find_server(language: &Language, shell_path: Option<&str>, managed: Optio
     if let Some(found) = on_path.or_else(ours) {
         return Ok(found);
     }
-    let reason = match servers::hint(first[0]) {
-        Some(hint) => format!("For code help, run: {hint}"),
-        None => format!("Install {} for code help", first[0]),
+    let reason = match (not_in_toolchain, servers::hint(first[0])) {
+        (Some(reason), _) => reason,
+        (None, Some(hint)) => format!("For code help, run: {hint}"),
+        (None, None) => format!("Install {} for code help", first[0]),
     };
     let package = language.servers.iter().find_map(|command| servers::package_for(command[0]));
     Err(Missing { reason, package })
@@ -743,6 +747,57 @@ fn search_path(shell_path: Option<&str>) -> String {
     std::env::join_paths(dirs).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// rustup's stand-ins for its tools, like `~/.cargo/bin/rust-analyzer`, start
+/// the tool from the project's toolchain. When the toolchain doesn't have it,
+/// the stand-in finds itself on the PATH and stops with "infinite recursion
+/// detected", so this asks rustup for the real program first.
+fn through_rustup(name: &str, program: PathBuf, search: &str, root: &Path) -> Result<PathBuf, String> {
+    let Some(rustup) = find_program("rustup", search) else { return Ok(program) };
+    if !is_rustup_stand_in(&program, &rustup) {
+        return Ok(program);
+    }
+    let key = (program.clone(), root.to_path_buf());
+    if let Some(real) = TOOLCHAIN_PROGRAMS.lock().ok().and_then(|known| known.as_ref()?.get(&key).cloned()) {
+        return Ok(real);
+    }
+    let mut which = Command::new(&rustup);
+    which
+        .args(["which", name])
+        .env("PATH", search)
+        // Only looks; never installs a toolchain a project asks for.
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    if root.is_dir() {
+        which.current_dir(root);
+    }
+    let out = which.output();
+    let real = out.ok().filter(|out| out.status.success()).map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
+    match real.filter(|real| real.is_file() && !is_rustup_stand_in(real, &rustup)) {
+        Some(real) => {
+            if let Ok(mut known) = TOOLCHAIN_PROGRAMS.lock() {
+                known.get_or_insert_with(HashMap::new).insert(key, real.clone());
+            }
+            Ok(real)
+        }
+        None => Err(format!("{name} isn't in your Rust toolchain. For code help, run: rustup component add {name}")),
+    }
+}
+
+/// Programs rustup found in a toolchain, by stand-in and project folder.
+static TOOLCHAIN_PROGRAMS: Mutex<Option<HashMap<(PathBuf, PathBuf), PathBuf>>> = Mutex::new(None);
+
+/// True for rustup's stand-ins: rustup itself under another name, or the
+/// small scripts Homebrew puts next to it.
+fn is_rustup_stand_in(program: &Path, rustup: &Path) -> bool {
+    let (Ok(program), Ok(rustup)) = (program.canonicalize(), rustup.canonicalize()) else { return false };
+    if program.parent() != rustup.parent() {
+        return false;
+    }
+    let size = |path: &Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+    size(&program) == size(&rustup) || size(&program) < 4096
+}
+
 fn find_program(name: &str, search: &str) -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat"] } else { &[""] };
     std::env::split_paths(search).find_map(|dir| {
@@ -809,12 +864,42 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let shell_path = dir.path().to_string_lossy().into_owned();
-        let missing = find_server(&json, Some(&shell_path), None).expect_err("nothing installed");
+        let missing = find_server(&json, Some(&shell_path), None, dir.path()).expect_err("nothing installed");
         assert_eq!(missing.reason, "For code help, run: npm i -g vscode-langservers-extracted");
         std::fs::write(dir.path().join(format!("biome{}", std::env::consts::EXE_SUFFIX)), "").unwrap();
-        let found = find_server(&json, Some(&shell_path), None).ok().expect("biome");
+        let found = find_server(&json, Some(&shell_path), None, dir.path()).ok().expect("biome");
         assert_eq!(found.name(), "biome");
         assert_eq!(found.args, ["lsp-proxy"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustup_stand_ins_lead_to_the_toolchain() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let toolchain = dir.path().join("toolchain");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&toolchain).unwrap();
+        let real = toolchain.join("rust-analyzer");
+        std::fs::write(&real, "a real server").unwrap();
+        let script = |path: &Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let stand_in = bin.join("rust-analyzer");
+        script(&stand_in, "exec rustup \"$@\"");
+        let search = bin.to_string_lossy().into_owned();
+
+        script(&bin.join("rustup"), &format!("echo {}", real.display()));
+        assert_eq!(through_rustup("rust-analyzer", stand_in.clone(), &search, dir.path()).unwrap(), real);
+
+        let other = tempfile::tempdir().unwrap();
+        script(&bin.join("rustup"), "echo \"error: unknown binary\" >&2; exit 1");
+        let missing = through_rustup("rust-analyzer", stand_in, &search, other.path()).unwrap_err();
+        assert!(missing.ends_with("run: rustup component add rust-analyzer"), "{missing}");
+        // A server that isn't rustup's is used as it is.
+        assert_eq!(through_rustup("rust-analyzer", real.clone(), &search, other.path()).unwrap(), real);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui_kit::{App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, SharedString};
+use gpui_kit::{App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, SharedString, Task};
 use parking_lot::Mutex;
 use somme_application::ports::{OutputSink, ShellOptions, TermSize};
 use somme_domain::Id;
@@ -175,6 +175,33 @@ pub struct TerminalSession {
     scanner: MarkScanner,
     /// Set when command blocks are on; used once the shell's hooks report in.
     pub blocks: Option<Blocks>,
+    /// Keeps the branch and changes up to date while files change.
+    git_watch: Option<GitWatch>,
+}
+
+/// Watches a repo on this computer, so the shell's branch and changes
+/// follow edits made anywhere, not only at the next prompt.
+struct GitWatch {
+    root: PathBuf,
+    _watcher: Option<notify::RecommendedWatcher>,
+    _task: Task<()>,
+}
+
+/// How long changes settle before the branch and changes are read again.
+const GIT_SETTLE: Duration = Duration::from_millis(600);
+/// Where watching a whole repo costs too much, it is read this often.
+const GIT_POLL: Duration = Duration::from_secs(4);
+
+/// Whether a change at `path` can change what `git diff HEAD` says.
+fn moves_git(root: &Path, path: &Path) -> bool {
+    let Ok(inside) = path.strip_prefix(root) else { return false };
+    let mut parts = inside.components().map(|part| part.as_os_str().to_string_lossy());
+    match parts.next().as_deref() {
+        // A commit or a branch switch; the rest of .git is git's own work.
+        Some(".git") => matches!(parts.next().as_deref(), Some("HEAD" | "refs" | "packed-refs")),
+        Some(_) => !inside.components().any(|part| matches!(part.as_os_str().to_str(), Some("target" | "node_modules"))),
+        None => false,
+    }
 }
 
 impl EventEmitter<SessionEvent> for TerminalSession {}
@@ -213,6 +240,7 @@ impl TerminalSession {
                 history: Vec::new(),
                 scanner: MarkScanner::default(),
                 blocks,
+                git_watch: None,
             };
             session.connect(cx);
             session
@@ -616,12 +644,63 @@ impl TerminalSession {
                 if let Some(blocks) = session.blocks.as_mut()
                     && blocks.cwd.as_ref() == Some(&dir)
                 {
+                    let root = git.as_ref().map(|git| git.root.clone());
                     blocks.git = git;
+                    session.watch_repo(root, cx);
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    /// Reads the branch and changes again whenever files in `root` change.
+    fn watch_repo(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.git_watch.as_ref().map(|watch| &watch.root) == root.as_ref() {
+            return;
+        }
+        let Some(root) = root else {
+            self.git_watch = None;
+            return;
+        };
+        let (changes, mut changed) = mpsc::unbounded::<()>();
+        // Linux watches each folder on its own, too many in a big repo.
+        let watcher = if cfg!(target_os = "linux") {
+            None
+        } else {
+            let inside = root.clone();
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event
+                    && event.paths.iter().any(|path| moves_git(&inside, path))
+                {
+                    let _ = changes.unbounded_send(());
+                }
+            })
+            .and_then(|mut watcher| {
+                use notify::Watcher as _;
+                watcher.watch(&root, notify::RecursiveMode::Recursive).map(|()| watcher)
+            })
+            .map_err(|err| tracing::warn!(%err, "the shell's git changes can't follow edits"))
+            .ok()
+        };
+        let polls = watcher.is_none();
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                if polls {
+                    cx.background_executor().timer(GIT_POLL).await;
+                } else {
+                    if changed.next().await.is_none() {
+                        break;
+                    }
+                    cx.background_executor().timer(GIT_SETTLE).await;
+                    while changed.try_recv().is_ok() {}
+                }
+                if this.update(cx, |session, cx| session.refresh_git(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.git_watch = Some(GitWatch { root, _watcher: watcher, _task: task });
     }
 
     /// Looks up the GitHub repository of the shell's folder, here or on the server.
@@ -909,4 +988,20 @@ async fn write_loop(services: Arc<Services>, id: Id, mut rx: io_mpsc::UnboundedR
         }
     }
     services.sessions.close(id).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_changes_git_can_see_wake_the_watch() {
+        let root = Path::new("/work/app");
+        assert!(moves_git(root, Path::new("/work/app/src/main.rs")));
+        assert!(moves_git(root, Path::new("/work/app/.git/HEAD")));
+        assert!(moves_git(root, Path::new("/work/app/.git/refs/heads/main")));
+        assert!(!moves_git(root, Path::new("/work/app/.git/index.lock")));
+        assert!(!moves_git(root, Path::new("/work/app/target/debug/app")));
+        assert!(!moves_git(root, Path::new("/elsewhere/file")));
+    }
 }

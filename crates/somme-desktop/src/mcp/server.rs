@@ -1,6 +1,7 @@
 //! Takes agents' connections (see `transport`) and links the tools to the
 //! saved hosts.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,15 +10,21 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::channel::mpsc::UnboundedSender;
 use serde_json::Value;
+use somme_ai::guard::{self, Action, HostFacts};
 use somme_application::AppError;
 use somme_application::ports::GatewayError;
+use somme_automation::{Automation, RunRecord, RunStatus, StartedBy};
+use somme_automation::history::StepStatus;
 use somme_domain::Id;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::task::JoinSet;
 
 use super::AgentEvent;
-use super::log::{HostRef, Record, ScriptLog, kept};
-use super::protocol::{self, Backend, HostInfo, ScriptRun, Session};
+use super::log::{GuardNote, HostRef, Record, ScriptLog, kept};
+use crate::ai::{self, Outcome};
+use super::protocol::{self, AutomationInfo, Backend, HostInfo, ScriptRun, Session};
+use crate::automations::runner;
+use crate::settings::Settings;
 use super::transport::{Listener, Mark, Stream};
 use crate::runtime;
 use crate::services::Services;
@@ -28,6 +35,11 @@ const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 const OUTPUT_LIMIT: usize = 256 * 1024;
 
 const LOCKED: &str = "Somme is locked. Ask the user to unlock it with their master password, then try again.";
+const AGENTS_OFF: &str = "Agents are turned off in Somme. Ask the user to turn on Settings \u{2192} Agents \u{2192} Let agents run scripts.";
+/// Step output an agent gets back, at most.
+const STEP_OUTPUT: usize = 4000;
+const NO_ANSWER: &str = "The user's guard rules say to ask first, and the user did not answer in Somme within 5 minutes, so the script did not run. Ask the user, then try again.";
+const NO_ONE_TO_ASK: &str = "The user's guard rules say to ask first, and Somme is not open to ask them, so the script did not run. Ask the user to open Somme, then try again.";
 
 /// What the Somme app sends the background service to take over from it.
 pub const YIELD: &str = r#"{"somme":"yield"}"#;
@@ -169,6 +181,29 @@ async fn connection(stream: Stream, shared: Shared) {
 }
 
 impl Shared {
+    /// The background worker listens while agents are off, so the app can
+    /// ask for the lock back. Agents are refused then.
+    fn agents_on(&self) -> Result<(), String> {
+        if Settings::load(&self.services.data_dir).agent_access { Ok(()) } else { Err(AGENTS_OFF.to_owned()) }
+    }
+
+    /// The saved automations agents may start, opened.
+    async fn allowed_automations(&self) -> Result<Vec<Automation>, String> {
+        self.agents_on()?;
+        if !self.unlocked().await {
+            return Err(LOCKED.to_owned());
+        }
+        let views = self.services.automations.list().await.map_err(|err| format!("Somme could not read the automations: {err}"))?;
+        Ok(views
+            .iter()
+            .filter_map(|view| {
+                let mut automation = Automation::from_json(&view.document).ok()?;
+                automation.id = view.id.to_string();
+                automation.start.agents.then_some(automation)
+            })
+            .collect())
+    }
+
     /// Unlocks with a remembered master password, the first time.
     async fn unlocked(&self) -> bool {
         let _ = self.services.vault.status().await;
@@ -209,6 +244,7 @@ impl Drop for Unfinished<'_> {
 #[async_trait]
 impl Backend for Shared {
     async fn hosts(&self) -> Result<Vec<HostInfo>, String> {
+        self.agents_on()?;
         if !self.unlocked().await {
             return Err(LOCKED.to_owned());
         }
@@ -235,10 +271,23 @@ impl Backend for Shared {
     }
 
     async fn run(&self, agent: &str, host: &HostInfo, script: &str, timeout: Duration) -> Result<ScriptRun, String> {
+        self.agents_on()?;
         if !self.unlocked().await {
             return Err(LOCKED.to_owned());
         }
         let host_id: Id = host.id.parse().map_err(|_| "That server id is not valid.".to_owned())?;
+        let facts = HostFacts { name: host.name.clone(), address: host.address.clone(), tags: host.tags.clone() };
+        let action = Action::command(script, Some(facts), agent);
+        // The background service has no one to send it to.
+        let checked = ai::check(&self.services, action, &host.name, |ask| self.events.unbounded_send(AgentEvent::Ask(ask)).is_ok()).await;
+        let (verdict, answer) = (&checked.verdict, checked.answer());
+        let refused = match checked.outcome {
+            Outcome::Run | Outcome::Allowed => None,
+            Outcome::Blocked => Some(guard::refusal(verdict, false)),
+            Outcome::Denied => Some(guard::refusal(verdict, true)),
+            Outcome::NoAnswer => Some(NO_ANSWER.to_owned()),
+            Outcome::NoOne => Some(NO_ONE_TO_ASK.to_owned()),
+        };
         let id = uuid::Uuid::new_v4().to_string();
         let start = Record::Start {
             id: id.clone(),
@@ -254,7 +303,22 @@ impl Backend for Shared {
             },
             script: script.to_owned(),
             timeout_seconds: timeout.as_secs(),
+            guard: GuardNote::from(verdict, answer),
         };
+        if let Some(refused) = refused {
+            self.record(start);
+            self.record(Record::End {
+                id,
+                at: now_ms(),
+                exit_status: None,
+                exit_signal: None,
+                timed_out: false,
+                error: Some(refused.clone()),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+            return Err(refused);
+        }
         // No log, no run.
         self.log
             .write(&start)
@@ -309,10 +373,80 @@ impl Backend for Shared {
         self.record(end);
         answer
     }
+
+    async fn automations(&self) -> Result<Vec<AutomationInfo>, String> {
+        Ok(self
+            .allowed_automations()
+            .await?
+            .into_iter()
+            .map(|automation| AutomationInfo {
+                id: automation.id,
+                name: automation.name,
+                description: automation.description,
+                inputs: automation.inputs.into_iter().map(|input| (input.name, input.default)).collect(),
+            })
+            .collect())
+    }
+
+    async fn run_automation(&self, agent: &str, id: &str, inputs: BTreeMap<String, String>) -> Result<String, String> {
+        let automation = self.allowed_automations().await?.into_iter().find(|automation| automation.id == id);
+        let automation = automation.ok_or("The user has not let agents run that automation.")?;
+        let runner = runner::shared().ok_or("Somme can't run automations right now.")?;
+        runner.start(automation, inputs, StartedBy::Agent(agent.to_owned()))
+    }
+
+    async fn automation_status(&self, run: &str) -> Result<(bool, String), String> {
+        let allowed = self.allowed_automations().await?;
+        let runner = runner::shared().ok_or("Somme can't run automations right now.")?;
+        let record = runner.history().find(run).filter(|record| allowed.iter().any(|a| a.id == record.head.automation_id));
+        let mut record = record.ok_or("No run of an automation agents may run has that id.")?;
+        let live = runner.is_running(run);
+        if live {
+            record.status = RunStatus::Running;
+            record.error = None;
+        }
+        let automation = allowed.iter().find(|a| a.id == record.head.automation_id);
+        Ok((!live, run_report(&record, automation)))
+    }
+}
+
+/// A run in words, step by step, for an agent.
+fn run_report(record: &RunRecord, automation: Option<&Automation>) -> String {
+    let how = match record.status {
+        RunStatus::Running => "still running",
+        RunStatus::Ok => "done",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "stopped",
+    };
+    let mut text = format!("Run {} of \"{}\": {how}.", record.head.id, record.head.automation_name);
+    if let Some(error) = &record.error {
+        text.push_str(&format!(" {error}"));
+    }
+    let mut steps: Vec<(&String, &somme_automation::history::StepRecord)> = record.steps.iter().collect();
+    steps.sort_by_key(|(_, step)| step.started.unwrap_or(i64::MAX));
+    for (id, step) in steps {
+        let title = automation.and_then(|a| a.node(id)).map_or_else(|| id.clone(), |node| node.title());
+        let state = match step.status {
+            StepStatus::Running => "running".to_owned(),
+            StepStatus::Done => format!("ended by {}", step.port.as_deref().unwrap_or("ok")),
+            StepStatus::Failed => "failed".to_owned(),
+            StepStatus::Skipped => "skipped".to_owned(),
+        };
+        text.push_str(&format!("\n\n{title} [{id}]: {state}"));
+        let said = step.summary.trim();
+        if !said.is_empty() {
+            let cut: String = said.chars().take(STEP_OUTPUT).collect();
+            text.push_str(&format!("\n{cut}"));
+            if cut.len() < said.len() {
+                text.push_str("\n[\u{2026}]");
+            }
+        }
+    }
+    text
 }
 
 /// Why a script could not start, in words an agent can pass on.
-fn explain(err: &AppError, host: &str) -> String {
+pub fn explain(err: &AppError, host: &str) -> String {
     match err {
         AppError::VaultLocked => LOCKED.to_owned(),
         AppError::Gateway(GatewayError::HostKeyRejected) => format!(

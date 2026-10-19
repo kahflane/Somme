@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
+use somme_ai::guard::{Rule, Strictness};
 
 const FILE_NAME: &str = "desktop-settings.json";
 
@@ -33,6 +34,61 @@ pub enum BellSetting {
     Visual,
     Sound,
     Off,
+}
+
+/// The master switch, one switch per feature, and the provider. API keys
+/// are not here: they are sealed with the vault (see `ai`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiSettings {
+    /// Off: no AI feature runs and nothing is sent to any AI service.
+    pub on: bool,
+    /// Jev or the LLM checks agents' and automations' actions against the
+    /// guard rules. The quick local check runs either way.
+    pub guard: bool,
+    /// Decide steps in automations.
+    pub decide: bool,
+    /// Write steps in automations.
+    pub write: bool,
+    /// Building automations by chatting.
+    pub builder: bool,
+    /// Agent steps that run commands on their own.
+    pub agent: bool,
+    /// Agent steps may control this computer. Off until turned on by itself.
+    pub computer: bool,
+    /// An OpenAI-compatible server, up to the version, like `https://api.openai.com/v1`.
+    pub llm_base_url: String,
+    pub llm_model: String,
+    pub jev_model: String,
+    /// Models for one use each. Empty: `llm_model`.
+    pub builder_model: String,
+    pub decide_model: String,
+    pub write_model: String,
+    pub agent_model: String,
+    /// AI calls one automation run may make.
+    pub run_ai_calls: u32,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            on: false,
+            guard: true,
+            decide: true,
+            write: true,
+            builder: true,
+            agent: true,
+            computer: false,
+            llm_base_url: String::new(),
+            llm_model: String::new(),
+            jev_model: somme_ai::jev::DEFAULT_MODEL.to_owned(),
+            builder_model: String::new(),
+            decide_model: String::new(),
+            write_model: String::new(),
+            agent_model: String::new(),
+            run_ai_calls: 30,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -85,6 +141,11 @@ pub struct Settings {
     pub agent_access: bool,
     /// Keeps a background service taking agents while the app is closed.
     pub agent_service: bool,
+    /// Keeps the background service running scheduled automations while the
+    /// app is closed.
+    pub automation_service: bool,
+    /// The user was asked once whether to turn `automation_service` on.
+    pub automation_service_asked: bool,
     /// Asks GitHub for a new version of Somme every few hours.
     pub check_updates: bool,
     /// The version put off with Later. Only a newer one shows again.
@@ -93,6 +154,24 @@ pub struct Settings {
     pub voice_model: crate::voice::VoiceModel,
     /// The language spoken, by Whisper's code, or "auto".
     pub voice_language: String,
+    /// AI features. Nothing runs and nothing is sent until the user turns AI on.
+    pub ai: AiSettings,
+    /// What the guard stops or asks about before an agent's or automation's
+    /// action runs, in the user's own words.
+    pub guard_rules: Vec<Rule>,
+    pub guard_strictness: Strictness,
+}
+
+impl Settings {
+    /// Whether the background service should start at login.
+    pub fn wants_service(&self) -> bool {
+        self.agent_service || self.automation_service
+    }
+
+    /// Whether the background worker has something to do now.
+    pub fn wants_worker(&self) -> bool {
+        (self.agent_service && self.agent_access) || self.automation_service
+    }
 }
 
 impl Default for Settings {
@@ -128,10 +207,15 @@ impl Default for Settings {
             line_blame: true,
             agent_access: false,
             agent_service: false,
+            automation_service: false,
+            automation_service_asked: false,
             check_updates: true,
             update_later: None,
             voice_model: crate::voice::VoiceModel::default(),
             voice_language: "auto".to_owned(),
+            ai: AiSettings::default(),
+            guard_rules: somme_ai::guard::default_rules(),
+            guard_strictness: Strictness::default(),
         }
     }
 }
