@@ -1,6 +1,7 @@
 //! Records the microphone until told to stop, then gives the sound as
 //! Whisper wants it: one channel, 16,000 samples a second.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,9 +18,16 @@ pub const MAX_LENGTH: Duration = Duration::from_secs(120);
 pub struct Recording {
     stop: mpsc::Sender<()>,
     done: mpsc::Receiver<Result<Vec<f32>, String>>,
+    /// How loud the last bit of sound was, as `f32` bits.
+    level: Arc<AtomicU32>,
 }
 
 impl Recording {
+    /// How loud the microphone is right now, from 0 to 1.
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
+    }
+
     /// Stops recording. Slow: waits for the microphone to close.
     pub fn finish(self) -> Result<Vec<f32>, String> {
         let _ = self.stop.send(());
@@ -36,12 +44,14 @@ pub fn start() -> Result<Recording, String> {
     let (stop, stopped) = mpsc::channel();
     let (done_tx, done) = mpsc::channel();
     let (started_tx, started) = mpsc::channel();
+    let level = Arc::new(AtomicU32::new(0));
+    let meter = level.clone();
     // The stream can't move between threads on every system, so it lives on its own.
     std::thread::Builder::new()
         .name("microphone".into())
         .spawn(move || {
             let heard = Arc::new(Mutex::new(Vec::new()));
-            let stream = match open(heard.clone()) {
+            let stream = match open(heard.clone(), meter) {
                 Ok((stream, rate)) => {
                     let _ = started_tx.send(Ok(()));
                     (stream, rate)
@@ -59,11 +69,12 @@ pub fn start() -> Result<Recording, String> {
         })
         .map_err(|err| format!("Could not start recording: {err}"))?;
     started.recv().unwrap_or_else(|_| Err("Could not start recording.".to_owned()))?;
-    Ok(Recording { stop, done })
+    Ok(Recording { stop, done, level })
 }
 
-/// Opens the default microphone, adding what it hears, as one channel, to `heard`.
-fn open(heard: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32), String> {
+/// Opens the default microphone, adding what it hears, as one channel, to
+/// `heard`, and how loud it is to `level`.
+fn open(heard: Arc<Mutex<Vec<f32>>>, level: Arc<AtomicU32>) -> Result<(cpal::Stream, u32), String> {
     let device = cpal::default_host().default_input_device().ok_or("No microphone found.")?;
     let config = device.default_input_config().map_err(|err| format!("Can't use the microphone: {err}"))?;
     let channels = usize::from(config.channels()).max(1);
@@ -71,13 +82,13 @@ fn open(heard: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32), String> {
     let format = config.sample_format();
     let config: cpal::StreamConfig = config.into();
     let stream = match format {
-        SampleFormat::I8 => build::<i8>(&device, config, channels, heard),
-        SampleFormat::I16 => build::<i16>(&device, config, channels, heard),
-        SampleFormat::I32 => build::<i32>(&device, config, channels, heard),
-        SampleFormat::U8 => build::<u8>(&device, config, channels, heard),
-        SampleFormat::U16 => build::<u16>(&device, config, channels, heard),
-        SampleFormat::F32 => build::<f32>(&device, config, channels, heard),
-        SampleFormat::F64 => build::<f64>(&device, config, channels, heard),
+        SampleFormat::I8 => build::<i8>(&device, config, channels, heard, level),
+        SampleFormat::I16 => build::<i16>(&device, config, channels, heard, level),
+        SampleFormat::I32 => build::<i32>(&device, config, channels, heard, level),
+        SampleFormat::U8 => build::<u8>(&device, config, channels, heard, level),
+        SampleFormat::U16 => build::<u16>(&device, config, channels, heard, level),
+        SampleFormat::F32 => build::<f32>(&device, config, channels, heard, level),
+        SampleFormat::F64 => build::<f64>(&device, config, channels, heard, level),
         other => return Err(format!("The microphone gives sound as {other}, which Somme can't read.")),
     }
     .map_err(|err| format!("Can't use the microphone: {err}"))?;
@@ -90,6 +101,7 @@ fn build<T>(
     config: cpal::StreamConfig,
     channels: usize,
     heard: Arc<Mutex<Vec<f32>>>,
+    level: Arc<AtomicU32>,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: SizedSample,
@@ -103,10 +115,12 @@ where
             if heard.len() >= limit {
                 return;
             }
+            let start = heard.len();
             for frame in data.chunks(channels) {
                 let sum: f32 = frame.iter().map(|&sample| f32::from_sample(sample)).sum();
                 heard.push(sum / frame.len() as f32);
             }
+            level.store(loudness(&heard[start..]).to_bits(), Ordering::Relaxed);
         },
         |err| tracing::warn!(%err, "microphone"),
         None,
@@ -168,7 +182,8 @@ fn from_wav(path: std::path::PathBuf) -> Result<Recording, String> {
         let _ = stopped.recv();
         let _ = done_tx.send(read_wav(&path));
     });
-    Ok(Recording { stop, done })
+    // Loud enough that the wave shows in screenshots.
+    Ok(Recording { stop, done, level: Arc::new(AtomicU32::new(0.05f32.to_bits())) })
 }
 
 /// Reads a 16-bit PCM WAV file as one channel at [`RATE`].

@@ -1,13 +1,17 @@
-//! Voice typing in a terminal: the mic button in the command box, the offer to
-//! download the speech model, and the shortcut. The words go in as if pasted.
+//! Voice typing in a terminal: the mic button in the command box, holding
+//! Space to talk, the offer to download the speech model, and the shortcut.
+//! The words go in as if pasted.
+
+use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px, relative,
+    AnyElement, App, Context, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers,
+    MouseButton, ParentElement as _, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
+    prelude::FluentBuilder as _, px, relative,
 };
 
 use super::{TerminalView, ToggleVoice};
@@ -17,6 +21,20 @@ use crate::voice::{Phase, Voice, VoiceModel, megabytes};
 
 /// The shortcut, as shown in hints.
 pub(super) const SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘⇧Space" } else { "Ctrl+Shift+Space" };
+
+/// Holding Space this long in the command box starts listening, instead of typing a space.
+const HOLD: Duration = Duration::from_millis(350);
+
+/// Bars in the wave shown while listening, and how tall each is next to the
+/// middle one, so the wave rises in the centre.
+const WAVE: [f32; 9] = [0.35, 0.55, 0.75, 0.9, 1., 0.9, 0.75, 0.55, 0.35];
+
+/// A Space press in the command box that may turn into holding to talk.
+pub(super) struct SpaceHold {
+    /// Listening started, so letting go of Space stops it.
+    talking: bool,
+    _timer: Task<()>,
+}
 
 /// Colors from the terminal's theme, so the button sits well with the chips.
 pub(super) struct Palette {
@@ -60,6 +78,58 @@ impl TerminalView {
         }
     }
 
+    /// Space in the command box. Held, it talks; tapped, it types a space,
+    /// which goes in when Space comes back up, or when another key comes first.
+    pub(super) fn space_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let space = event.keystroke.key == "space" && event.keystroke.modifiers == Modifiers::none();
+        if let Some(hold) = &self.space {
+            if space {
+                // Space repeats while held.
+                cx.stop_propagation();
+            } else if !hold.talking {
+                self.space = None;
+                self.insert_in_prompt(" ", window, cx);
+            }
+            return;
+        }
+        if !space || event.is_held || !self.can_hold_to_talk(window, cx) {
+            return;
+        }
+        cx.stop_propagation();
+        let timer = cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor().timer(HOLD).await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                let Some(hold) = view.space.as_mut().filter(|hold| !hold.talking) else { return };
+                hold.talking = true;
+                view.toggle_voice(&ToggleVoice, window, cx);
+            });
+        });
+        self.space = Some(SpaceHold { talking: false, _timer: timer });
+    }
+
+    pub(super) fn space_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key != "space" {
+            return;
+        }
+        let Some(hold) = self.space.take() else { return };
+        if !hold.talking {
+            self.insert_in_prompt(" ", window, cx);
+        } else if Voice::global(cx).read(cx).phase() == (Phase::Listening { owner: cx.entity_id() }) {
+            self.finish_voice(cx);
+        }
+    }
+
+    /// Holding Space talks only in the command line itself, not the folder
+    /// search, and only once the speech model is here, so until then it types spaces.
+    fn can_hold_to_talk(&self, window: &Window, cx: &App) -> bool {
+        let voice = Voice::global(cx);
+        let voice = voice.read(cx);
+        self.shows_mic(cx)
+            && self.prompt_focused(window, cx)
+            && voice.phase() == Phase::Idle
+            && voice.ready(Voice::chosen(cx))
+    }
+
     fn finish_voice(&mut self, cx: &mut Context<Self>) {
         let task = Voice::global(cx).update(cx, |voice, cx| voice.finish(cx));
         if let Some(id) = self.voice_note {
@@ -72,7 +142,15 @@ impl TerminalView {
                     view.remove_note(id, cx);
                 }
                 match result {
-                    Ok(text) => view.paste_text(&text, cx),
+                    Ok(text) => {
+                        // Words said after typed ones need a space between.
+                        let joins = view.prompt.as_ref().is_some_and(|prompt| {
+                            let editor = prompt.editor.read(cx);
+                            let before = editor.value().get(..editor.cursor()).unwrap_or_default().to_owned();
+                            before.ends_with(|c: char| !c.is_whitespace())
+                        });
+                        view.paste_text(&if joins { format!(" {text}") } else { text }, cx);
+                    }
                     Err(err) => view.voice_failed(err, cx),
                 }
             });
@@ -133,10 +211,8 @@ impl TerminalView {
             .cursor_pointer();
         let chip = if listening {
             chip.bg(colors.red.opacity(0.18))
-                .text_color(colors.red)
                 .hover(|chip| chip.bg(colors.red.opacity(0.26)))
-                .child(Icon::new(Lucide::Mic).size(px(12.)))
-                .child("Listening · click to stop")
+                .child(wave(voice.level(), voice.listening_for(), colors.red))
         } else if writing {
             chip.bg(colors.foreground.opacity(0.07))
                 .text_color(colors.muted)
@@ -149,7 +225,8 @@ impl TerminalView {
                 .child(Icon::new(Lucide::Mic).size(px(12.)))
                 .when_some(downloading, |chip, share| chip.child(share))
         };
-        chip.tooltip(|window, cx| Tooltip::new("Voice typing").action(&ToggleVoice, None).build(window, cx))
+        let tip = if listening { "Listening. Let go of Space, or click, to stop" } else { "Voice typing: hold Space and talk" };
+        chip.tooltip(move |window, cx| Tooltip::new(tip).action(&ToggleVoice, None).build(window, cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, _, window, cx| {
@@ -215,7 +292,7 @@ impl TerminalView {
             v_flex()
                 .gap_2()
                 .child(text(format!(
-                    "The speech model is ready. Click the mic or press {SHORTCUT}, talk, then press it again to stop."
+                    "The speech model is ready. Hold Space and talk, then let go. Or click the mic or press {SHORTCUT} to start and stop."
                 )))
                 .child(
                     h_flex()
@@ -287,4 +364,16 @@ impl TerminalView {
                 .into_any_element(),
         )
     }
+}
+
+/// Bars that rise and fall with the microphone's `level`. `time` keeps them
+/// moving a little, so they show it is listening even in a quiet room.
+fn wave(level: f32, time: Duration, color: Hsla) -> impl IntoElement {
+    let loud = (level * 12.).sqrt().min(1.);
+    let time = time.as_secs_f32();
+    h_flex().h(px(14.)).gap(px(2.)).items_center().children(WAVE.iter().enumerate().map(|(i, shape)| {
+        let sway = 0.6 + 0.4 * (time * 9. + i as f32 * 0.9).sin();
+        let height = 3. + 11. * shape * (0.15 + 0.85 * loud) * sway;
+        div().w(px(2.)).h(px(height)).rounded_full().bg(color)
+    }))
 }

@@ -130,6 +130,10 @@ pub struct Voice {
     pub download_error: Option<String>,
     engine: Arc<Mutex<Option<(VoiceModel, whisper::Engine)>>>,
     used: Instant,
+    /// How loud the microphone looks, falling back slowly so the wave moves smoothly.
+    level: f32,
+    /// Redraws the wave while listening.
+    meter: Option<Task<()>>,
     _unload: Task<()>,
     _quit: Subscription,
 }
@@ -173,6 +177,8 @@ impl Voice {
                 download_error: None,
                 engine: Arc::default(),
                 used: Instant::now(),
+                level: 0.,
+                meter: None,
                 _unload: unload,
                 _quit: quit,
             }
@@ -190,6 +196,16 @@ impl Voice {
 
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+
+    /// How loud the microphone is while listening, from 0 to 1.
+    pub fn level(&self) -> f32 {
+        self.level
+    }
+
+    /// How long it has been listening, which moves the wave along.
+    pub fn listening_for(&self) -> Duration {
+        self.used.elapsed()
     }
 
     pub fn download(&self) -> Option<&Download> {
@@ -286,6 +302,21 @@ impl Voice {
         self.recording = Some(listen::start()?);
         self.phase = Phase::Listening { owner };
         self.used = Instant::now();
+        self.level = 0.;
+        self.meter = Some(cx.spawn(async move |voice, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(50)).await;
+                let listening = voice.update(cx, |voice, cx| {
+                    let heard = voice.recording.as_ref().map_or(0., listen::Recording::level);
+                    voice.level = heard.max(voice.level * 0.8);
+                    cx.notify();
+                    matches!(voice.phase, Phase::Listening { .. })
+                });
+                if !listening.unwrap_or(false) {
+                    return;
+                }
+            }
+        }));
         let (engine, path) = (self.engine.clone(), self.path(model.file()));
         cx.background_spawn(async move {
             if let Err(err) = load(&engine, model, &path) {
@@ -303,6 +334,7 @@ impl Voice {
             return Task::ready(Err("Voice typing wasn't listening.".to_owned()));
         };
         self.phase = Phase::Writing { owner };
+        self.meter = None;
         cx.notify();
         let model = Self::chosen(cx);
         let language = Settings::get(cx).voice_language.clone();
@@ -340,6 +372,7 @@ impl Voice {
         if matches!(self.phase, Phase::Listening { .. }) {
             self.phase = Phase::Idle;
         }
+        self.meter = None;
         cx.notify();
     }
 }

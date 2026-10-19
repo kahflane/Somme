@@ -3,7 +3,7 @@
 //!
 //! Run with `SOMME_SCRIPT=steps.txt`. One step per line:
 //! `wait 500`, `key cmd-t`, `type hello`, `click 120 40`, `move 120 40`, `drag 10 10 200 10`, `scroll 120 40 -300`,
-//! `action workspace::NewTab`, `bench X Y N` (scrolls N times and prints the average frame time),
+//! `down space` and `up space` (press and let go, for holding a key), `action workspace::NewTab`, `bench X Y N` (scrolls N times and prints the average frame time),
 //! `files X Y a.txt | my folder` (drags files from outside over the window), `release X Y` (drops them),
 //! `shot out.png`, `quit`. Lines starting with `#` are skipped.
 
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::{
-    AnyWindowHandle, App, AsyncApp, ExternalPaths, FileDropEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+    AnyWindowHandle, App, AsyncApp, ExternalPaths, FileDropEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
     ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 
@@ -63,8 +63,19 @@ async fn run_step(line: &str, base: &Path, window: AnyWindowHandle, cx: &mut Asy
                     key: if ch == ' ' { "space".into() } else { text.clone() },
                     key_char: Some(text),
                 };
-                window.update(cx, |_, window, cx| window.dispatch_keystroke(keystroke, cx))?;
+                window.update(cx, |_, window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                    window.dispatch_event(PlatformInput::KeyUp(KeyUpEvent { keystroke }), cx);
+                })?;
             }
+        }
+        "down" => {
+            let keystroke = Keystroke::parse(arg.trim())?;
+            window.update(cx, |_, window, cx| window.dispatch_keystroke(keystroke, cx))?;
+        }
+        "up" => {
+            let keystroke = Keystroke::parse(arg.trim())?;
+            window.update(cx, |_, window, cx| window.dispatch_event(PlatformInput::KeyUp(KeyUpEvent { keystroke }), cx))?;
         }
         "move" => {
             let mut parts = arg.split_whitespace().map(str::parse::<f32>);

@@ -195,6 +195,8 @@ pub struct TerminalView {
     voice_offer: bool,
     /// Says voice typing is listening, where the command box isn't shown.
     voice_note: Option<usize>,
+    /// Space pressed in the command box, which may become holding to talk.
+    space: Option<voice::SpaceHold>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -259,6 +261,7 @@ impl TerminalView {
             next_note: 0,
             voice_offer: false,
             voice_note: None,
+            space: None,
             _subscriptions: subscriptions,
         };
         view.reset_blink(cx);

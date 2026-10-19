@@ -829,6 +829,8 @@ impl TerminalView {
             .border_t_1()
             .border_color(foreground.opacity(0.1))
             .bg(to_hsla(theme.background))
+            .capture_key_down(cx.listener(Self::space_down))
+            .capture_key_up(cx.listener(Self::space_up))
             .capture_action(cx.listener(|view, _: &MoveUp, window, cx| {
                 if view.move_picker(true, cx) || view.move_menu(true, cx) || view.history_step(true, window, cx) {
                     cx.stop_propagation();

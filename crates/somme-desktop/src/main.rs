@@ -195,7 +195,14 @@ fn main() -> anyhow::Result<()> {
         .detach();
         #[cfg(feature = "snapshot")]
         automation::start(window, cx);
-        cx.activate(true);
+        // A scripted UI check runs beside someone's work, so it leaves their keyboard where it is.
+        #[cfg(feature = "snapshot")]
+        let scripted = std::env::var_os("SOMME_SCRIPT").is_some();
+        #[cfg(not(feature = "snapshot"))]
+        let scripted = false;
+        if !scripted {
+            cx.activate(true);
+        }
     });
     Ok(())
 }
