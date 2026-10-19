@@ -54,6 +54,8 @@ impl Look {
         s.font_size = self.font_size;
         s.ui_font_size = self.ui_font_size;
         s.line_height = self.line_height;
+        // Another device may still have a theme this version dropped.
+        s.replace_retired_themes();
     }
 }
 

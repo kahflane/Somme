@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 const FILE_NAME: &str = "desktop-settings.json";
 
+/// Themes Somme no longer has, and the ones that took their place.
+const RETIRED_THEMES: &[(&str, &str)] = &[("Termius", "Somme Dark")];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum CursorShapeSetting {
@@ -144,10 +147,21 @@ impl Settings {
     }
 
     pub fn load(dir: &Path) -> Self {
-        std::fs::read_to_string(dir.join(FILE_NAME))
+        let mut settings: Self = std::fs::read_to_string(dir.join(FILE_NAME))
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings.replace_retired_themes();
+        settings
+    }
+
+    /// Swaps a chosen theme Somme no longer has for the one that took its place.
+    pub fn replace_retired_themes(&mut self) {
+        for name in [&mut self.dark_theme, &mut self.light_theme, &mut self.terminal_theme] {
+            if let Some((_, now)) = RETIRED_THEMES.iter().find(|(old, _)| *old == name.as_str()) {
+                *name = (*now).to_owned();
+            }
+        }
     }
 
     pub fn get(cx: &App) -> &Self {
@@ -170,5 +184,22 @@ impl Settings {
             }
         }
         cx.refresh_windows();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_retired_theme_becomes_the_one_in_its_place() {
+        let mut settings = Settings {
+            dark_theme: "Termius".to_owned(),
+            terminal_theme: "Termius".to_owned(),
+            ..Settings::default()
+        };
+        settings.replace_retired_themes();
+        assert_eq!((settings.dark_theme.as_str(), settings.terminal_theme.as_str()), ("Somme Dark", "Somme Dark"));
+        assert_eq!(settings.light_theme, Settings::default().light_theme);
     }
 }
