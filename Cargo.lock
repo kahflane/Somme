@@ -9259,7 +9259,7 @@ checksum = "c4fdfe13e1c42e45f497416afb8dc4e783bf0e25b7be9077c1c77c5fb14cb998"
 
 [[package]]
 name = "somme-application"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -9274,7 +9274,7 @@ dependencies = [
 
 [[package]]
 name = "somme-cloud"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9301,7 +9301,7 @@ dependencies = [
 
 [[package]]
 name = "somme-desktop"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -9347,7 +9347,7 @@ dependencies = [
 
 [[package]]
 name = "somme-domain"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -9357,7 +9357,7 @@ dependencies = [
 
 [[package]]
 name = "somme-infrastructure"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "arc-swap",
  "argon2 0.5.3",
