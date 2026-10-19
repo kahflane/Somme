@@ -679,6 +679,8 @@ impl Workspace {
                 EditorPaneEvent::Empty => workspace.remove_tab(id, window, cx),
                 EditorPaneEvent::FilesChanged => workspace.save_open_files(cx),
                 EditorPaneEvent::OpenCommit(dir, sha) => workspace.open_changes(dir.clone(), Some(sha.clone()), window, cx),
+                // A tab of its own has no buttons for these.
+                EditorPaneEvent::Minimize | EditorPaneEvent::ToggleMaximize => {}
             }),
         ];
         self.tabs.push(Tab {

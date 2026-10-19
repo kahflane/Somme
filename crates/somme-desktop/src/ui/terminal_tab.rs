@@ -85,6 +85,16 @@ impl PaneNode {
     }
 }
 
+/// How the editor shows beside the terminals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorShow {
+    Beside,
+    /// Filling the tab, with the terminals kept behind it.
+    Maximized,
+    /// Put away in the bar under the terminals.
+    Minimized,
+}
+
 pub enum TerminalTabEvent {
     Changed,
     Empty,
@@ -108,6 +118,7 @@ pub struct TerminalTab {
     subscriptions: Vec<(EntityId, Subscription)>,
     /// Files opened from the terminal, shown on the right.
     editor: Option<(Entity<EditorPane>, Subscription)>,
+    editor_show: EditorShow,
     /// Pull requests or issues of the shell's GitHub repository, on the right.
     github: Option<(Entity<GitHubPanel>, Subscription)>,
     /// The commit graph of the shell's repository, on the right in place of the GitHub panel.
@@ -141,6 +152,7 @@ impl TerminalTab {
             services,
             subscriptions: Vec::new(),
             editor: None,
+            editor_show: EditorShow::Beside,
             github: None,
             graph: None,
             explorer: None,
@@ -253,6 +265,7 @@ impl TerminalTab {
                 return;
             }
             let open = tab.update_in(cx, |tab, window, cx| {
+                tab.bring_back_editor(cx);
                 tab.editor.as_ref().is_some_and(|(pane, _)| {
                     pane.update(cx, |pane, cx| {
                         let open = pane.show_open(&path, &disk, window, cx);
@@ -310,18 +323,49 @@ impl TerminalTab {
             Some((pane, _)) => pane.clone(),
             None => {
                 let pane = cx.new(EditorPane::new);
-                let subscription = cx.subscribe_in(&pane, window, |tab, _, event, window, cx| match event {
+                let subscription = cx.subscribe_in(&pane, window, |tab, pane, event, window, cx| match event {
                     EditorPaneEvent::Empty => {
                         tab.editor = None;
+                        tab.editor_show = EditorShow::Beside;
                         window.focus(&tab.active.focus_handle(cx), cx);
                         cx.notify();
                     }
                     EditorPaneEvent::FilesChanged => {}
                     EditorPaneEvent::OpenCommit(dir, sha) => cx.emit(TerminalTabEvent::OpenCommit(dir.clone(), sha.clone())),
+                    EditorPaneEvent::Minimize => tab.show_editor(EditorShow::Minimized, window, cx),
+                    EditorPaneEvent::ToggleMaximize => {
+                        let maximized = pane.read(cx).maximized;
+                        tab.show_editor(if maximized { EditorShow::Beside } else { EditorShow::Maximized }, window, cx);
+                    }
                 });
                 self.editor = Some((pane.clone(), subscription));
                 pane
             }
+        }
+    }
+
+    /// Shows the editor beside the terminals, filling the tab, or put away.
+    fn show_editor(&mut self, show: EditorShow, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane, _)) = &self.editor else { return };
+        self.editor_show = show;
+        pane.update(cx, |pane, cx| {
+            pane.maximized = show == EditorShow::Maximized;
+            cx.notify();
+        });
+        if show == EditorShow::Minimized {
+            window.focus(&self.active.focus_handle(cx), cx);
+        } else {
+            window.focus(&pane.focus_handle(cx), cx);
+        }
+        cx.emit(TerminalTabEvent::Changed);
+        cx.notify();
+    }
+
+    /// Puts a minimized editor back beside the terminals, for a file opened in it.
+    fn bring_back_editor(&mut self, cx: &mut Context<Self>) {
+        if self.editor_show == EditorShow::Minimized {
+            self.editor_show = EditorShow::Beside;
+            cx.notify();
         }
     }
 
@@ -715,9 +759,29 @@ impl TerminalTab {
             .into_any_element()
     }
 
-    /// The minimized panes. A click brings one back.
+    /// The minimized panes and editor. A click brings one back.
     fn render_minimized(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let editor = self.editor.as_ref().filter(|_| self.editor_show == EditorShow::Minimized).map(|(pane, _)| {
+            let pane = pane.read(cx);
+            let more = pane.file_count().saturating_sub(1);
+            let title = if more > 0 { format!("{} +{more}", pane.title()) } else { pane.title().to_string() };
+            h_flex()
+                .id("editor-minimized")
+                .h(px(22.))
+                .max_w(px(240.))
+                .px_2()
+                .gap_1p5()
+                .items_center()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(theme.foreground.opacity(0.05))
+                .hover(|chip| chip.bg(theme.foreground.opacity(0.1)))
+                .child(Icon::new(Lucide::FileCode).size(px(12.)))
+                .child(div().min_w_0().truncate().child(title))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Restore").build(window, cx))
+                .on_click(cx.listener(|tab, _, window, cx| tab.show_editor(EditorShow::Beside, window, cx)))
+        });
         let chips = self.minimized.iter().map(|view| {
             let title = view.read(cx).session.read(cx).title();
             let restore = view.clone();
@@ -747,6 +811,7 @@ impl TerminalTab {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.muted_foreground)
+            .children(editor)
             .children(chips)
     }
 }
@@ -764,17 +829,20 @@ impl Render for TerminalTab {
             Some(view) => Some(self.render_pane(view, cx)),
             None => self.render_node(&self.root, "0".into(), cx),
         };
+        let editor_away = self.editor.is_some() && self.editor_show == EditorShow::Minimized;
         let terminals = v_flex()
             .size_full()
             .child(div().flex_1().min_h_0().children(panes))
-            .when(!self.minimized.is_empty(), |col| col.child(self.render_minimized(cx)))
+            .when(!self.minimized.is_empty() || editor_away, |col| col.child(self.render_minimized(cx)))
             .into_any_element();
         let side = match (&self.github, &self.graph) {
             (Some((github, _)), _) => Some(AnyView::from(github.clone())),
             (None, Some((graph, _))) => Some(AnyView::from(graph.clone())),
             (None, None) => None,
         };
-        let body = match (&self.editor, side) {
+        let editor = self.editor.as_ref().filter(|_| !editor_away);
+        let body = match (editor, side) {
+            (Some((editor, _)), _) if self.editor_show == EditorShow::Maximized => editor.clone().into_any_element(),
             (None, None) => terminals,
             (Some((editor, _)), None) => h_resizable("editor-split")
                 .child(resizable_panel().child(terminals))

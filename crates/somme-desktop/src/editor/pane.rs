@@ -14,6 +14,7 @@ use gpui_kit::component::input::{
     Copy, Cut, Editor, EditorState, Enter, GoToDefinition, InputEvent, Paste, Position, Rope, RopeExt as _, Search,
     SelectAll,
 };
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
@@ -33,7 +34,7 @@ use crate::settings::Settings;
 use crate::editor::sudo;
 use crate::editor::tools::{self, Tool};
 use crate::terminal::disk::{Disk, DiskError};
-use crate::ui::common::{Lucide, ago};
+use crate::ui::common::{Lucide, ago, copy_text};
 use crate::ui::native;
 
 mod find;
@@ -73,6 +74,33 @@ pub enum EditorPaneEvent {
     FilesChanged,
     /// Show what a commit changed, in the repo at this folder.
     OpenCommit(PathBuf, String),
+    /// Put the editor away in the bar under the terminals.
+    Minimize,
+    /// Fill the tab with the editor, or put it back beside the terminals.
+    ToggleMaximize,
+}
+
+/// Which files a tab's menu closes.
+#[derive(Clone, Copy)]
+enum CloseFiles {
+    Others,
+    Left,
+    Right,
+    Saved,
+    All,
+}
+
+impl CloseFiles {
+    /// Whether file `ix` goes, for the menu of the tab at `clicked`.
+    fn picks(self, ix: usize, clicked: usize, dirty: bool) -> bool {
+        match self {
+            Self::Others => ix != clicked,
+            Self::Left => ix < clicked,
+            Self::Right => ix > clicked,
+            Self::Saved => !dirty,
+            Self::All => true,
+        }
+    }
 }
 
 /// Whether a language server helps with a file.
@@ -293,6 +321,8 @@ pub struct EditorPane {
     active: usize,
     /// Fills a tab of its own, instead of sitting beside terminals.
     own_tab: bool,
+    /// Fills the terminal tab it sits in, with the terminals behind it.
+    pub maximized: bool,
     focus_handle: FocusHandle,
     /// How the last Markdown file was shown, for the next one.
     markdown_view: View,
@@ -320,6 +350,7 @@ impl EditorPane {
             files: Vec::new(),
             active: 0,
             own_tab: false,
+            maximized: false,
             focus_handle: cx.focus_handle(),
             markdown_view: View::Preview,
             seen_installs: Installer::global(cx).map_or(0, |installer| installer.read(cx).finished),
@@ -560,6 +591,11 @@ impl EditorPane {
 
     pub fn holds(&self, path: &Path) -> bool {
         self.files.iter().any(|file| file.path == path && file.disk.is_local())
+    }
+
+    /// How many files are open, on this computer or a server.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
     }
 
     /// The name of the file in front.
@@ -956,6 +992,64 @@ impl EditorPane {
         self.activate(self.active, window, cx);
     }
 
+    /// Closes the files `which` picks, for the menu of the tab at `clicked`.
+    /// Files with unsaved changes are asked about once, together.
+    fn close_files(&mut self, clicked: usize, which: CloseFiles, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = |dirty: bool| -> Vec<EntityId> {
+            let files = self.files.iter().enumerate();
+            files
+                .filter(|(ix, file)| file.dirty == dirty && which.picks(*ix, clicked, file.dirty))
+                .map(|(_, file)| file.body.id())
+                .collect()
+        };
+        let (saved, unsaved) = (picked(false), picked(true));
+        let clicked = self.files.get(clicked).map(|file| file.body.id());
+        if !saved.is_empty() {
+            self.close_ids(&saved, clicked, window, cx);
+        }
+        if unsaved.is_empty() {
+            return;
+        }
+        let title = match &unsaved[..] {
+            [id] => {
+                let name = self.files.iter().find(|file| file.body.id() == *id).map(OpenFile::name).unwrap_or_default();
+                format!("Close {name} without saving?")
+            }
+            many => format!("Close {} files without saving?", many.len()),
+        };
+        let pane = cx.entity().downgrade();
+        native::confirm(
+            &title,
+            "Your changes will be lost.",
+            "Close Without Saving",
+            move |window, cx| {
+                let _ = pane.update(cx, |pane, cx| pane.close_ids(&unsaved, clicked, window, cx));
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Closes files by their editors' ids. The file in front stays there;
+    /// when it closed, the `clicked` one comes forward.
+    fn close_ids(&mut self, ids: &[EntityId], clicked: Option<EntityId>, window: &mut Window, cx: &mut Context<Self>) {
+        let front = self.files.get(self.active).map(|file| file.body.id());
+        for file in self.files.extract_if(.., |file| ids.contains(&file.body.id())).collect::<Vec<_>>() {
+            file.forget();
+        }
+        if self.files.is_empty() {
+            cx.emit(EditorPaneEvent::Empty);
+            return;
+        }
+        cx.emit(EditorPaneEvent::FilesChanged);
+        let next = [front, clicked]
+            .into_iter()
+            .flatten()
+            .find_map(|id| self.files.iter().position(|file| file.body.id() == id))
+            .unwrap_or(self.active.min(self.files.len() - 1));
+        self.activate(next, window, cx);
+    }
+
     /// Puts in the suggestion picked with Enter. The menu takes the key, but
     /// the editor lets it go on to type a new line too, so it stops here.
     fn pick_suggestion(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
@@ -976,8 +1070,13 @@ impl EditorPane {
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let count = self.files.len();
+        let any_saved = self.files.iter().any(|file| !file.dirty);
         let tabs = self.files.iter().enumerate().map(|(ix, file)| {
             let active = ix == self.active;
+            let pane = cx.entity().downgrade();
+            let path = file.path.to_string_lossy().into_owned();
+            let scratch = file.scratch;
             h_flex()
                 .id(("file-tab", ix))
                 .group("file-tab")
@@ -1033,17 +1132,71 @@ impl EditorPane {
                     MouseButton::Middle,
                     cx.listener(move |pane, _, window, cx| pane.request_close(ix, window, cx)),
                 )
+                .context_menu(move |menu, _, _| {
+                    let close_item = |label: &'static str, which: CloseFiles, enabled: bool| {
+                        let pane = pane.clone();
+                        PopupMenuItem::new(label).disabled(!enabled).on_click(move |_, window, cx| {
+                            let _ = pane.update(cx, |pane, cx| pane.close_files(ix, which, window, cx));
+                        })
+                    };
+                    let close = pane.clone();
+                    let path = path.clone();
+                    menu.item(PopupMenuItem::new("Close").icon(IconName::Close).on_click(move |_, window, cx| {
+                        let _ = close.update(cx, |pane, cx| pane.request_close(ix, window, cx));
+                    }))
+                    .item(close_item("Close Others", CloseFiles::Others, count > 1))
+                    .item(close_item("Close to the Left", CloseFiles::Left, ix > 0))
+                    .item(close_item("Close to the Right", CloseFiles::Right, ix + 1 < count))
+                    .item(close_item("Close Saved", CloseFiles::Saved, any_saved))
+                    .item(close_item("Close All", CloseFiles::All, true))
+                    .when(!scratch, |menu| {
+                        menu.separator().item(
+                            PopupMenuItem::new("Copy Path")
+                                .icon(Icon::new(Lucide::Copy))
+                                .on_click(move |_, _, cx| copy_text(path.clone(), cx)),
+                        )
+                    })
+                })
         });
+        let maximized = self.maximized;
         h_flex()
-            .id("file-tabs")
             .h(px(32.))
             .flex_none()
             .w_full()
-            .overflow_x_scroll()
             .bg(theme.foreground.opacity(0.03))
             .border_b_1()
             .border_color(theme.border)
-            .children(tabs)
+            .child(h_flex().id("file-tabs").h_full().flex_1().min_w_0().overflow_x_scroll().children(tabs))
+            // Beside terminals, the editor can be put away or fill the tab, as panes can.
+            .when(!self.own_tab, |bar| {
+                bar.child(
+                    h_flex()
+                        .flex_none()
+                        .px_1()
+                        .gap_0p5()
+                        .items_center()
+                        .when(!maximized, |buttons| {
+                            buttons.child(
+                                Button::new("editor-minimize")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(Lucide::Minus))
+                                    .tab_stop(false)
+                                    .tooltip("Minimize")
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(EditorPaneEvent::Minimize))),
+                            )
+                        })
+                        .child(
+                            Button::new("editor-maximize")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(if maximized { Lucide::Minimize2 } else { Lucide::Maximize2 }))
+                                .tab_stop(false)
+                                .tooltip(if maximized { "Restore" } else { "Maximize" })
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(EditorPaneEvent::ToggleMaximize))),
+                        ),
+                )
+            })
     }
 
     fn render_status(&self, file: &OpenFile, cx: &Context<Self>) -> impl IntoElement {
@@ -1498,6 +1651,17 @@ fn paint_line_blame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tabs_menu_closes_the_files_around_it() {
+        // Five files, the one at 2 clicked, the one at 3 unsaved.
+        let picked = |which: CloseFiles| -> Vec<usize> { (0..5).filter(|&ix| which.picks(ix, 2, ix == 3)).collect() };
+        assert_eq!(picked(CloseFiles::Others), [0, 1, 3, 4]);
+        assert_eq!(picked(CloseFiles::Left), [0, 1]);
+        assert_eq!(picked(CloseFiles::Right), [3, 4]);
+        assert_eq!(picked(CloseFiles::Saved), [0, 1, 2, 4]);
+        assert_eq!(picked(CloseFiles::All), [0, 1, 2, 3, 4]);
+    }
 
     #[test]
     fn refuses_binary_and_non_utf8_files() {
