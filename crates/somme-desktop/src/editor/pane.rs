@@ -1396,7 +1396,7 @@ impl Render for EditorPane {
                         .appearance(false)
                         .bordered(false)
                         .size_full()
-                        .font_family(settings.font_family.clone())
+                        .font_family(settings.mono_font())
                         .text_size(px(settings.font_size.clamp(6., 72.)))
                         .into_any_element(),
                     Body::Big(editor) => editor.clone().into_any_element(),
@@ -1410,7 +1410,7 @@ impl Render for EditorPane {
                             None => who_when(&change),
                         };
                         let editor = editor.clone();
-                        let (family, size) = (settings.font_family.clone(), px(settings.font_size.clamp(6., 72.)));
+                        let (family, size) = (settings.mono_font(), px(settings.font_size.clamp(6., 72.)));
                         let color = theme.muted_foreground.opacity(0.7);
                         div().relative().size_full().overflow_hidden().child(body).child(
                             canvas(

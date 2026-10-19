@@ -413,7 +413,7 @@ impl MarkdownPreview {
     fn render_block(&mut self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let block = self.blocks[ix].clone();
-        let mono = Settings::get(cx).font_family.clone();
+        let mono = Settings::get(cx).mono_font();
         let body = match &block.kind {
             Kind::Markdown(text) => {
                 let text = if self.definitions.is_empty() {
@@ -482,7 +482,7 @@ impl Render for MarkdownPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let settings = Settings::get(cx);
-        let mono = settings.font_family.clone();
+        let mono = settings.mono_font();
         let size = px(settings.font_size.clamp(6., 72.));
         let editing = self.editing.as_ref().map(|editing| (editing.range.clone(), editing.input.clone()));
         let mut children = Vec::new();
@@ -540,7 +540,7 @@ impl Render for MarkdownPreview {
     }
 }
 
-fn editor(input: &Entity<TextareaState>, theme: &Theme, mono: String, size: Pixels) -> impl IntoElement {
+fn editor(input: &Entity<TextareaState>, theme: &Theme, mono: SharedString, size: Pixels) -> impl IntoElement {
     div()
         .w_full()
         .px_2()

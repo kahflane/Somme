@@ -133,6 +133,7 @@ pub(crate) fn monospace_fonts() -> Vec<SharedString> {
         .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
         .filter(|name| !name.starts_with('.') && !name.contains("Bitmap"))
         .collect();
+    names.push(crate::fonts::BUNDLED.to_owned());
     names.sort_by_key(|n| n.to_lowercase());
     names.dedup();
     names.into_iter().map(SharedString::from).collect()
@@ -198,6 +199,12 @@ const AUTO_LOCK: &[(u32, &str)] = &[
 fn appearance_page(fonts: &[SharedString], cx: &App) -> SettingPage {
     let mut font_options: Vec<(SharedString, SharedString)> = fonts.iter().map(|f| (f.clone(), f.clone())).collect();
     let current: SharedString = Settings::get(cx).font_family.clone().into();
+    // The font follows the account, so it may come from a computer that has it.
+    let font_note = if crate::fonts::installed(&current) {
+        "Only fixed-width fonts are listed.".to_owned()
+    } else {
+        format!("This computer doesn't have {current}, so Somme shows {}.", crate::fonts::BUNDLED)
+    };
     if !fonts.contains(&current) {
         font_options.insert(0, (current.clone(), current));
     }
@@ -274,7 +281,7 @@ fn appearance_page(fonts: &[SharedString], cx: &App) -> SettingPage {
                         "Font",
                         font_field(font_options).default_value(SharedString::from(defaults.font_family.clone())),
                     )
-                    .description("Only fixed-width fonts are listed."),
+                    .description(font_note),
                 )
                 .item(
                     SettingItem::new(
@@ -732,7 +739,7 @@ fn credits_page() -> SettingPage {
                 });
                 v_flex()
                     .w_full()
-                    .child(heading("Icons, logos and models".into()))
+                    .child(heading("Fonts, icons, logos and models".into()))
                     .children(artwork)
                     .child(heading("Libraries".into()))
                     .child(window.use_keyed_state("credits-list", cx, |window, cx| CreditsList::new(window, cx)))

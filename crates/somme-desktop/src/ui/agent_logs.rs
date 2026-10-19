@@ -203,7 +203,7 @@ impl TableDelegate for RunTable {
             "host" => div().truncate().child(SharedString::from(run.host.name.clone())).into_any_element(),
             "script" => div()
                 .truncate()
-                .font_family(Settings::get(cx).font_family.clone())
+                .font_family(Settings::get(cx).mono_font())
                 .child(first_line(&run.script))
                 .into_any_element(),
             "agent" => div().truncate().text_color(muted).child(SharedString::from(run.agent.clone())).into_any_element(),

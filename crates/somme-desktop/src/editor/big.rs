@@ -1149,7 +1149,7 @@ impl Render for BigText {
             anchor: self.anchor,
             focused: self.focus_handle.is_focused(window),
             query: self.query(cx),
-            font: terminal_font(&settings.font_family),
+            font: terminal_font(&settings.mono_font()),
             font_size,
             line_height: (font_size * 1.5).round(),
             colors: Colors {

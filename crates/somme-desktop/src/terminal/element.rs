@@ -31,12 +31,12 @@ const FALLBACK_FONTS: &[&str] = &[
 ];
 
 pub fn terminal_font(family: &str) -> Font {
+    // The bundled font first, so letters the chosen font lacks still fit the grid.
+    let fallbacks = std::iter::once(crate::fonts::BUNDLED).chain(FALLBACK_FONTS.iter().copied());
     Font {
         family: SharedString::from(family.to_owned()),
         features: FontFeatures::disable_ligatures(),
-        fallbacks: Some(FontFallbacks::from_fonts(
-            FALLBACK_FONTS.iter().map(|name| (*name).to_owned()).collect(),
-        )),
+        fallbacks: Some(FontFallbacks::from_fonts(fallbacks.map(str::to_owned).collect())),
         weight: FontWeight::NORMAL,
         style: FontStyle::Normal,
     }
@@ -44,7 +44,7 @@ pub fn terminal_font(family: &str) -> Font {
 
 /// Measures one cell of the terminal grid for the current font settings.
 pub fn cell_metrics(settings: &Settings, window: &Window) -> (Font, Pixels, Pixels, Pixels) {
-    let font = terminal_font(&settings.font_family);
+    let font = terminal_font(&settings.mono_font());
     let font_size = px(settings.font_size.clamp(6., 72.));
     let text_system = window.text_system();
     let font_id = text_system.resolve_font(&font);

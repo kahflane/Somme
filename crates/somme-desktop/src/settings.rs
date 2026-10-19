@@ -97,7 +97,7 @@ impl Default for Settings {
             light_theme: "Somme Light".to_owned(),
             side_panel: false,
             terminal_matches_theme: true,
-            font_family: default_font().to_owned(),
+            font_family: crate::fonts::BUNDLED.to_owned(),
             font_everywhere: false,
             font_size: 12.,
             ui_font_size: 14.,
@@ -129,16 +129,6 @@ impl Default for Settings {
     }
 }
 
-fn default_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Menlo"
-    } else if cfg!(target_os = "windows") {
-        "Consolas"
-    } else {
-        "DejaVu Sans Mono"
-    }
-}
-
 impl Global for Settings {}
 
 /// Where the settings file lives, kept next to the vault database.
@@ -147,6 +137,12 @@ pub struct SettingsFile(pub PathBuf);
 impl Global for SettingsFile {}
 
 impl Settings {
+    /// The font terminals and code are drawn in: the chosen one, or the one
+    /// Somme carries when this computer doesn't have it.
+    pub fn mono_font(&self) -> gpui_kit::SharedString {
+        crate::fonts::or_bundled(&self.font_family)
+    }
+
     pub fn load(dir: &Path) -> Self {
         std::fs::read_to_string(dir.join(FILE_NAME))
             .ok()

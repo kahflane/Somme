@@ -92,7 +92,7 @@ fn scheme_card(scheme: &'static TerminalTheme, cx: &App) -> Stateful<Div> {
         .p_2()
         .gap_0p5()
         .bg(to_hsla(scheme.background))
-        .font_family(SharedString::from(Settings::get(cx).font_family.clone()))
+        .font_family(Settings::get(cx).mono_font())
         .text_size(px(10.))
         .line_height(px(13.))
         .child(h_flex().child(word(ansi(2), "user@host")).child(word(text, ":~$ ls")))

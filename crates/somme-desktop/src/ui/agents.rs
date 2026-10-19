@@ -108,7 +108,7 @@ fn code_box(id: &'static str, text: String, cx: &App) -> impl IntoElement {
                 .flex_1()
                 .min_w_0()
                 .text_xs()
-                .font_family(Settings::get(cx).font_family.clone())
+                .font_family(Settings::get(cx).mono_font())
                 .child(SharedString::from(text)),
         )
         .child(

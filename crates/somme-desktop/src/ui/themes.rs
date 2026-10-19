@@ -327,7 +327,7 @@ pub fn choose(theme: &AppTheme, cx: &mut App) {
 /// Runs whenever settings change, so it does nothing when the fonts are already right.
 pub fn apply_font(cx: &mut App) {
     let settings = Settings::get(cx);
-    let mono = SharedString::from(settings.font_family.clone());
+    let mono = settings.mono_font();
     let ui = if settings.font_everywhere { mono.clone() } else { cx.global::<SystemFont>().0.clone() };
     let size = px(settings.ui_font_size.clamp(12., 24.));
     let theme = Theme::global(cx);

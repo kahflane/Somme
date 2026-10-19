@@ -204,7 +204,7 @@ impl Element for BlocksElement {
         let settings = Settings::get(cx).clone();
         let theme = colors::active_theme(cx);
         let (font, font_size, cell_width, line_height) = cell_metrics(&settings, window);
-        let small_font = terminal_font(&settings.font_family);
+        let small_font = terminal_font(&settings.mono_font());
         let small_size = (font_size * 0.85).round();
         let bold_font = Font {
             weight: FontWeight::SEMIBOLD,

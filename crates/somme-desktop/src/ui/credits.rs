@@ -37,6 +37,7 @@ pub struct Library {
 
 /// Icons, logos and speech models, which are not Rust libraries.
 pub const ARTWORK: &[(&str, &str, &str)] = &[
+    ("JetBrains Mono font", "OFL-1.1", "https://github.com/JetBrains/JetBrainsMono"),
     ("Lucide icons", "ISC", "https://lucide.dev"),
     ("Simple Icons, for system logos", "CC0-1.0", "https://simpleicons.org"),
     ("Whisper speech model, by OpenAI", "MIT", "https://github.com/openai/whisper"),

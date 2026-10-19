@@ -361,7 +361,7 @@ impl EditorPane {
         let outcome = bar.outcome.as_ref()?;
         let theme = cx.theme();
         let settings = Settings::get(cx);
-        let mono = settings.font_family.clone();
+        let mono = settings.mono_font();
         let size = px(settings.font_size.clamp(6., 72.));
         let body = match outcome {
             Err(error) => div()

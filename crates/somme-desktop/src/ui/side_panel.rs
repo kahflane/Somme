@@ -233,7 +233,7 @@ impl SidePanel {
             })
             .collect();
         let shown = matches.len();
-        let mono = SharedString::from(Settings::get(cx).font_family.clone());
+        let mono = Settings::get(cx).mono_font();
 
         let rows = matches.into_iter().enumerate().map(|(ix, snippet)| {
             let first_line = snippet.script.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_owned();

@@ -671,7 +671,7 @@ impl TerminalView {
                 .border_1()
                 .border_color(foreground.opacity(0.12))
                 .bg(foreground.opacity(0.04))
-                .font_family(settings.font_family.clone())
+                .font_family(settings.mono_font())
                 .text_size(px(settings.font_size.clamp(6., 72.) * 0.9))
                 .children(rows)
                 .when(more > 0, |list| {
@@ -723,7 +723,7 @@ impl TerminalView {
                 .child(
                     v_flex()
                         .gap_0p5()
-                        .font_family(settings.font_family.clone())
+                        .font_family(settings.mono_font())
                         .text_size(px(settings.font_size.clamp(6., 72.) * 0.9))
                         .children(rows),
                 )
@@ -764,7 +764,7 @@ impl TerminalView {
                     .child(
                         Textarea::new(&prompt.editor)
                             .appearance(false)
-                            .font_family(settings.font_family.clone())
+                            .font_family(settings.mono_font())
                             .text_size(font_size)
                             .text_color(foreground),
                     )
@@ -778,7 +778,7 @@ impl TerminalView {
                                 .right(Size::Medium.input_px())
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                .font_family(settings.font_family.clone())
+                                .font_family(settings.mono_font())
                                 .text_size(font_size)
                                 .line_height(rems(1.25))
                                 .child(div().flex_none().text_color(transparent_black()).child(typed))

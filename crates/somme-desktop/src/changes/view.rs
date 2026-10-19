@@ -401,7 +401,7 @@ impl ChangesView {
             Some(Row::Hunk(f, h)) => row
                 .pl(number_width * 2.)
                 .bg(theme.info.opacity(0.08))
-                .font_family(settings.font_family.clone())
+                .font_family(settings.mono_font())
                 .text_size(px(font_size))
                 .text_color(theme.muted_foreground)
                 .child(div().px_2().child(files[f].hunks[h].header.clone()))
@@ -447,7 +447,7 @@ impl ChangesView {
                 };
                 let text = expand_tabs(&line.text);
                 let colors = self.line_colors(f, h, l, text.len(), cx);
-                row.font_family(settings.font_family.clone())
+                row.font_family(settings.mono_font())
                     .text_size(px(font_size))
                     .when_some(tint, |el, tint| el.bg(tint.opacity(0.14)))
                     .child(number(line.old))

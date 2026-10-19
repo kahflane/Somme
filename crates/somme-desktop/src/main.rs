@@ -3,6 +3,7 @@ mod automation;
 mod changes;
 mod download;
 mod editor;
+mod fonts;
 mod github;
 mod graph;
 mod host_os;
@@ -140,6 +141,7 @@ fn main() -> anyhow::Result<()> {
         // Windows and Linux name the app in notifications by this.
         cx.set_app_identity("app.somme.desktop", ui::common::APP_NAME);
         gpui_kit::init(cx);
+        fonts::init(cx);
         ui::themes::register(cx);
         terminal::view::init(cx);
         editor::pane::init(cx);

@@ -468,7 +468,7 @@ impl TerminalView {
                 .child(
                     v_flex()
                         .gap_0p5()
-                        .font_family(settings.font_family.clone())
+                        .font_family(settings.mono_font())
                         .text_size(text_size)
                         .on_scroll_wheel(cx.listener(move |view, event: &ScrollWheelEvent, _, cx| {
                             cx.stop_propagation();
