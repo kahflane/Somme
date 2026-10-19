@@ -3,6 +3,7 @@
 
 pub mod big;
 pub mod blame;
+pub mod complete;
 pub mod jq;
 pub mod language;
 pub mod lsp;

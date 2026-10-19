@@ -11,7 +11,7 @@ use std::time::Duration;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::highlighter::LanguageRegistry;
 use gpui_kit::component::input::{
-    Copy, Cut, Editor, EditorState, GoToDefinition, InputEvent, Paste, Position, Rope, RopeExt as _, Search,
+    Copy, Cut, Editor, EditorState, Enter, GoToDefinition, InputEvent, Paste, Position, Rope, RopeExt as _, Search,
     SelectAll,
 };
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex};
@@ -630,10 +630,7 @@ impl EditorPane {
         };
         let uri = lsp::file_uri(path);
         client.open(&uri, language.lsp_id, editor.read(cx).text(), editor.downgrade());
-        let provider = Rc::new(DocProvider {
-            client: client.clone(),
-            uri: uri.clone(),
-        });
+        let provider = Rc::new(DocProvider::new(client.clone(), uri.clone(), editor.downgrade()));
         let pane = cx.entity().downgrade();
         let own_uri = uri.clone();
         editor.update(cx, |editor, _| {
@@ -957,6 +954,19 @@ impl EditorPane {
             self.active -= 1;
         }
         self.activate(self.active, window, cx);
+    }
+
+    /// Puts in the suggestion picked with Enter. The menu takes the key, but
+    /// the editor lets it go on to type a new line too, so it stops here.
+    fn pick_suggestion(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Body::Code(editor)) = self.files.get(self.active).map(|file| &file.body) else { return };
+        if !editor.read(cx).completion_menu_state().open {
+            return;
+        }
+        let picked = editor.update(cx, |editor, cx| editor.route_overlay_action(Box::new(action.clone()), window, cx));
+        if picked {
+            cx.stop_propagation();
+        }
     }
 
     /// Whether any open file has unsaved changes.
@@ -1357,6 +1367,7 @@ impl Render for EditorPane {
         v_flex()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
+            .capture_action(cx.listener(Self::pick_suggestion))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::on_close_file))
             // Reaches here from JSON files only; other files find with the editor's own bar.

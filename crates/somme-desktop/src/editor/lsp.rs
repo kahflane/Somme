@@ -19,10 +19,12 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::{App, AppContext as _, Global, Task, WeakEntity, Window};
 use lsp_types::{
-    CompletionContext, CompletionResponse, GotoDefinitionResponse, Hover, LocationLink, PublishDiagnosticsParams,
+    CompletionContext, CompletionItem, CompletionResponse, GotoDefinitionResponse, Hover, LocationLink,
+    PublishDiagnosticsParams,
 };
 use serde_json::{Value, json};
 
+use crate::editor::complete;
 use crate::editor::language::Language;
 use crate::editor::servers::{self, Package};
 use crate::settings::Settings;
@@ -420,12 +422,118 @@ impl Client {
 pub struct DocProvider {
     pub client: Rc<Client>,
     pub uri: String,
+    editor: WeakEntity<EditorState>,
+    /// The server's last suggestions, narrowed down as the word grows.
+    asked: Rc<RefCell<Option<Asked>>>,
+}
+
+/// Suggestions the server gave for the word starting at `start`.
+struct Asked {
+    start: usize,
+    /// The line before the word, to tell it is still the same spot.
+    before: String,
+    /// The word as last typed. Typing on adds to it.
+    word: String,
+    items: Rc<[CompletionItem]>,
+    /// The server has more, so it is asked again as the word grows.
+    incomplete: bool,
+}
+
+/// Where a word is being typed.
+#[derive(Clone)]
+struct Spot {
+    start: usize,
+    offset: usize,
+    before: String,
+    word: String,
+    typed: lsp_types::Range,
 }
 
 impl DocProvider {
+    pub fn new(client: Rc<Client>, uri: String, editor: WeakEntity<EditorState>) -> Self {
+        Self {
+            client,
+            uri,
+            editor,
+            asked: Rc::default(),
+        }
+    }
+
     fn position(&self, text: &Rope, offset: usize) -> Value {
         self.client.sync(&self.uri, text);
         json!({ "textDocument": { "uri": self.uri }, "position": text.offset_to_position(offset) })
+    }
+
+    /// Asks the server for suggestions at `spot`, and keeps them.
+    fn ask(
+        &self,
+        text: &Rope,
+        spot: &Spot,
+        context: Value,
+        cx: &mut App,
+    ) -> Task<Result<(Rc<[CompletionItem]>, Spot)>> {
+        let mut params = self.position(text, spot.offset);
+        params["context"] = context;
+        let answer = self.client.request("textDocument/completion", params);
+        let parsed = cx.background_spawn(async move {
+            anyhow::Ok(match serde_json::from_value::<Option<CompletionResponse>>(answer.await?)? {
+                Some(CompletionResponse::Array(items)) => (items, false),
+                Some(CompletionResponse::List(list)) => (list.items, list.is_incomplete),
+                None => (Vec::new(), false),
+            })
+        });
+        let (asked, spot) = (self.asked.clone(), spot.clone());
+        cx.spawn(async move |_| {
+            let (items, incomplete) = parsed.await?;
+            let items: Rc<[CompletionItem]> = items.into();
+            *asked.borrow_mut() = Some(Asked {
+                start: spot.start,
+                before: spot.before.clone(),
+                word: spot.word.clone(),
+                items: items.clone(),
+                incomplete,
+            });
+            Ok((items, spot))
+        })
+    }
+
+    /// Asks the server again for a word it had more suggestions for. The menu
+    /// shows the new ones if the word is still the same when they come.
+    fn ask_again(&self, text: &Rope, spot: Spot, cx: &mut App) {
+        let asked = self.ask(text, &spot, json!({ "triggerKind": 3 }), cx);
+        let editor = self.editor.clone();
+        cx.spawn(async move |cx| {
+            let Ok((items, spot)) = asked.await else { return };
+            let _ = editor.update(cx, |editor, cx| {
+                let menu = editor.completion_menu_state();
+                let text = editor.text();
+                let still = menu.open
+                    && editor.cursor() == spot.offset
+                    && spot.offset <= text.len()
+                    && text.is_char_boundary(spot.start)
+                    && text.is_char_boundary(spot.offset)
+                    && text.slice(spot.start..spot.offset) == spot.word.as_str();
+                if still {
+                    let (latch, query) = (menu.trigger_start_offset.unwrap_or(spot.start), menu.query.clone());
+                    editor.present_completion_items(latch, query, complete::narrow(&items, &spot.word, spot.typed), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Why the server is asked: a character like `.` was typed, or a word.
+    fn context(&self, text: &Rope, spot: &Spot) -> Value {
+        if spot.word.is_empty() {
+            let mut end: Vec<char> = text.chars_at(spot.offset).reversed().take(3).collect();
+            end.reverse();
+            let end: String = end.into_iter().collect();
+            let shared = self.client.shared.lock().expect("lsp state");
+            if let Some(trigger) = shared.triggers.iter().find(|trigger| end.ends_with(trigger.as_str())) {
+                return json!({ "triggerKind": 2, "triggerCharacter": trigger });
+            }
+        }
+        json!({ "triggerKind": 1 })
     }
 }
 
@@ -434,21 +542,42 @@ impl CompletionProvider for DocProvider {
         &self,
         text: &Rope,
         offset: usize,
-        trigger: CompletionContext,
+        _: CompletionContext,
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
-        let mut params = self.position(text, offset);
-        params["context"] = serde_json::to_value(trigger).unwrap_or(Value::Null);
-        let answer = self.client.request("textDocument/completion", params);
-        cx.background_spawn(async move {
-            let found = serde_json::from_value::<Option<CompletionResponse>>(answer.await?)?;
-            Ok(found.unwrap_or(CompletionResponse::Array(Vec::new())))
+        let start = complete::word_start(text, offset);
+        let spot = Spot {
+            start,
+            offset,
+            before: complete::line_before(text, start),
+            word: text.slice(start..offset).to_string(),
+            typed: lsp_types::Range::new(text.offset_to_position(start), text.offset_to_position(offset)),
+        };
+        // Typing on in the same word narrows what the server already gave,
+        // at once, so the menu stays put instead of waiting on the server.
+        let kept = self.asked.borrow_mut().as_mut().and_then(|asked| {
+            let same = asked.start == start && asked.before == spot.before && spot.word.starts_with(&asked.word);
+            same.then(|| {
+                asked.word.clone_from(&spot.word);
+                (asked.items.clone(), asked.incomplete)
+            })
+        });
+        if let Some((items, incomplete)) = kept {
+            if incomplete {
+                self.ask_again(text, spot.clone(), cx);
+            }
+            return Task::ready(Ok(CompletionResponse::Array(complete::narrow(&items, &spot.word, spot.typed))));
+        }
+        let asked = self.ask(text, &spot, self.context(text, &spot), cx);
+        cx.spawn(async move |_| {
+            let (items, spot) = asked.await?;
+            Ok(CompletionResponse::Array(complete::narrow(&items, &spot.word, spot.typed)))
         })
     }
 
     fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
-        if new_text.chars().last().is_some_and(|ch| ch.is_alphanumeric() || ch == '_') {
+        if new_text.chars().last().is_some_and(complete::is_word) {
             return true;
         }
         let shared = self.client.shared.lock().expect("lsp state");
