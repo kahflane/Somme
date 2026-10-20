@@ -52,6 +52,10 @@ pub struct AiSettings {
     pub write: bool,
     /// Building automations by chatting.
     pub builder: bool,
+    /// The builder may run commands that only look, on this computer and
+    /// saved servers, to see what is really there. What they show goes to
+    /// the LLM, with secrets taken out.
+    pub builder_looks: bool,
     /// Agent steps that run commands on their own.
     pub agent: bool,
     /// Agent steps may control this computer. Off until turned on by itself.
@@ -77,6 +81,7 @@ impl Default for AiSettings {
             decide: true,
             write: true,
             builder: true,
+            builder_looks: true,
             agent: true,
             computer: false,
             llm_base_url: String::new(),
@@ -86,7 +91,7 @@ impl Default for AiSettings {
             decide_model: String::new(),
             write_model: String::new(),
             agent_model: String::new(),
-            run_ai_calls: 30,
+            run_ai_calls: 80,
         }
     }
 }

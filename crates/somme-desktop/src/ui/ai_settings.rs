@@ -17,7 +17,7 @@ use crate::ai::{self, KeyName};
 use crate::runtime;
 use crate::settings::Settings;
 use crate::store::Store;
-use crate::ui::common::{APP_NAME, Lucide};
+use crate::ui::common::{APP_NAME, Lucide, ok_color};
 use crate::ui::fields::Choice;
 use crate::ui::settings_page::switch;
 
@@ -52,7 +52,7 @@ pub fn ai_page(cx: &App) -> SettingPage {
         .group(
             SettingGroup::new()
                 .title("LLM")
-                .description("Any server that speaks the OpenAI API. A server on this computer, like Ollama, keeps everything here.")
+                .description("Pick a provider, or any server that speaks the OpenAI API. A server on this computer, like Ollama, keeps everything here.")
                 .item(
                     SettingItem::render(|_, window, cx| {
                         div().w_full().child(window.use_keyed_state("ai-llm", cx, |window, cx| KeySetup::new(KeyName::Llm, window, cx)))
@@ -80,7 +80,14 @@ pub fn ai_page(cx: &App) -> SettingPage {
                         .description("Describe an automation and the LLM puts its steps on the canvas. Nothing runs until you press Run.")
                         .disabled(off),
                 )
+                .item(
+                    SettingItem::new("Let the builder look around", switch(|s| s.ai.builder_looks, |s, v| s.ai.builder_looks = v))
+                        .description("While building, it may run commands that only look, like listing folders and their sizes, on this computer and your servers, so its steps fit the real machine. What they show goes to the LLM with secrets taken out.")
+                        .disabled(off),
+                )
                 .item(model_item("Model for building", |s| &s.ai.builder_model, |s, v| s.ai.builder_model = v).disabled(off))
+                .item(SettingItem::render(|_, _, cx| remembered(cx)).disabled(off))
+                .item(SettingItem::render(|_, _, cx| skills(cx)).disabled(off))
                 .item(
                     SettingItem::new("Decide steps", switch(|s| s.ai.decide, |s, v| s.ai.decide = v))
                         .description("Yes or no questions about a step's output. Jev answers first, then the LLM.")
@@ -127,6 +134,60 @@ pub fn ai_page(cx: &App) -> SettingPage {
 
 /// Whether agents can use this computer's screen, and on macOS a button to
 /// ask the system for access.
+/// What the builder learned from this user, and a way to forget it.
+fn remembered(cx: &App) -> gpui_kit::Div {
+    let data_dir = Store::services(cx).data_dir.clone();
+    let facts = crate::automations::memory::load(&data_dir);
+    let muted = cx.theme().muted_foreground;
+    let said = if facts.is_empty() {
+        "The assistant keeps short facts it learns about you and your machines, like where your projects are. Nothing yet.".to_owned()
+    } else {
+        format!("What the assistant remembers about you and your machines ({}). Each chat starts with these.", facts.len())
+    };
+    v_flex()
+        .w_full()
+        .gap_1()
+        .child(div().text_sm().text_color(muted).whitespace_normal().child(said))
+        .children(facts.into_iter().rev().enumerate().map(|(ix, fact)| {
+            let (data_dir, text) = (data_dir.clone(), fact.text.clone());
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_center()
+                .child(div().flex_1().min_w_0().whitespace_normal().text_sm().child(fact.text))
+                .child(Button::new(("forget-fact", ix)).ghost().xsmall().icon(Icon::new(Lucide::X)).tooltip("Forget this").on_click(move |_, window, _| {
+                    crate::automations::memory::forget(&data_dir, &text);
+                    window.refresh();
+                }))
+        }))
+}
+
+fn skills(cx: &App) -> gpui_kit::Div {
+    let data_dir = Store::services(cx).data_dir.clone();
+    let own = crate::automations::skills::own(&data_dir).len();
+    let built_in = crate::automations::skills::built_in().len();
+    let yours = match own {
+        0 => "none of yours yet".to_owned(),
+        1 => "1 of yours".to_owned(),
+        n => format!("{n} of yours"),
+    };
+    let said = format!(
+        "Skills are know-how the builder reads for kinds of jobs: {built_in} come with {APP_NAME}, {yours}. To add one, put a folder with a SKILL.md in the skills folder. Hermes Agent and Claude skills use the same format."
+    );
+    let folder = crate::automations::skills::folder(&data_dir);
+    h_flex()
+        .w_full()
+        .gap_2()
+        .items_center()
+        .child(div().flex_1().min_w_0().whitespace_normal().text_sm().text_color(cx.theme().muted_foreground).child(said))
+        .child(Button::new("open-skills").small().label("Open folder").on_click(move |_, _, cx| {
+            match std::fs::create_dir_all(&folder) {
+                Ok(()) => cx.open_with_system(&folder),
+                Err(err) => tracing::warn!(%err, "could not make the skills folder"),
+            }
+        }))
+}
+
 fn screen_access(cx: &App) -> gpui_kit::Div {
     let off = !Settings::get(cx).ai.on;
     let ready = crate::computer::platform().and_then(|platform| platform.ready());
@@ -533,7 +594,7 @@ impl Render for KeySetup {
                 )
             });
         let status = self.status.clone().map(|(ok, text)| {
-            div().text_sm().text_color(if ok { theme.foreground } else { theme.danger }).child(SharedString::from(text))
+            div().text_sm().text_color(if ok { ok_color(cx) } else { theme.danger }).child(SharedString::from(text))
         });
         v_flex()
             .w_full()

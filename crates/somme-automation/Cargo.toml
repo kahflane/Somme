@@ -10,6 +10,8 @@ description = "Somme's Automations: the flow format, its checks, and the engine 
 async-trait.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
+# Paths in a scope, like ~/Projects/**/node_modules.
+globset = "0.4"
 hickory-resolver = "0.25"
 parking_lot = "0.12"
 regex = "1"
@@ -24,6 +26,9 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["process", "time", "io-util", "macros", "net"] }
 tokio-util.workspace = true
 tracing.workspace = true
+# Reads shell code: the same parser and grammar the editor uses.
+tree-sitter = "0.26"
+tree-sitter-bash = "0.23"
 
 [dev-dependencies]
 tempfile = "3"

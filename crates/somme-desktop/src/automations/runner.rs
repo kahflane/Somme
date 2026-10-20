@@ -103,6 +103,9 @@ impl Runner {
                 screen: Default::default(),
                 ai_calls: Default::default(),
                 secrets: Default::default(),
+                chat: None,
+                cleared: Default::default(),
+                automation: (!automation.id.is_empty()).then(|| automation.id.clone()),
             });
             let on_event = |event: Event| {
                 writer.write(&event);

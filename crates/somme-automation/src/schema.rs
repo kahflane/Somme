@@ -25,6 +25,17 @@ pub struct Automation {
     pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// What it is for, written before it was built: the grading sheet its
+    /// review and its runs are checked against.
+    #[serde(default, skip_serializing_if = "Plan::is_empty")]
+    pub plan: Plan,
+    /// What it may change, approved by the user and kept to while it runs.
+    #[serde(default, skip_serializing_if = "Scope::is_empty")]
+    pub scope: Scope,
+    /// The scope the user approved, as its own text. Empty, or a different
+    /// scope: not approved.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope_ok: String,
 }
 
 impl Automation {
@@ -38,7 +49,15 @@ impl Automation {
             inputs: Vec::new(),
             nodes: Vec::new(),
             edges: Vec::new(),
+            plan: Plan::default(),
+            scope: Scope::default(),
+            scope_ok: String::new(),
         }
+    }
+
+    /// Whether the user approved the scope it has now.
+    pub fn scope_approved(&self) -> bool {
+        self.scope.is_empty() || self.scope_ok == self.scope.key()
     }
 
     pub fn node(&self, id: &str) -> Option<&Node> {
@@ -83,6 +102,115 @@ pub enum Missed {
     Skip,
 }
 
+/// What an automation is for, in the user's terms.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub goal: String,
+    /// How to tell it worked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done_when: Vec<String>,
+    /// What must never happen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub never: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<String>,
+    /// What looking at the machine showed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub found: Vec<String>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// What an automation may change while it runs. Paths are globs, like
+/// `~/Projects/**/node_modules`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    /// Where it may write or delete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// It may delete, in `paths` only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delete: bool,
+    /// Hosts it may send to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<String>,
+    /// Services it may stop, start or restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sudo: bool,
+}
+
+impl Scope {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The scope as one text, to tell a changed scope from the approved one.
+    pub fn key(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// What a step does to the machine, as the one who wrote it says.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Effects {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deletes: Vec<String>,
+    /// Hosts or addresses it sends to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<String>,
+    /// Services it stops, starts or restarts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sudo: bool,
+    /// What it deletes can be made again, like build output or caches.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rebuildable: bool,
+    /// Running it twice in a row does no more than once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat_safe: bool,
+    /// How to put it back, when it can be.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub undo: String,
+}
+
+impl Effects {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether it changes anything at all.
+    pub fn changes(&self) -> bool {
+        !self.writes.is_empty() || !self.deletes.is_empty() || !self.sends.is_empty() || !self.services.is_empty() || self.sudo
+    }
+}
+
+/// How a step that changes things runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// It does what it says.
+    #[default]
+    Do,
+    /// It only says what it would do, until the user lets it.
+    Report,
+}
+
+fn is_do(mode: &Mode) -> bool {
+    *mode == Mode::Do
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Input {
     pub name: String,
@@ -113,6 +241,21 @@ pub struct Node {
     /// An AI wrote its command, and the user has not checked it yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ai_wrote: bool,
+    /// An AI wrote its command, checked or not: it runs inside the fence
+    /// until the user changes the command themselves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_ai: bool,
+    /// What it does to the machine, for steps that run commands.
+    #[serde(default, skip_serializing_if = "Effects::is_empty")]
+    pub effects: Effects,
+    /// A command run after it, where it ran: exit 0 means it worked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check: String,
+    /// A command that only looks and lists what it would touch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
+    #[serde(default, skip_serializing_if = "is_do")]
+    pub mode: Mode,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -134,6 +277,11 @@ impl Node {
             retries: 0,
             retry_wait_seconds: 0,
             ai_wrote: false,
+            by_ai: false,
+            effects: Effects::default(),
+            check: String::new(),
+            preview: String::new(),
+            mode: Mode::Do,
         }
     }
 
@@ -291,8 +439,8 @@ fn default_true() -> bool {
     true
 }
 
-pub const AGENT_STEPS: u32 = 20;
-pub const AGENT_TOKENS: u64 = 200_000;
+pub const AGENT_STEPS: u32 = 40;
+pub const AGENT_TOKENS: u64 = 1_000_000;
 /// The most tool calls an Agent step may be given.
 pub const MOST_AGENT_STEPS: u32 = 200;
 
@@ -514,6 +662,9 @@ pub fn problems(automation: &Automation) -> Vec<String> {
     let mut found = Vec::new();
     if automation.nodes.is_empty() {
         found.push("Add a step.".to_owned());
+    }
+    if !automation.scope_approved() {
+        found.push("Approve what it may change, under Automation.".to_owned());
     }
     if let Some(schedule) = automation.start.schedule.as_deref().filter(|text| !text.trim().is_empty())
         && let Err(err) = crate::schedule::Cron::parse(schedule)

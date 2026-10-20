@@ -93,8 +93,10 @@ pub(crate) mod test_server {
             for (status, body) in answers {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 seen.push(read_request(&mut stream).await);
+                // A streamed answer is a run of `data:` lines.
+                let kind = if body.starts_with("data:") { "text/event-stream" } else { "application/json" };
                 let head = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
                 stream.write_all(head.as_bytes()).await.unwrap();

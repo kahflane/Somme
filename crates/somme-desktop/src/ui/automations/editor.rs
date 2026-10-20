@@ -97,6 +97,8 @@ pub struct FlowEditor {
     pub(super) bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(super) focus: FocusHandle,
     pub(super) chat: Chat,
+    /// Commands the AI wrote that the user changed, by step: the AI's own.
+    /// Each becomes a lesson once the change is saved.
     _subscriptions: Vec<Subscription>,
 }
 

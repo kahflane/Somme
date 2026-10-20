@@ -225,6 +225,14 @@ pub async fn guard_with(services: &Services, settings: &Settings, mut action: Ac
     if settings.guard_rules.is_empty() {
         return guard::check(&[], settings.guard_strictness, &action, &[]).await;
     }
+    // A command that only looks gets the quick check: an AI call for each
+    // look made agents slow. What the quick check doubts still goes to AI.
+    if action.kind == "command" && somme_automation::readonly::check(&action.detail).is_ok() {
+        let quick = guard::check(&settings.guard_rules, settings.guard_strictness, &action, &[]).await;
+        if quick.decision != Decision::Ask {
+            return quick;
+        }
+    }
     let clients = Clients::load(services, settings, Feature::Guard).await;
     action.detail = clients.cleaner.clean(&action.detail);
     let askers = clients.askers(settings, Feature::Guard);

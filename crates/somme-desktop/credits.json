@@ -358,6 +358,14 @@
       "link": "https://github.com/smol-rs/async-channel"
     },
     {
+      "name": "async-compression",
+      "versions": [
+        "0.4.51"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/Nullus157/async-compression"
+    },
+    {
       "name": "async-executor",
       "versions": [
         "1.14.0"
@@ -396,22 +404,6 @@
       ],
       "license": "Apache-2.0 OR MIT",
       "link": "https://github.com/smol-rs/async-net"
-    },
-    {
-      "name": "async-openai",
-      "versions": [
-        "0.42.2"
-      ],
-      "license": "MIT",
-      "link": "https://github.com/64bit/async-openai"
-    },
-    {
-      "name": "async-openai-macros",
-      "versions": [
-        "0.3.0"
-      ],
-      "license": "MIT",
-      "link": "https://github.com/64bit/async-openai"
     },
     {
       "name": "async-process",
@@ -724,6 +716,14 @@
       "link": "https://github.com/fereidani/branches"
     },
     {
+      "name": "bs58",
+      "versions": [
+        "0.5.1"
+      ],
+      "license": "MIT/Apache-2.0",
+      "link": "https://github.com/Nullus157/bs58-rs"
+    },
+    {
       "name": "bstr",
       "versions": [
         "1.13.1"
@@ -919,6 +919,22 @@
       ],
       "license": "MIT",
       "link": "https://github.com/Marwes/combine"
+    },
+    {
+      "name": "compression-codecs",
+      "versions": [
+        "0.4.46"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/Nullus157/async-compression"
+    },
+    {
+      "name": "compression-core",
+      "versions": [
+        "0.4.34"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/Nullus157/async-compression"
     },
     {
       "name": "concurrent-queue",
@@ -1226,7 +1242,6 @@
     {
       "name": "darling",
       "versions": [
-        "0.20.11",
         "0.24.1"
       ],
       "license": "MIT",
@@ -1235,7 +1250,6 @@
     {
       "name": "darling_core",
       "versions": [
-        "0.20.11",
         "0.24.1"
       ],
       "license": "MIT",
@@ -1244,7 +1258,6 @@
     {
       "name": "darling_macro",
       "versions": [
-        "0.20.11",
         "0.24.1"
       ],
       "license": "MIT",
@@ -1337,30 +1350,6 @@
       ],
       "license": "MIT OR Apache-2.0",
       "link": "https://github.com/jhpratt/deranged"
-    },
-    {
-      "name": "derive_builder",
-      "versions": [
-        "0.20.2"
-      ],
-      "license": "MIT OR Apache-2.0",
-      "link": "https://github.com/colin-kiegel/rust-derive-builder"
-    },
-    {
-      "name": "derive_builder_core",
-      "versions": [
-        "0.20.2"
-      ],
-      "license": "MIT OR Apache-2.0",
-      "link": "https://github.com/colin-kiegel/rust-derive-builder"
-    },
-    {
-      "name": "derive_builder_macro",
-      "versions": [
-        "0.20.2"
-      ],
-      "license": "MIT OR Apache-2.0",
-      "link": "https://github.com/colin-kiegel/rust-derive-builder"
     },
     {
       "name": "derive_more",
@@ -1745,14 +1734,6 @@
       "link": "https://github.com/smol-rs/event-listener-strategy"
     },
     {
-      "name": "eventsource-stream",
-      "versions": [
-        "0.2.3"
-      ],
-      "license": "MIT OR Apache-2.0",
-      "link": "https://github.com/jpopesculian/eventsource-stream"
-    },
-    {
       "name": "exr",
       "versions": [
         "1.74.2"
@@ -2098,6 +2079,14 @@
       ],
       "license": "MIT",
       "link": "https://github.com/Drakulix/gbm.rs/tree/master/gbm-sys"
+    },
+    {
+      "name": "genai",
+      "versions": [
+        "0.7.0"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/jeremychone/rust-genai"
     },
     {
       "name": "genawaiter",
@@ -2507,6 +2496,7 @@
     {
       "name": "hashbrown",
       "versions": [
+        "0.12.3",
         "0.14.5",
         "0.15.5",
         "0.16.1",
@@ -2889,6 +2879,7 @@
     {
       "name": "indexmap",
       "versions": [
+        "1.9.3",
         "2.14.2"
       ],
       "license": "Apache-2.0 OR MIT",
@@ -3500,6 +3491,22 @@
       ],
       "license": "MIT OR Apache-2.0",
       "link": "https://github.com/next-slide-please/macos-accessibility-client"
+    },
+    {
+      "name": "macro_rules_attribute",
+      "versions": [
+        "0.2.3"
+      ],
+      "license": "Apache-2.0 OR MIT OR Zlib",
+      "link": "https://github.com/danielhenrymantilla/macro_rules_attribute-rs"
+    },
+    {
+      "name": "macro_rules_attribute-proc_macro",
+      "versions": [
+        "0.2.3"
+      ],
+      "license": "Apache-2.0 OR MIT OR Zlib",
+      "link": "https://github.com/danielhenrymantilla/macro_rules_attribute-rs"
     },
     {
       "name": "malloc_buf",
@@ -5392,6 +5399,7 @@
     {
       "name": "schemars",
       "versions": [
+        "0.9.0",
         "1.2.3"
       ],
       "license": "MIT",
@@ -5460,14 +5468,6 @@
       ],
       "license": "Apache-2.0 OR MIT",
       "link": "https://github.com/RustCrypto/formats"
-    },
-    {
-      "name": "secrecy",
-      "versions": [
-        "0.10.3"
-      ],
-      "license": "Apache-2.0 OR MIT",
-      "link": "https://github.com/iqlusioninc/crates/tree/main/secrecy"
     },
     {
       "name": "secret-service",
@@ -5588,6 +5588,22 @@
       ],
       "license": "MIT/Apache-2.0",
       "link": "https://github.com/nox/serde_urlencoded"
+    },
+    {
+      "name": "serde_with",
+      "versions": [
+        "3.24.0"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/jonasbb/serde_with/"
+    },
+    {
+      "name": "serde_with_macros",
+      "versions": [
+        "3.24.0"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/jonasbb/serde_with/"
     },
     {
       "name": "serdect",
@@ -7036,6 +7052,14 @@
       "link": "https://github.com/unicode-rs/unicode-width"
     },
     {
+      "name": "unicode-xid",
+      "versions": [
+        "0.2.6"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/unicode-rs/unicode-xid"
+    },
+    {
       "name": "universal-hash",
       "versions": [
         "0.5.1",
@@ -7133,6 +7157,14 @@
       ],
       "license": "MIT",
       "link": "https://github.com/tokio-rs/valuable"
+    },
+    {
+      "name": "value-ext",
+      "versions": [
+        "0.1.5"
+      ],
+      "license": "MIT OR Apache-2.0",
+      "link": "https://github.com/jeremychone/rust-value-ext"
     },
     {
       "name": "vte",

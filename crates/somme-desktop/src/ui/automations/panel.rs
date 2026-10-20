@@ -23,7 +23,7 @@ use super::editor::{FlowEditor, Picked, run_words};
 use crate::automations::Automations;
 use crate::settings::Settings;
 use crate::store::{Store, mutate};
-use crate::ui::common::{Lucide, ago, ink_button};
+use crate::ui::common::{Lucide, ago, ink_button, ok_color};
 use crate::ui::fields::{Choice, ChoiceState, choice_select, selected};
 
 /// The fields of the picked step.
@@ -34,6 +34,10 @@ pub(super) struct StepForm {
     timeout: Entity<InputState>,
     retries: Entity<InputState>,
     retry_wait: Entity<InputState>,
+    /// For steps that run a command: one that proves it worked, and one that
+    /// only looks and lists what it would touch.
+    check: Entity<InputState>,
+    preview: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -151,12 +155,16 @@ impl StepForm {
         let timeout = line(node.timeout_seconds.map(|s| s.to_string()).unwrap_or_default(), &node.kind.default_timeout().to_string(), window, cx);
         let retries = line(node.retries.to_string(), "0", window, cx);
         let retry_wait = line(node.retry_wait_seconds.to_string(), "0", window, cx);
+        let check = line(node.check.clone(), "test -d ~/app", window, cx);
+        let preview = line(node.preview.clone(), "ls -d ~/app/build", window, cx);
         let apply = FlowEditor::apply_step_form;
         let mut subscriptions = vec![
             on_change(&label, apply, cx),
             on_change(&timeout, apply, cx),
             on_change(&retries, apply, cx),
             on_change(&retry_wait, apply, cx),
+            on_change(&check, apply, cx),
+            on_change(&preview, apply, cx),
         ];
         let fields = match &node.kind {
             NodeKind::Command { hosts, command, .. } => {
@@ -286,7 +294,7 @@ impl StepForm {
                 Fields::Agent { goal, servers, tag, max_steps, max_tokens, apps }
             }
         };
-        Self { id: node.id.clone(), label, fields, timeout, retries, retry_wait, _subscriptions: subscriptions }
+        Self { id: node.id.clone(), label, fields, timeout, retries, retry_wait, check, preview, _subscriptions: subscriptions }
     }
 }
 
@@ -352,6 +360,11 @@ fn area(input: &Entity<TextareaState>, cx: &gpui_kit::App) -> String {
     input.read(cx).value().to_string()
 }
 
+
+/// What an agent wanted to change past its scope: the command, where, and
+/// what the scope would need (a kind and a value).
+type Wanted = (String, String, Option<(String, String)>);
+
 impl FlowEditor {
     pub(super) fn apply_step_form(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &self.step_form else { return };
@@ -361,6 +374,7 @@ impl FlowEditor {
         let timeout = if timeout.trim().is_empty() { Some(None) } else { number::<u64>(&form.timeout, cx).map(Some) };
         let retries = number::<u32>(&form.retries, cx);
         let retry_wait = number::<u64>(&form.retry_wait, cx);
+        let (check, preview) = (text(&form.check, cx).trim().to_owned(), text(&form.preview, cx).trim().to_owned());
         enum Typed {
             Command(String, String),
             Local(String, String),
@@ -408,6 +422,10 @@ impl FlowEditor {
         }
         if let Some(wait) = retry_wait {
             node.retry_wait_seconds = wait;
+        }
+        if node.kind.command().is_some() {
+            node.check = check;
+            node.preview = preview;
         }
         let before = node.kind.command().map(str::to_owned);
         match (&mut node.kind, typed) {
@@ -489,6 +507,7 @@ impl FlowEditor {
         // Changing a command the AI wrote counts as checking it.
         if node.kind.command().map(str::to_owned) != before {
             node.ai_wrote = false;
+            node.by_ai = false;
         }
         self.changed(cx);
     }
@@ -903,6 +922,7 @@ impl FlowEditor {
                 })),
             )
         });
+        let does = node.kind.command().map(|_| self.what_it_does(node, form, &mono, cx));
         let can_retry = matches!(
             node.kind,
             NodeKind::Command { .. } | NodeKind::Local { .. } | NodeKind::Copy { .. } | NodeKind::Http { .. } | NodeKind::Tls { .. } | NodeKind::Dns { .. }
@@ -937,6 +957,7 @@ impl FlowEditor {
             .child(field("Name", Input::new(&form.label).small()))
             .child(kind_fields)
             .children(values_box)
+            .children(does)
             .child(
                 v_flex()
                     .gap_3()
@@ -955,6 +976,71 @@ impl FlowEditor {
                     }),
             )
             .child(note(format!("Its id is {}. Later steps use it as {used_as}.", node.id), cx))
+            .into_any_element()
+    }
+
+    /// For a step that runs a command: whether it only reports, what it
+    /// says it changes, and the commands that preview it and check it.
+    fn what_it_does(&self, node: &Node, form: &StepForm, mono: &SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let id = node.id.clone();
+        let effects = &node.effects;
+        let list = |items: &[String]| items.join(", ");
+        let mut said: Vec<String> = Vec::new();
+        if !effects.writes.is_empty() {
+            said.push(format!("Writes {}", list(&effects.writes)));
+        }
+        if !effects.deletes.is_empty() {
+            let again = if effects.rebuildable { " (can be made again)" } else { "" };
+            said.push(format!("Deletes {}{again}", list(&effects.deletes)));
+        }
+        if !effects.sends.is_empty() {
+            said.push(format!("Sends to {}", list(&effects.sends)));
+        }
+        if !effects.services.is_empty() {
+            said.push(format!("Stops or restarts {}", list(&effects.services)));
+        }
+        if effects.sudo {
+            said.push("Uses sudo".into());
+        }
+        if effects.repeat_safe {
+            said.push("Safe to run again".into());
+        }
+        if !effects.undo.is_empty() {
+            said.push(format!("To undo: {}", effects.undo));
+        }
+        let only_looks = node.kind.command().is_some_and(|command| somme_automation::readonly::check(command).is_ok());
+        let summary = if said.is_empty() {
+            if only_looks { "It only looks.".to_owned() } else { "It doesn't say what it changes. Read the command.".to_owned() }
+        } else {
+            said.join(". ") + "."
+        };
+        let reporting = node.mode == schema::Mode::Report;
+        v_flex()
+            .gap_3()
+            .pt_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(div().text_sm().font_semibold().child("What it does"))
+            .child(div().text_sm().text_color(theme.muted_foreground).whitespace_normal().child(summary))
+            .child(toggle("step-report", "Only report what it would do", reporting, cx, move |editor, on| {
+                if let Some(node) = editor.step_mut(&id) {
+                    node.mode = if on { schema::Mode::Report } else { schema::Mode::Do };
+                }
+            }))
+            .when(reporting, |el| {
+                el.child(note("Runs only its preview and changes nothing. Turn this off when the preview shows what you expect.".to_owned(), cx))
+            })
+            .when(!reporting && node.by_ai && !only_looks, |el| {
+                let kept = if effects.rebuildable {
+                    "Copies of files it changes stay in the Somme bin (~/.somme/bin) for 7 days."
+                } else {
+                    "What it deletes, and copies of files it changes, stay in the Somme bin (~/.somme/bin) for 7 days."
+                };
+                el.child(note(format!("Somme stops any change it makes outside what this automation may change. {kept}"), cx))
+            })
+            .child(field("Preview: a command that only looks and lists what it would touch", Input::new(&form.preview).small().font_family(mono.clone())))
+            .child(field("Check: a command that exits 0 when it worked", Input::new(&form.check).small().font_family(mono.clone())))
             .into_any_element()
     }
 
@@ -1002,6 +1088,8 @@ impl FlowEditor {
                         ),
                 ),
             )
+            .children(self.render_plan(cx))
+            .children(self.render_scope(cx))
             .child(self.render_schedule(cx))
             .child(toggle("flow-agents", "AI agents can run this", agents, cx, |editor, on| editor.draft.start.agents = on))
             .when(!found.is_empty(), |el| {
@@ -1019,6 +1107,103 @@ impl FlowEditor {
             })
             .child(note("Click a step to change it. Drag from a step's dot to another step to join them.", cx))
             .into_any_element()
+    }
+
+    /// What it is for, as the builder wrote it down.
+    fn render_plan(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let plan = &self.draft.plan;
+        if plan.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let part = |title: &'static str, items: &[String]| {
+            (!items.is_empty()).then(|| {
+                v_flex()
+                    .gap_0p5()
+                    .child(div().text_xs().font_semibold().text_color(theme.muted_foreground).child(title))
+                    .children(items.iter().map(|item| div().text_sm().whitespace_normal().child(format!("\u{2022} {item}"))))
+            })
+        };
+        Some(
+            field(
+                "Plan",
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .when(!plan.goal.is_empty(), |el| el.child(div().text_sm().whitespace_normal().child(plan.goal.clone())))
+                    .children(part("Done when", &plan.done_when))
+                    .children(part("Never", &plan.never))
+                    .children(part("Assumes", &plan.assumptions))
+                    .children(part("Found by looking", &plan.found)),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// What it may change while it runs, and whether the user approved it.
+    fn render_scope(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let scope = &self.draft.scope;
+        if scope.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let mut lines: Vec<String> = Vec::new();
+        if !scope.paths.is_empty() {
+            let verb = if scope.delete { "Changes and deletes in" } else { "Changes files in" };
+            lines.push(format!("{verb} {}", scope.paths.join(", ")));
+        }
+        if !scope.sends.is_empty() {
+            lines.push(format!("Sends to {}", scope.sends.join(", ")));
+        }
+        if !scope.services.is_empty() {
+            lines.push(format!("Restarts {}", scope.services.join(", ")));
+        }
+        if scope.sudo {
+            lines.push("Uses sudo".into());
+        }
+        let approved = self.draft.scope_approved();
+        Some(
+            field(
+                "What it may change",
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .children(lines.into_iter().map(|line| div().text_sm().whitespace_normal().child(line)))
+                    .child(if approved {
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .text_xs()
+                            .text_color(ok_color(cx))
+                            .child(Icon::new(Lucide::ShieldCheck).size(px(12.)))
+                            .child("You approved this. Runs that go outside it are stopped.")
+                            .into_any_element()
+                    } else {
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().flex_1().text_xs().text_color(theme.muted_foreground).child("It can't run until you approve this."))
+                            .child(
+                                Button::new("scope-approve")
+                                    .custom(ink_button(cx))
+                                    .xsmall()
+                                    .label("Approve")
+                                    .on_click(cx.listener(|editor, _, _, cx| {
+                                        editor.draft.scope_ok = editor.draft.scope.key();
+                                        editor.changed(cx);
+                                    })),
+                            )
+                            .into_any_element()
+                    }),
+            )
+            .into_any_element(),
+        )
     }
 
     fn render_schedule(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1056,6 +1241,22 @@ impl FlowEditor {
                 .when(next.is_some(), |el| el.child(field("When the computer slept through a run", Select::new(&form.missed).small()))),
         )
         .into_any_element()
+    }
+
+    /// Lets the automation change what one of its runs wanted to, from now
+    /// on. Pressing it is the user's OK for the wider scope.
+    fn widen_scope(&mut self, kind: &str, value: &str, cx: &mut Context<Self>) {
+        let scope = &mut self.draft.scope;
+        let value = value.trim().to_owned();
+        match kind {
+            "path" if !value.is_empty() && !scope.paths.contains(&value) => scope.paths.push(value),
+            "send" if !value.is_empty() && !scope.sends.contains(&value) => scope.sends.push(value),
+            "service" if !value.is_empty() && !scope.services.contains(&value) => scope.services.push(value),
+            "delete" => scope.delete = true,
+            _ => return,
+        }
+        self.draft.scope_ok = self.draft.scope.key();
+        self.changed(cx);
     }
 
     pub(super) fn render_runs(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1165,6 +1366,60 @@ impl FlowEditor {
                     });
                     let changed: Vec<String> =
                         step.result.get("changed").and_then(|v| v.as_array()).map(|files| files.iter().filter_map(|file| file.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                    // What an agent wanted to change past its scope, with no one there to OK it.
+                    let wanted: Vec<Wanted> = step
+                        .result
+                        .get("wanted")
+                        .and_then(|v| v.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    let text = |key: &str| item[key].as_str().unwrap_or_default().to_owned();
+                                    let widen = item["widen"].as_object().map(|widen| {
+                                        (widen.get("kind").and_then(|v| v.as_str()).unwrap_or_default().to_owned(), widen.get("value").and_then(|v| v.as_str()).unwrap_or_default().to_owned())
+                                    });
+                                    (text("command"), text("host"), widen)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let scope = self.draft.scope.clone();
+                    let wanted_view = (!wanted.is_empty()).then(|| {
+                        v_flex().gap_1p5().children(wanted.into_iter().enumerate().map(|(ix, (command, host, widen))| {
+                            let allowed = widen.as_ref().is_some_and(|(kind, value)| match kind.as_str() {
+                                "path" => scope.paths.contains(value),
+                                "send" => scope.sends.contains(value),
+                                "service" => scope.services.contains(value),
+                                "delete" => scope.delete,
+                                _ => false,
+                            });
+                            let what = match widen.as_ref().map(|(kind, value)| (kind.as_str(), value.as_str())) {
+                                Some(("path", path)) => format!("change {path}"),
+                                Some(("send", to)) => format!("send to {to}"),
+                                Some(("service", name)) => format!("act on the service {name}"),
+                                Some(("delete", _)) => "delete things".to_owned(),
+                                _ => "go past what it may change".to_owned(),
+                            };
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(div().text_sm().whitespace_normal().child(format!("It wanted to {what}, past what it may change.")))
+                                        .child(div().text_xs().font_family(mono.clone()).text_color(theme.muted_foreground).truncate().child(format!("On {host}: {command}"))),
+                                )
+                                .children(widen.filter(|_| !allowed).map(|(kind, value)| {
+                                    Button::new(("allow-wanted", ix))
+                                        .small()
+                                        .label("Allow from now on")
+                                        .tooltip("Add it to what this automation may change")
+                                        .on_click(cx.listener(move |editor, _, _, cx| editor.widen_scope(&kind, &value, cx)))
+                                }))
+                        }))
+                    });
                     v_flex()
                         .gap_2()
                         .child(div().text_sm().font_semibold().child(title))
@@ -1176,6 +1431,7 @@ impl FlowEditor {
                         .children(error.map(|error| div().text_sm().text_color(theme.foreground).child(error)))
                         .children(did.map(|did| field("What it did", did)))
                         .when(!changed.is_empty(), |el| el.child(note(format!("Changed: {}", changed.join(", ")), cx)))
+                        .children(wanted_view.map(|wanted| field("Waiting for your OK", wanted)))
                         .when(!output.trim().is_empty(), |el| {
                             el.child(
                                 div()
@@ -1265,7 +1521,7 @@ impl FlowEditor {
         let has_scripts = !Store::global(cx).read(cx).snippets.is_empty();
         let said = self.script_note.clone().map(|(ok, text)| {
             let theme = cx.theme();
-            div().text_xs().text_color(if ok { theme.muted_foreground } else { theme.foreground }).child(text)
+            div().text_xs().text_color(if ok { ok_color(cx) } else { theme.foreground }).child(text)
         });
         v_flex()
             .gap_1p5()

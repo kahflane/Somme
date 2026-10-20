@@ -5,6 +5,10 @@
 //!
 //! It reads text, so it lowers risk; it is not a sandbox. Commands that hide
 //! what they do always go to Ask.
+//!
+//! Rules only say what the user named. A review looks for the usual risks
+//! in any command, rules or not, for the user to read before an AI's command
+//! is allowed to run.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -445,6 +449,155 @@ fn judge(rules: &[Rule], strictness: Strictness, answers: &BTreeMap<String, crat
     Verdict { decision, rule: Some(rule.text.clone()), probability: Some(yes), by, reason }
 }
 
+/// A risk any command can carry, whatever the rules say.
+struct RiskKind {
+    id: &'static str,
+    /// For the user, after "It may…".
+    says: &'static str,
+    /// For Jev: what the command would do.
+    does: &'static str,
+    /// Plain signs of it the quick check knows.
+    signs: fn() -> &'static [Regex],
+}
+
+static DOWN: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    regexes(&[
+        r"(?i)\b(shutdown|reboot|halt|poweroff)\b",
+        r"(?i)\bsystemctl\s+(stop|restart|kill|isolate|poweroff|reboot)\b|\bservice\s+\S+\s+(stop|restart)\b",
+        r"\bkill(all)?\s+(-9|-KILL|-s\s+KILL)\b|\bpkill\b",
+        r"(?i)\bdocker\s+(stop|kill)\b|\bkubectl\s+(drain|cordon)\b",
+    ])
+});
+
+static ACCESS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    regexes(&[
+        r"\b(passwd|chpasswd|usermod|userdel|useradd|visudo|gpasswd)\b",
+        r"authorized_keys|/etc/sudoers|sshd_config",
+        r"\bchmod\s+(-R\s+)?[0-7]*777\b|\bchmod\s+-R\b|\bchown\s+-R\b",
+        r"\b(ufw|iptables|ip6tables|firewall-cmd|nft)\s",
+    ])
+});
+
+static LEAK: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    regexes(&[
+        r"\b(scp|rsync|sftp)\b[^\n]*\s[\w.@-]+:",
+        r"\bcurl\b[^\n]*\s(-T|--upload-file|-F|--form|-d\s*@|--data(-binary|-raw)?\s*@)",
+        r"\b(nc|ncat|netcat)\b[^\n]*<",
+    ])
+});
+
+static RISKS: LazyLock<Vec<RiskKind>> = LazyLock::new(|| {
+    vec![
+        RiskKind {
+            id: "risk_data",
+            says: "delete or overwrite data",
+            does: "deletes, overwrites, empties or wipes files, folders, disks or databases",
+            signs: || &GROUPS[0].patterns,
+        },
+        RiskKind {
+            id: "risk_access",
+            says: "change who can get in",
+            does: "changes users, passwords, SSH keys, file permissions, sudo rights or firewall rules",
+            signs: || &ACCESS,
+        },
+        RiskKind {
+            id: "risk_down",
+            says: "take something down",
+            does: "shuts down or reboots the machine, or stops, restarts or kills services or processes",
+            signs: || &DOWN,
+        },
+        RiskKind {
+            id: "risk_leak",
+            says: "send data off the machine",
+            does: "sends files, data or secrets from this machine to another place",
+            signs: || &LEAK,
+        },
+        RiskKind {
+            id: "risk_remote",
+            says: "run code from the internet, or code it hides",
+            does: "downloads code from the internet and runs it, or runs code it hides or decodes first",
+            signs: || &HIDDEN,
+        },
+        RiskKind {
+            id: "risk_system",
+            says: "change the system",
+            does: "installs, removes or upgrades software, or changes system settings or services",
+            signs: || &GROUPS[1].patterns,
+        },
+    ]
+});
+
+/// A risk the review found.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Risk {
+    /// After "It may…".
+    pub says: &'static str,
+    /// Jev's chance it is so; none when the quick check saw it plainly.
+    pub sure: Option<f64>,
+    /// What the quick check saw.
+    pub sign: Option<String>,
+}
+
+/// What a review found, and who looked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Review {
+    pub risks: Vec<Risk>,
+    /// Jev or the LLM; `LocalOnly` when only the quick check looked, and
+    /// `Failed` when they were asked but gave no answer.
+    pub by: CheckedBy,
+}
+
+/// At or above, a review counts the risk.
+const RISK_FROM: f64 = 0.5;
+
+/// Looks for the usual risks in a command, whatever the rules say: plain
+/// signs first, then one call to Jev (or an LLM) with a question per risk.
+/// The action should already be cleaned of secrets.
+pub async fn review(action: &Action, askers: &[&dyn Asker]) -> Review {
+    let mut risks: Vec<Risk> = Vec::new();
+    for kind in RISKS.iter() {
+        if let Some(found) = (kind.signs)().iter().find_map(|sign| sign.find(&action.detail)) {
+            risks.push(Risk { says: kind.says, sure: None, sign: Some(found.as_str().trim().to_owned()) });
+        }
+    }
+    if askers.is_empty() {
+        return Review { risks, by: CheckedBy::LocalOnly };
+    }
+    let questions: BTreeMap<String, Question> = RISKS
+        .iter()
+        .map(|kind| {
+            let question = Question::Noul {
+                instructions: json!({ "risk": kind.does, "question": "Does `action`, when it runs, do what `risk` describes?" }),
+                criteria: Some(NoulCriteria {
+                    yes: "Running the action clearly does this.".into(),
+                    no: "The action does nothing like this.".into(),
+                }),
+            };
+            (kind.id.to_owned(), question)
+        })
+        .collect();
+    let state = json!({ "action": action });
+    for asker in askers {
+        let answers = match asker.ask(&state, &questions).await {
+            Ok(answers) => answers,
+            Err(err) => {
+                tracing::warn!(asker = asker.name(), %err, "the review got no answer");
+                continue;
+            }
+        };
+        for kind in RISKS.iter() {
+            let Some(yes) = answers.get(kind.id).and_then(crate::jev::Answer::yes).filter(|yes| *yes >= RISK_FROM) else { continue };
+            match risks.iter_mut().find(|risk| risk.says == kind.says) {
+                Some(seen) => seen.sure = Some(yes),
+                None => risks.push(Risk { says: kind.says, sure: Some(yes), sign: None }),
+            }
+        }
+        let by = if asker.name() == "Jev" { CheckedBy::Jev } else { CheckedBy::Llm };
+        return Review { risks, by };
+    }
+    Review { risks, by: CheckedBy::Failed }
+}
+
 /// What the agent is told when a command is blocked or denied.
 pub fn refusal(verdict: &Verdict, denied_by_user: bool) -> String {
     if denied_by_user {
@@ -479,6 +632,24 @@ mod tests {
 
     async fn quick(rules: &[Rule], action: &Action) -> Verdict {
         check(rules, Strictness::Normal, action, &[]).await
+    }
+
+    #[tokio::test]
+    async fn a_review_finds_risks_with_no_rules() {
+        let plain = review(&command("find /var/log -name '*.gz' -delete && systemctl restart nginx"), &[]).await;
+        assert_eq!(plain.by, CheckedBy::LocalOnly);
+        let says: Vec<&str> = plain.risks.iter().map(|risk| risk.says).collect();
+        assert_eq!(says, ["delete or overwrite data", "take something down"]);
+        assert_eq!(plain.risks[0].sign.as_deref(), Some("find /var/log -name '*.gz' -delete"));
+        assert!(review(&command("df -h /"), &[]).await.risks.is_empty());
+        // Jev sees what plain signs can't, and says how sure it is.
+        let jev = Fixed("Jev", Some(0.8));
+        let asked = review(&command("df -h /"), &[&jev]).await;
+        assert_eq!((asked.by, asked.risks.len(), asked.risks[0].sure), (CheckedBy::Jev, RISKS.len(), Some(0.8)));
+        let calm = Fixed("Jev", Some(0.1));
+        assert!(review(&command("df -h /"), &[&calm]).await.risks.is_empty());
+        let down = Fixed("Jev", None);
+        assert_eq!(review(&command("df -h /"), &[&down]).await.by, CheckedBy::Failed);
     }
 
     #[test]

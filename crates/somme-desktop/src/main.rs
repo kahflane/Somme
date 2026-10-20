@@ -146,6 +146,11 @@ fn main() -> anyhow::Result<()> {
         Some(mcp::SERVICE_ARG) => std::process::exit(mcp::run_service()),
         Some(mcp::WORKER_ARG) => std::process::exit(mcp::run_worker()),
         Some(UNINSTALL_ARG) => std::process::exit(uninstall()),
+        // The builder's test suite, with the user's own LLM.
+        Some("--eval") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(automations::eval::run_cli(&args))
+        }
         // Release tools: make the update key, sign a release.
         Some(update::verify::KEYGEN_ARG | update::verify::SIGN_ARG) => {
             let args: Vec<String> = std::env::args().skip(1).collect();

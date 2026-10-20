@@ -14,6 +14,13 @@ pub use gpui_kit::assets::IconName as Lucide;
 
 use crate::ui::native;
 
+/// Green for something that worked: the theme's, toned down and moved
+/// toward the text colour, so it reads as words and not as a sign.
+pub fn ok_color(cx: &App) -> Hsla {
+    let theme = cx.theme();
+    Hsla { s: theme.success.s.min(0.35), l: (theme.success.l + theme.foreground.l) / 2., ..theme.success }
+}
+
 /// A button lightly filled with the text colour, for the main action on
 /// screens kept to plain colours: automations and screen control. The fill
 /// is the colour at a fifth, as the button draws it.

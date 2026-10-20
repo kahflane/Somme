@@ -69,7 +69,6 @@ impl Asker for LlmAsker {
             ],
             json: true,
             temperature: Some(0.0),
-            max_tokens: Some(800),
             ..ChatRequest::default()
         };
         let reply = self.llm.chat(&request).await?;

@@ -1,17 +1,23 @@
-//! The Agent step: an LLM with a goal and tools, like Claude Code or Codex.
-//! It loops: the LLM picks a tool, Somme runs it, and the result goes back,
-//! until the LLM answers without a tool or a limit is hit. The guard checks
-//! each tool call in the app; with `ask_first`, the user OKs each change too.
-//! With `computer`, it also sees and uses this computer's screen.
+//! The agent: an LLM with tools, like Claude Code or Codex. It loops: the
+//! LLM picks a tool, Somme runs it, and the result goes back, until the LLM
+//! answers without a tool or a limit is hit. The same loop is an Agent step
+//! in a run and the chat that does jobs with the user. Commands that only
+//! look run at once, several together; a change waits for the user's OK
+//! when the job asks for that, and runs inside the fence when it has one,
+//! so what it deletes or changes can be put back. The guard checks each
+//! tool call in the app. With `computer`, it also sees and uses this
+//! computer's screen.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use somme_ai::llm::{ChatRequest, Message, Part, Tool, ToolCall};
+use somme_ai::llm::{ChatRequest, Effort, Message, Part, Tool, ToolCall};
 
 use crate::computer::{self, Seen};
-use crate::nodes::{Finished, HostRef, Output, Tools};
+use crate::fence::{self, Fence};
+use crate::nodes::{Approval, Approved, Finished, HostRef, Output, Tools};
+use crate::readonly;
 
 /// Output kept from one tool call for the LLM, in characters.
 const RESULT_LIMIT: usize = 16_000;
@@ -27,14 +33,18 @@ const MARGIN: Duration = Duration::from_secs(20);
 const SHOTS_KEPT: usize = 3;
 /// How the message with a screenshot starts.
 const SCREEN_NOW: &str = "The screen now: ";
+/// What goes back when the user says no.
+const SAID_NO: &str = "Not done: the user said no. Do not try it another way; change course or stop and explain.";
 
-/// One Agent step's job.
+/// One agent's job.
+#[derive(Default)]
 pub struct Job<'a> {
     pub goal: &'a str,
     /// The servers it may use.
     pub hosts: Vec<HostRef>,
     /// It may work on this computer too.
     pub local: bool,
+    /// The user OKs each change. Commands that only look run at once.
     pub ask_first: bool,
     pub max_steps: u32,
     pub max_tokens: u64,
@@ -42,31 +52,92 @@ pub struct Job<'a> {
     pub computer: bool,
     pub apps: Vec<String>,
     pub timeout: Duration,
+    /// What it is told first, in place of an Agent step's rules.
+    pub rules: Option<String>,
+    /// Changes run inside it: what they delete goes to the Somme bin, unless
+    /// the agent says it can be made again, and files are copied first.
+    pub fence: Option<Fence>,
+    /// How hard the model thinks on each turn.
+    pub effort: Option<Effort>,
+    /// A tool call that names no place works on this computer.
+    pub local_first: bool,
+    /// When the fence stops a change, the user is asked to let it past;
+    /// with no one to ask, it is kept as wanted, for them to allow later.
+    pub ask_outside: bool,
 }
 
-/// Runs the job to its end. `note` gets a line for each thing it does.
-pub async fn run(job: Job<'_>, tools: &dyn Tools, note: &(dyn Fn(String) + Send + Sync)) -> Finished {
+/// What a job changed, and what it wanted to change past its fence.
+#[derive(Default)]
+struct Tally {
+    changed: BTreeSet<String>,
+    wanted: Vec<Value>,
+}
+
+/// Something the agent did, for people to follow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// Its words before the tools it calls.
+    Said(String),
+    /// It calls a tool: the call's id, the tool and a line about it.
+    Doing { id: String, name: String, line: String },
+    /// What the call gave back.
+    Done { id: String, result: String },
+    /// What a change deleted or changed is in the Somme bin, in `folder`,
+    /// on `host` (None: this computer).
+    Kept { host: Option<String>, folder: String, said: String },
+}
+
+/// Where the agent tells what it does.
+pub type Note<'a> = &'a (dyn Fn(Event) + Send + Sync);
+
+/// A talk with the agent, kept from one of the user's messages to the next.
+#[derive(Clone, Debug, Default)]
+pub struct Session {
+    /// The talk so far, its rules first.
+    pub messages: Vec<Message>,
+    /// The user let every change through until this task is done.
+    pub allow_all: bool,
+}
+
+/// Runs an Agent step's job to its end.
+pub async fn run(job: Job<'_>, tools: &dyn Tools, note: Note<'_>) -> Finished {
+    let mut rules = job.rules.clone().unwrap_or_else(|| rules(&job));
+    let notes = tools.notes();
+    if !notes.is_empty() {
+        rules.push_str(&format!("\n\nWhat earlier runs noted:\n- {}", notes.join("\n- ")));
+    }
+    let mut session = Session { messages: vec![Message::system(rules), Message::user(job.goal.trim())], allow_all: false };
     if !job.computer {
-        return work(&job, tools, note).await;
+        return work(&job, &mut session, tools, note).await;
     }
     if let Err(err) = tools.computer_start(&job.apps).await {
         return Finished::failed(err);
     }
-    let finished = work(&job, tools, note).await;
+    let finished = work(&job, &mut session, tools, note).await;
     tools.computer_end().await;
     finished
 }
 
-async fn work(job: &Job<'_>, tools: &dyn Tools, note: &(dyn Fn(String) + Send + Sync)) -> Finished {
+/// Carries on `session` from the user's newest message until the agent
+/// answers, asks, or a limit is hit.
+pub async fn resume(job: &Job<'_>, session: &mut Session, tools: &dyn Tools, note: Note<'_>) -> Finished {
+    work(job, session, tools, note).await
+}
+
+async fn work(job: &Job<'_>, session: &mut Session, tools: &dyn Tools, note: Note<'_>) -> Finished {
     let deadline = Instant::now() + job.timeout.saturating_sub(MARGIN);
-    let specs = specs(job);
-    let mut messages = vec![Message::system(rules(job)), Message::user(job.goal.trim())];
+    let specs = specs(job, tools);
     let mut steps = 0u32;
     let mut tokens = 0u64;
-    let mut changed = BTreeSet::new();
+    let mut tally = Tally::default();
     let mut said = String::new();
-    let end = |error: Option<String>, said: &str, steps: u32, tokens: u64, changed: &BTreeSet<String>| {
-        let result = json!({ "answer": said, "output": said, "steps": steps, "tokens": tokens, "changed": changed });
+    // Answers cut off in a row, before it called a tool.
+    let mut cut_offs = 0;
+    let end = |error: Option<String>, said: &str, steps: u32, tokens: u64, tally: &Tally| {
+        let mut result = json!({ "answer": said, "output": said, "steps": steps, "tokens": tokens, "changed": tally.changed });
+        if !tally.wanted.is_empty() {
+            result["wanted"] = json!(tally.wanted);
+        }
         match error {
             None => Finished { port: crate::schema::OK.into(), result, error: None },
             Some(error) => {
@@ -78,34 +149,73 @@ async fn work(job: &Job<'_>, tools: &dyn Tools, note: &(dyn Fn(String) + Send + 
     };
     loop {
         if tools.computer_stopped() {
-            return end(Some(computer::STOPPED.into()), &said, steps, tokens, &changed);
+            return end(Some(computer::STOPPED.into()), &said, steps, tokens, &tally);
         }
         if Instant::now() >= deadline {
-            return end(Some("Ran out of time before it was done.".into()), &said, steps, tokens, &changed);
+            return end(Some("Ran out of time before it was done.".into()), &said, steps, tokens, &tally);
         }
-        leave_out_old_shots(&mut messages);
-        let request = ChatRequest { messages: messages.clone(), tools: specs.clone(), max_tokens: Some(4000), temperature: Some(0.2), ..ChatRequest::default() };
+        leave_out_old_shots(&mut session.messages);
+        // No length limit: a thinking model can use a small one up before it
+        // calls a tool. The job's own token budget still holds.
+        let request = ChatRequest {
+            messages: session.messages.clone(),
+            tools: specs.clone(),
+            temperature: Some(0.2),
+            effort: job.effort,
+            cache: true,
+            ..ChatRequest::default()
+        };
         let reply = match tools.agent_turn(&request).await {
             Ok(reply) => reply,
-            Err(err) => return end(Some(err), &said, steps, tokens, &changed),
+            Err(err) => return end(Some(err), &said, steps, tokens, &tally),
         };
         tokens += reply.usage.input_tokens + reply.usage.output_tokens;
-        messages.push(Message::from_reply(&reply));
+        session.messages.push(Message::from_reply(&reply));
+        if reply.cut_off && reply.tool_calls.is_empty() && cut_offs < 2 {
+            cut_offs += 1;
+            session.messages.push(Message::user(somme_ai::llm::GO_ON));
+            continue;
+        }
+        cut_offs = 0;
         let text = reply.text.trim();
         if !text.is_empty() {
             said = text.to_owned();
         }
         if reply.tool_calls.is_empty() {
-            return end(None, &said, steps, tokens, &changed);
+            // The task is done: the next one asks again.
+            session.allow_all = false;
+            return end(None, &said, steps, tokens, &tally);
         }
         if !text.is_empty() {
-            note(text.to_owned());
+            note(Event::Said(text.to_owned()));
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Commands that only look run together, first.
+        let mut ready: BTreeMap<usize, String> = BTreeMap::new();
+        let quick: Vec<usize> = reply
+            .tool_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| only_looks(call))
+            .map(|(ix, _)| ix)
+            .take(job.max_steps.saturating_sub(steps) as usize)
+            .collect();
+        if quick.len() > 1 && !tools.computer_stopped() && tokens < job.max_tokens {
+            for &ix in &quick {
+                steps += 1;
+                let call = &reply.tool_calls[ix];
+                note(Event::Doing { id: call.id.clone(), name: call.name.clone(), line: describe(call) });
+            }
+            let answers = futures::future::join_all(quick.iter().map(|&ix| look(&reply.tool_calls[ix], job, tools, left))).await;
+            ready.extend(quick.into_iter().zip(answers));
         }
         let mut screen: Option<Seen> = None;
-        let app = shown_app(&messages);
-        for call in &reply.tool_calls {
+        let app = shown_app(&session.messages);
+        for (ix, call) in reply.tool_calls.iter().enumerate() {
             // Every call gets an answer, so the talk stays whole for the next turn.
-            let answer = if tools.computer_stopped() {
+            let answer = if let Some(answer) = ready.remove(&ix) {
+                answer
+            } else if tools.computer_stopped() {
                 format!("Not done: {}", computer::STOPPED)
             } else if steps >= job.max_steps {
                 "Not done: no tool calls left.".to_owned()
@@ -113,39 +223,36 @@ async fn work(job: &Job<'_>, tools: &dyn Tools, note: &(dyn Fn(String) + Send + 
                 "Not done: no tokens left.".to_owned()
             } else {
                 steps += 1;
-                note(describe(call));
+                note(Event::Doing { id: call.id.clone(), name: call.name.clone(), line: describe(call) });
                 let left = deadline.saturating_duration_since(Instant::now());
-                let answer = if call.name == "computer" && job.computer {
-                    let (answer, seen) = use_screen(call, job, tools, &app, left).await;
+                if call.name == "computer" && job.computer {
+                    let (answer, seen) = use_screen(call, job, session, tools, &app, text, left).await;
                     screen = seen.or(screen);
                     answer
                 } else {
-                    call_tool(call, job, tools, left, &mut changed).await
-                };
-                if let Some(first) = answer.lines().next().filter(|line| line.starts_with("Not done")) {
-                    note(first.to_owned());
+                    call_tool(call, job, session, tools, text, left, &mut tally, note).await
                 }
-                answer
             };
-            messages.push(Message::tool_result(&call.id, clip(&answer)));
+            note(Event::Done { id: call.id.clone(), result: answer.clone() });
+            session.messages.push(Message::tool_result(&call.id, clip(&answer)));
         }
         // Tool results are text only, so the screen goes after them.
         if let Some(seen) = screen {
-            messages.push(Message::user_with_png(format!("{SCREEN_NOW}{} in front.", seen.app), seen.png));
+            session.messages.push(Message::user_with_png(format!("{SCREEN_NOW}{} in front.", seen.app), seen.png));
         }
         if tools.computer_stopped() {
-            return end(Some(computer::STOPPED.into()), &said, steps, tokens, &changed);
+            return end(Some(computer::STOPPED.into()), &said, steps, tokens, &tally);
         }
         if steps >= job.max_steps {
-            return end(Some(format!("Used all its {} tool calls before it was done.", job.max_steps)), &said, steps, tokens, &changed);
+            return end(Some(format!("Used all its {} tool calls before it was done.", job.max_steps)), &said, steps, tokens, &tally);
         }
         if tokens >= job.max_tokens {
-            return end(Some(format!("Used all its {} tokens before it was done.", job.max_tokens)), &said, steps, tokens, &changed);
+            return end(Some(format!("Used all its {} tokens before it was done.", job.max_tokens)), &said, steps, tokens, &tally);
         }
     }
 }
 
-/// What the agent is told before the goal.
+/// What an Agent step is told before the goal.
 fn rules(job: &Job) -> String {
     let mut places: Vec<String> = job
         .hosts
@@ -165,8 +272,8 @@ fn rules(job: &Job) -> String {
         places.push(format!("- {LOCAL}: this computer ({})", std::env::consts::OS));
     }
     let asks = match (job.ask_first, job.computer) {
-        (true, false) => "The user OKs each command, change and web request before it runs, so say in one line why you need it before you call the tool.",
-        (true, true) => "The user OKs each command, change, web request and click before it runs, so say in one line why you need it before you call the tool.",
+        (true, false) => "The user OKs each change and web request before it runs, so say in one line why you need it before you call the tool. Commands that only look run at once.",
+        (true, true) => "The user OKs each change, web request and click before it runs, so say in one line why you need it before you call the tool. Commands that only look run at once.",
         (false, _) => "Use ask_user before anything risky, and before anything the goal did not ask for.",
     };
     let mut text = String::from("You are the Agent step of an automation in Somme, an SSH app. The user's goal comes next.\n");
@@ -199,12 +306,16 @@ fn rules(job: &Job) -> String {
     text
 }
 
-fn specs(job: &Job) -> Vec<Tool> {
+fn specs(job: &Job, tools: &dyn Tools) -> Vec<Tool> {
     let mut names: Vec<String> = job.hosts.iter().map(|host| host.name.clone()).collect();
     if job.local {
         names.push(LOCAL.into());
     }
-    let host = json!({ "type": "string", "enum": names, "description": "Where: a server's name, or \"local\" for this computer. Needed when there is more than one place." });
+    let host = if job.local_first {
+        json!({ "type": "string", "enum": names, "description": "Where: a server's name, or \"local\" for this computer. Defaults to this computer." })
+    } else {
+        json!({ "type": "string", "enum": names, "description": "Where: a server's name, or \"local\" for this computer. Needed when there is more than one place." })
+    };
     let tool = |name: &str, description: &str, properties: Value, required: &[&str]| Tool {
         name: name.into(),
         description: description.into(),
@@ -212,7 +323,7 @@ fn specs(job: &Job) -> Vec<Tool> {
     };
     let mut specs = Vec::new();
     if !names.is_empty() {
-        specs.extend(place_tools(&tool, &host));
+        specs.extend(place_tools(&tool, &host, job.fence.is_some()));
     }
     specs.push(tool(
         "http_request",
@@ -227,16 +338,18 @@ fn specs(job: &Job) -> Vec<Tool> {
     ));
     specs.push(tool(
         "ask_user",
-        "Asks the user a yes or no question and waits. Gives yes or no.",
+        "Asks the user a question and waits for the answer. Give a few choices when you can, made from what you found; they can also write their own.",
         json!({
             "question": { "type": "string", "description": "One short question." },
             "details": { "type": "string", "description": "What they need to know to answer." },
+            "choices": { "type": "array", "items": { "type": "string" }, "description": "Two to five short answers." },
         }),
         &["question"],
     ));
     if job.computer {
         specs.push(computer::spec());
     }
+    specs.extend(tools.more_tools());
     specs
 }
 
@@ -244,17 +357,24 @@ fn specs(job: &Job) -> Vec<Tool> {
 type MakeTool<'a> = &'a dyn Fn(&str, &str, Value, &[&str]) -> Tool;
 
 /// The tools that work in a place: a server or this computer.
-fn place_tools(tool: MakeTool, host: &Value) -> Vec<Tool> {
+fn place_tools(tool: MakeTool, host: &Value, fenced: bool) -> Vec<Tool> {
+    let mut command = json!({
+        "cmd": { "type": "string", "description": "Shell command to run." },
+        "host": host,
+        "workdir": { "type": "string", "description": "Folder to run it in. Defaults to the home folder." },
+        "timeout_seconds": { "type": "number", "description": "Stops it after this many seconds. Defaults to 120." },
+    });
+    if fenced {
+        command["rebuildable"] = json!({
+            "type": "boolean",
+            "description": "True when all it deletes can be made again, like build output, caches or installed packages: it is removed for good and frees the space. Otherwise what it deletes is kept in the Somme bin for 7 days.",
+        });
+    }
     vec![
         tool(
             "exec_command",
-            "Runs a shell command and gives its exit code and output.",
-            json!({
-                "cmd": { "type": "string", "description": "Shell command to run." },
-                "host": host,
-                "workdir": { "type": "string", "description": "Folder to run it in. Defaults to the home folder." },
-                "timeout_seconds": { "type": "number", "description": "Stops it after this many seconds. Defaults to 120." },
-            }),
+            "Runs a shell command and gives its exit code and output. Commands that only look (list, read, size, status) run at once, so use as many as you need; run several in one reply and they run together.",
+            command,
             &["cmd"],
         ),
         tool(
@@ -293,7 +413,7 @@ Relative paths start at the home folder.",
     ]
 }
 
-/// A line for the run view about a tool call.
+/// A line for people about a tool call.
 fn describe(call: &ToolCall) -> String {
     let args = call.args();
     let text = |name: &str| args.get(name).and_then(Value::as_str).unwrap_or_default().trim().to_owned();
@@ -315,12 +435,119 @@ fn describe(call: &ToolCall) -> String {
         }
         "ask_user" => format!("Asks you: {}", text("question")),
         "computer" => computer::Action::from_args(&args).map_or_else(|_| "Uses the screen".to_owned(), |action| action.describe()),
+        "read_skill" => format!("Reads the skill \u{201c}{}\u{201d}", text("name")),
+        "remember" => format!("Remembers: {}", text("fact")),
         other => format!("Calls {other}"),
     }
 }
 
-/// Runs one tool call and gives what goes back to the LLM.
-async fn call_tool(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Duration, changed: &mut BTreeSet<String>) -> String {
+/// Whether a call is a command that only looks: it runs at once, with others.
+fn only_looks(call: &ToolCall) -> bool {
+    call.name == "exec_command" && call.args().get("cmd").and_then(Value::as_str).is_some_and(|cmd| !cmd.trim().is_empty() && readonly::check(cmd).is_ok())
+}
+
+/// Runs a command that only looks.
+async fn look(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Duration) -> String {
+    let args = call.args();
+    let host = match where_to(job, args.get("host").and_then(Value::as_str)) {
+        Ok(host) => host,
+        Err(err) => return format!("Not done: {err}"),
+    };
+    let cmd = args.get("cmd").and_then(Value::as_str).unwrap_or_default();
+    let workdir = args.get("workdir").and_then(Value::as_str).unwrap_or_default();
+    match run_look(tools, host, cmd, workdir, command_time(&args, left)).await {
+        Ok(output) => command_text(&output),
+        Err(err) => format!("Not done: {err}"),
+    }
+}
+
+/// Runs a command that only looks, walled in: on this Mac in macOS's
+/// sandbox, and with git kept from running programs a repository names.
+/// What checks commands reads the command itself.
+async fn run_look(tools: &dyn Tools, host: Option<&HostRef>, cmd: &str, workdir: &str, timeout: Duration) -> Result<Output, String> {
+    let workdir = workdir.trim();
+    match host {
+        Some(host) => {
+            let cmd = if workdir.is_empty() { cmd.to_owned() } else { format!("cd {} && {cmd}", crate::nodes::quote(workdir)) };
+            tools.run_fenced_on_host(host, &cmd, &fence::look_script(&cmd), timeout).await
+        }
+        None => {
+            let dir = (!workdir.is_empty()).then(|| workdir.to_owned()).or_else(|| home().map(|home| home.display().to_string()));
+            let walled = fence::look_command(cmd).unwrap_or_else(|| fence::look_script(cmd));
+            tools.run_fenced_local(cmd, &walled, &[], dir.as_deref(), timeout).await
+        }
+    }
+}
+
+/// How long a command may run: what the LLM asked, within what is left.
+fn command_time(args: &Value, left: Duration) -> Duration {
+    let seconds = args.get("timeout_seconds").and_then(Value::as_f64).map_or(COMMAND_SECONDS, |seconds| seconds.max(1.0) as u64);
+    Duration::from_secs(seconds).min(left)
+}
+
+/// Runs `cmd` where `host` says, inside `fence` when there is one.
+async fn run_command(tools: &dyn Tools, host: Option<&HostRef>, cmd: &str, workdir: &str, timeout: Duration, fence: Option<&Fence>) -> Result<Output, String> {
+    let workdir = workdir.trim();
+    match host {
+        Some(host) => {
+            let cmd = if workdir.is_empty() { cmd.to_owned() } else { format!("cd {} && {cmd}", crate::nodes::quote(workdir)) };
+            match fence {
+                // The sandbox and the bin's folder are this computer's: a
+                // server's bin is in its own home.
+                Some(fence) => {
+                    let fence = Fence { sandbox: false, bin_root: None, ..fence.clone() };
+                    tools.run_fenced_on_host(host, &cmd, &fence::command(&cmd, &fence), timeout).await
+                }
+                None => tools.run_on_host(host, &cmd, timeout).await,
+            }
+        }
+        None => {
+            let dir = (!workdir.is_empty()).then(|| workdir.to_owned()).or_else(|| home().map(|home| home.display().to_string()));
+            match fence {
+                Some(fence) => tools.run_fenced_local(cmd, &fence::command(cmd, fence), &[], dir.as_deref(), timeout).await,
+                None => tools.run_local(cmd, &[], dir.as_deref(), timeout).await,
+            }
+        }
+    }
+}
+
+/// Tells of the bin folders a fenced command's output names.
+fn kept(output: &Output, host: Option<&HostRef>, note: Note<'_>) {
+    for (said, folder) in fence::bin_folders(&output.stderr) {
+        note(Event::Kept { host: host.map(|host| host.name.clone()), folder, said });
+    }
+}
+
+/// Asks the user to OK a change, unless they let the rest through. None
+/// when it may go ahead; else what goes back to the LLM.
+async fn approve(tools: &dyn Tools, session: &mut Session, approval: Approval, left: Duration) -> Option<String> {
+    if session.allow_all {
+        return None;
+    }
+    match tools.approve(&approval, left).await {
+        Ok(Approved::Once) => None,
+        Ok(Approved::Rest) => {
+            session.allow_all = true;
+            None
+        }
+        Ok(Approved::No) => Some(SAID_NO.into()),
+        Err(err) => Some(format!("Not done: {err}")),
+    }
+}
+
+/// Runs one tool call and gives what goes back to the LLM. `why` is what
+/// the LLM said before it, shown when the user is asked.
+#[allow(clippy::too_many_arguments)]
+async fn call_tool(
+    call: &ToolCall,
+    job: &Job<'_>,
+    session: &mut Session,
+    tools: &dyn Tools,
+    why: &str,
+    left: Duration,
+    tally: &mut Tally,
+    note: Note<'_>,
+) -> String {
     let args = call.args();
     if !args.is_object() {
         return "Not done: the arguments were not a JSON object.".into();
@@ -339,30 +566,68 @@ async fn call_tool(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Dura
     };
     let host = place.flatten();
     let at = host.map_or_else(|| "this computer".to_owned(), |host| host.name.clone());
+    let asked = |title: &str, detail: String, for_good: bool| Approval { title: title.into(), place: at.clone(), detail, why: why.trim().to_owned(), for_good };
     match call.name.as_str() {
         "exec_command" => {
             let cmd = text("cmd");
             if cmd.trim().is_empty() {
                 return "Not done: cmd is empty.".into();
             }
-            let workdir = text("workdir");
-            let seconds = args.get("timeout_seconds").and_then(Value::as_f64).map_or(COMMAND_SECONDS, |seconds| seconds.max(1.0) as u64);
-            let timeout = Duration::from_secs(seconds).min(left);
-            if job.ask_first && let Some(no) = ok_from_user(tools, "Let the agent run this?", &format!("On {at}:\n{cmd}"), left).await {
-                return no;
+            let timeout = command_time(&args, left);
+            if readonly::check(&cmd).is_ok() {
+                return match run_look(tools, host, &cmd, &text("workdir"), timeout).await {
+                    Ok(output) => command_text(&output),
+                    Err(err) => format!("Not done: {err}"),
+                };
             }
-            let output = match host {
-                Some(host) => {
-                    let cmd = if workdir.trim().is_empty() { cmd } else { format!("cd {} && {cmd}", crate::nodes::quote(workdir.trim())) };
-                    tools.run_on_host(host, &cmd, timeout).await
+            let for_good = args.get("rebuildable").and_then(Value::as_bool).unwrap_or(false);
+            let fence = job.fence.as_ref().map(|fence| Fence { bin: fence.bin && !for_good, ..fence.clone() });
+            if fence.is_some()
+                && let Err(why) = fence::can_fence(&cmd)
+            {
+                return format!("Not done: Somme can't keep what this changes, because {why}. Write it another way.");
+            }
+            if job.ask_first && !session.allow_all {
+                // The guard first, so the user isn't asked about what it stops.
+                if let Err(err) = tools.check("command", &cmd, host).await {
+                    return format!("Not done: {err}");
                 }
-                None => {
-                    let dir = (!workdir.trim().is_empty()).then(|| workdir.trim().to_owned()).or_else(|| home().map(|home| home.display().to_string()));
-                    tools.run_local(&cmd, &[], dir.as_deref(), timeout).await
+                if let Some(no) = approve(tools, session, asked("Let the agent run this?", cmd.clone(), fence.is_some() && for_good), left).await {
+                    return no;
                 }
-            };
-            match output {
-                Ok(output) => command_text(&output),
+            }
+            match run_command(tools, host, &cmd, &text("workdir"), timeout, fence.as_ref()).await {
+                Ok(output) => {
+                    if let Some(fence) = &fence {
+                        kept(&output, host, note);
+                        if let Some(stop) = fence::stopped(&format!("{}\n{}", output.stdout, output.stderr), fence.sandbox && host.is_none()) {
+                            if !job.ask_outside {
+                                return format!("Not done: {stop}\n{}", command_text(&output));
+                            }
+                            // Past the fence only with the user's OK, and then in a fence that keeps what it deletes.
+                            let wanted = |why: &str| json!({ "command": cmd, "host": at, "widen": fence::widen(&stop).map(|(kind, value)| json!({ "kind": kind, "value": value })), "why": why });
+                            let past = Approval { title: "Let the agent go past what it may change?".into(), place: at.clone(), detail: format!("{cmd}\n\n{stop}"), why: why.trim().to_owned(), for_good: false };
+                            return match tools.approve(&past, left).await {
+                                Ok(Approved::No) => format!("Not done: {stop}\nThe user said no to going past it. Do not try it another way; carry on without it."),
+                                Ok(_) => {
+                                    let keep = Fence { scope: Fence::keep(&fence.step, fence.bin).scope, sandbox: false, ..fence.clone() };
+                                    match run_command(tools, host, &cmd, &text("workdir"), timeout, Some(&keep)).await {
+                                        Ok(output) => {
+                                            kept(&output, host, note);
+                                            command_text(&output)
+                                        }
+                                        Err(err) => format!("Not done: {err}"),
+                                    }
+                                }
+                                Err(err) => {
+                                    tally.wanted.push(wanted(&stop));
+                                    format!("Not done: {stop}\nNo one could let it past ({err}), so the user sees it in this run to allow later. Carry on with the rest.")
+                                }
+                            };
+                        }
+                    }
+                    command_text(&output)
+                }
                 Err(err) => format!("Not done: {err}"),
             }
         }
@@ -382,14 +647,52 @@ async fn call_tool(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Dura
         }
         "apply_patch" => {
             let patch = text("input");
-            if let Err(err) = somme_patch::parse_patch(&patch) {
-                return format!("Not done: {err}");
-            }
+            let hunks = match somme_patch::parse_patch(&patch) {
+                Ok(hunks) => hunks,
+                Err(err) => return format!("Not done: {err}"),
+            };
             if let Err(err) = tools.check("write file", &patch, host).await {
                 return format!("Not done: {err}");
             }
-            if job.ask_first && let Some(no) = ok_from_user(tools, "Let the agent change these files?", &format!("On {at}:\n{patch}"), left).await {
+            if job.ask_first
+                && let Some(no) = approve(tools, session, asked("Let the agent change these files?", patch.clone(), false), left).await
+            {
                 return no;
+            }
+            let paths: Vec<String> = hunks
+                .iter()
+                .flat_map(|hunk| match hunk {
+                    somme_patch::Hunk::UpdateFile { path, move_path, .. } => vec![path.clone()].into_iter().chain(move_path.clone()).collect(),
+                    somme_patch::Hunk::DeleteFile { path } | somme_patch::Hunk::AddFile { path, .. } => vec![path.clone()],
+                })
+                .collect();
+            // A patch doesn't go through the fence's stand-ins, so its files are checked here.
+            if let Some(fence) = &job.fence {
+                let home = if host.is_some() { "~".to_owned() } else { home().map(|home| home.display().to_string()).unwrap_or_default() };
+                let outside: Vec<&String> = paths.iter().filter(|path| !fence::inside(&fence.scope, path, &home)).collect();
+                if let Some(first) = outside.first() {
+                    let stop = format!("Somme stopped `apply_patch`: {first} is outside what this automation may change (its scope).");
+                    if !job.ask_outside {
+                        return format!("Not done: {stop}");
+                    }
+                    let past = Approval { title: "Let the agent go past what it may change?".into(), place: at.clone(), detail: format!("{patch}\n\n{stop}"), why: why.trim().to_owned(), for_good: false };
+                    match tools.approve(&past, left).await {
+                        Ok(Approved::No) => return format!("Not done: {stop}\nThe user said no to going past it. Do not try it another way; carry on without it."),
+                        Ok(_) => {}
+                        Err(err) => {
+                            tally.wanted.push(json!({ "command": format!("change {}", outside.iter().map(|path| path.as_str()).collect::<Vec<_>>().join(", ")), "host": at, "widen": { "kind": "path", "value": first }, "why": stop }));
+                            return format!("Not done: {stop}\nNo one could let it past ({err}), so the user sees it in this run to allow later. Carry on with the rest.");
+                        }
+                    }
+                }
+            }
+            // Copies of the files first, so they can be put back.
+            if let Some(fence) = &job.fence {
+                let backups = paths.clone();
+                let keeper = Fence { backups, sandbox: false, ..fence.clone() };
+                if let Ok(output) = run_command(tools, host, "true", "", Duration::from_secs(30).min(left), Some(&keeper)).await {
+                    kept(&output, host, note);
+                }
             }
             let name = |path: &str| match host {
                 Some(host) => format!("{}:{path}", host.name),
@@ -397,11 +700,11 @@ async fn call_tool(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Dura
             };
             match tools.patch(host, &patch).await {
                 Ok(applied) => {
-                    changed.extend(applied.added.iter().chain(&applied.modified).chain(&applied.deleted).map(|path| name(path)));
+                    tally.changed.extend(applied.added.iter().chain(&applied.modified).chain(&applied.deleted).map(|path| name(path)));
                     applied.summary()
                 }
                 Err(failed) => {
-                    changed.extend(failed.done.added.iter().chain(&failed.done.modified).chain(&failed.done.deleted).map(|path| name(path)));
+                    tally.changed.extend(failed.done.added.iter().chain(&failed.done.modified).chain(&failed.done.deleted).map(|path| name(path)));
                     if failed.done.is_empty() {
                         format!("Not done: {}", failed.message)
                     } else {
@@ -424,8 +727,9 @@ async fn call_tool(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Dura
             }
             // A GET can carry what it read out in its address, so every
             // request is asked.
+            let shown = format!("{method} {url}\n{headers}\n\n{}", text("body")).trim_end().to_owned();
             if job.ask_first
-                && let Some(no) = ok_from_user(tools, "Let the agent send this?", format!("{method} {url}\n{headers}\n\n{}", text("body")).trim_end(), left).await
+                && let Some(no) = approve(tools, session, Approval { place: String::new(), ..asked("Let the agent send this?", shown, false) }, left).await
             {
                 return no;
             }
@@ -434,18 +738,30 @@ async fn call_tool(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Dura
                 Err(err) => format!("Not done: {err}"),
             }
         }
-        "ask_user" => match tools.ask(&text("question"), &text("details"), left).await {
-            Ok(true) => "yes".into(),
-            Ok(false) => "no".into(),
-            Err(err) => format!("Not done: {err}"),
-        },
+        "ask_user" => {
+            let choices: Vec<String> = args
+                .get("choices")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|choice| choice.trim().to_owned())
+                .filter(|choice| !choice.is_empty())
+                .take(5)
+                .collect();
+            match tools.question(&text("question"), &text("details"), &choices, left).await {
+                Ok(answer) => answer,
+                Err(err) => format!("Not done: {err}"),
+            }
+        }
+        other if tools.more_tools().iter().any(|tool| tool.name == other) => tools.more(call).await,
         other => format!("Not done: there is no tool called {other}."),
     }
 }
 
 /// Does one thing on the screen. Gives what goes back to the LLM, and the
 /// screen after it.
-async fn use_screen(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, app: &str, left: Duration) -> (String, Option<Seen>) {
+async fn use_screen(call: &ToolCall, job: &Job<'_>, session: &mut Session, tools: &dyn Tools, app: &str, why: &str, left: Duration) -> (String, Option<Seen>) {
     let not_done = |why: String| (format!("Not done: {why}"), None);
     let action = match computer::Action::from_args(&call.args()) {
         Ok(action) => action,
@@ -462,7 +778,10 @@ async fn use_screen(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, app: &str
         if let Err(err) = tools.check(kind, &detail, None).await {
             return not_done(err);
         }
-        if job.ask_first && let Some(no) = ok_from_user(tools, "Let the agent do this on the screen?", &action.describe(), left).await {
+        let approval = Approval { title: "Let the agent do this on the screen?".into(), place: "this computer".into(), detail: action.describe(), why: why.trim().to_owned(), for_good: false };
+        if job.ask_first
+            && let Some(no) = approve(tools, session, approval, left).await
+        {
             return (no, None);
         }
     }
@@ -497,15 +816,6 @@ fn leave_out_old_shots(messages: &mut [Message]) {
     }
 }
 
-/// Asks the user to OK an action. None when they do; else what goes back to the LLM.
-async fn ok_from_user(tools: &dyn Tools, title: &str, message: &str, left: Duration) -> Option<String> {
-    match tools.ask(title, message, left).await {
-        Ok(true) => None,
-        Ok(false) => Some("Not done: the user said no. Do not try it another way; change course or stop and explain.".into()),
-        Err(err) => Some(format!("Not done: {err}")),
-    }
-}
-
 /// The place a tool call names: a server, or None for this computer.
 fn where_to<'a>(job: &'a Job, named: Option<&str>) -> Result<Option<&'a HostRef>, String> {
     let named = named.map(str::trim).filter(|name| !name.is_empty());
@@ -517,6 +827,7 @@ fn where_to<'a>(job: &'a Job, named: Option<&str>) -> Result<Option<&'a HostRef>
         names.join(", ")
     };
     match named {
+        None if job.local && job.local_first => Ok(None),
         None => match (job.hosts.as_slice(), job.local) {
             ([host], false) => Ok(Some(host)),
             ([], true) => Ok(None),

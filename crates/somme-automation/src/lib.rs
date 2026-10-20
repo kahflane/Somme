@@ -6,12 +6,15 @@ pub mod agent;
 pub mod computer;
 pub mod dry;
 pub mod engine;
+pub mod fence;
 pub mod history;
 pub mod layout;
 pub mod net;
 pub mod nodes;
+pub mod readonly;
 pub mod schedule;
 pub mod schema;
+pub mod shell;
 pub mod templates;
 pub mod values;
 

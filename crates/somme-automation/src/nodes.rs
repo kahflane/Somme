@@ -15,6 +15,7 @@ use somme_patch::{Applied, Failed};
 
 use crate::agent::{self, Job};
 use crate::computer;
+use crate::fence::{self, Fence};
 use crate::net::{Certificate, HttpReply};
 use crate::schema::{ALLOWED, DENIED, Direction, FAILED, HostPick, NO, NodeKind, OK, Test, UNSURE, YES};
 use crate::values::{Shell, ShellCommand, as_text, render, render_shell, with_values};
@@ -76,6 +77,30 @@ pub struct Written {
     pub tokens: Option<u64>,
 }
 
+/// A change an agent wants to make, for the user to OK.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Approval {
+    /// Like "Run this command?".
+    pub title: String,
+    /// Where: a server's name, or "this computer".
+    pub place: String,
+    /// The command, patch or request.
+    pub detail: String,
+    /// What the agent said it is for.
+    pub why: String,
+    /// What it deletes is gone for good, not kept in the Somme bin.
+    pub for_good: bool,
+}
+
+/// The user's answer to an approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Approved {
+    Once,
+    /// This and every change after it, until the task is done.
+    Rest,
+    No,
+}
+
 /// What the app gives the engine.
 #[async_trait]
 pub trait Tools: Send + Sync {
@@ -86,6 +111,19 @@ pub trait Tools: Send + Sync {
     /// `vars` are set for the command, as its `{{…}}` values.
     async fn run_local(&self, command: &str, vars: &[(String, String)], dir: Option<&str>, timeout: Duration) -> Result<Output, String> {
         run_local(command, vars, dir, timeout).await
+    }
+
+    /// Runs `fenced`, the step's command `shown` inside its fence. What
+    /// checks commands reads `shown`, not the fence around it.
+    async fn run_fenced_on_host(&self, host: &HostRef, shown: &str, fenced: &str, timeout: Duration) -> Result<Output, String> {
+        let _ = shown;
+        self.run_on_host(host, fenced, timeout).await
+    }
+
+    /// Like `run_fenced_on_host`, on this computer.
+    async fn run_fenced_local(&self, shown: &str, fenced: &str, vars: &[(String, String)], dir: Option<&str>, timeout: Duration) -> Result<Output, String> {
+        let _ = shown;
+        self.run_local(fenced, vars, dir, timeout).await
     }
 
     async fn notify(&self, title: &str, body: &str);
@@ -109,6 +147,34 @@ pub trait Tools: Send + Sync {
     /// Asks the user to allow or deny. `Ok(true)` when they allow.
     async fn ask(&self, _title: &str, _message: &str, _timeout: Duration) -> Result<bool, String> {
         Err("Ask me needs someone to answer. Open Somme and run it from there.".into())
+    }
+
+    /// Asks the user to OK a change an agent wants to make. Here, the plain
+    /// yes or no of `ask`.
+    async fn approve(&self, approval: &Approval, timeout: Duration) -> Result<Approved, String> {
+        let message = if approval.place.is_empty() { approval.detail.clone() } else { format!("On {}:\n{}", approval.place, approval.detail) };
+        self.ask(&approval.title, &message, timeout).await.map(|yes| if yes { Approved::Once } else { Approved::No })
+    }
+
+    /// Asks the user a question for an agent. With `choices`, the user picks
+    /// one or writes their own; here, only yes or no.
+    async fn question(&self, question: &str, details: &str, _choices: &[String], timeout: Duration) -> Result<String, String> {
+        self.ask(question, details, timeout).await.map(|yes| if yes { "yes" } else { "no" }.to_owned())
+    }
+
+    /// What earlier runs of this automation's agent noted for later ones.
+    fn notes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Tools the app adds to an agent's, like reading a skill.
+    fn more_tools(&self) -> Vec<somme_ai::llm::Tool> {
+        Vec::new()
+    }
+
+    /// Answers a call to one of `more_tools`.
+    async fn more(&self, call: &somme_ai::llm::ToolCall) -> String {
+        format!("Not done: there is no tool called {}.", call.name)
     }
 
     /// Copies one file over SFTP. Gives the bytes copied.
@@ -239,7 +305,7 @@ pub struct Finished {
 }
 
 impl Finished {
-    fn ok(result: Value) -> Self {
+    pub fn ok(result: Value) -> Self {
         Self { port: OK.into(), result, error: None }
     }
 
@@ -256,7 +322,16 @@ impl Finished {
 /// Runs one try of a step, with its `{{…}}` values filled from `context`.
 /// `ai_text`: its command holds text an AI wrote in this run, so the user
 /// must allow it first. `note` gets lines about what a long step is doing.
-pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: Duration, ai_text: bool, note: &(dyn Fn(String) + Send + Sync)) -> Finished {
+/// `fence`: it runs inside one, as a step the AI wrote does.
+pub async fn run(
+    kind: &NodeKind,
+    context: &Value,
+    tools: &dyn Tools,
+    timeout: Duration,
+    ai_text: bool,
+    note: &(dyn Fn(String) + Send + Sync),
+    fence: Option<&Fence>,
+) -> Finished {
     match kind {
         NodeKind::Command { hosts, command, one_by_one, sudo } => {
             let shell = render_shell(command, context, Shell::Posix);
@@ -264,17 +339,36 @@ pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: D
             if *sudo {
                 command = format!("sudo -n sh -c {}", quote(&command));
             }
-            run_command(hosts, &command, *one_by_one, tools, timeout, needs_ok(ai_text, &shell)).await
+            let fenced = match fence {
+                Some(fence) => match fence::can_fence(&command) {
+                    Ok(()) => Some(fence::command(&command, &Fence { sandbox: false, ..fence.clone() })),
+                    Err(why) => return Finished::failed(unfenced(&why)),
+                },
+                None => None,
+            };
+            run_command(hosts, &command, fenced.as_deref(), *one_by_one, tools, timeout, needs_ok(ai_text, &shell)).await
         }
         NodeKind::Local { command, dir } => {
             let shell = render_shell(command, context, if cfg!(windows) { Shell::Cmd } else { Shell::Posix });
             let dir = dir.as_deref().map(|dir| render(dir, context)).filter(|dir| !dir.trim().is_empty());
+            let shown = with_values(&shell.script, &shell.vars);
             if let Some(why) = needs_ok(ai_text, &shell)
-                && let Err(err) = tools.allow_command(&with_values(&shell.script, &shell.vars), None, why).await
+                && let Err(err) = tools.allow_command(&shown, None, why).await
             {
                 return Finished::failed(err);
             }
-            match tools.run_local(&shell.script, &shell.vars, dir.as_deref(), timeout).await {
+            let ran = match fence {
+                // Windows runs steps with cmd, which the fence doesn't know.
+                Some(fence) if !cfg!(windows) => {
+                    if let Err(why) = fence::can_fence(&shell.script) {
+                        return Finished::failed(unfenced(&why));
+                    }
+                    let fenced = fence::command(&shell.script, &Fence { sandbox: fence::can_sandbox(), ..fence.clone() });
+                    tools.run_fenced_local(&shown, &fenced, &shell.vars, dir.as_deref(), timeout).await
+                }
+                _ => tools.run_local(&shell.script, &shell.vars, dir.as_deref(), timeout).await,
+            };
+            match ran {
                 Ok(output) => from_output(output, None),
                 Err(err) => Finished::failed(err),
             }
@@ -426,8 +520,25 @@ pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: D
                 computer: *computer,
                 apps,
                 timeout,
+                effort: Some(somme_ai::llm::Effort::Low),
+                // Inside the automation's scope it works on its own; past it, it asks.
+                fence: fence.cloned(),
+                ask_outside: fence.is_some(),
+                ..Job::default()
             };
-            agent::run(job, tools, note).await
+            // The run view gets a line for each thing it does, and why a call
+            // was not done.
+            let lines = |event: agent::Event| match event {
+                agent::Event::Said(text) => note(text),
+                agent::Event::Doing { line, .. } => note(line),
+                agent::Event::Done { result, .. } => {
+                    if let Some(first) = result.lines().next().filter(|line| line.starts_with("Not done")) {
+                        note(first.to_owned());
+                    }
+                }
+                agent::Event::Kept { said, .. } => note(said),
+            };
+            agent::run(job, tools, &lines).await
         }
     }
 }
@@ -521,7 +632,30 @@ fn needs_ok(ai_text: bool, shell: &ShellCommand) -> Option<&'static str> {
     }
 }
 
-async fn run_command(picked: &HostPick, command: &str, one_by_one: bool, tools: &dyn Tools, timeout: Duration, why: Option<&str>) -> Finished {
+/// Why a step the AI wrote didn't run: it couldn't be kept in its scope.
+fn unfenced(why: &str) -> String {
+    format!("Not run: Somme can't keep this step inside what it may change, because {why}.")
+}
+
+/// Runs `command` on the servers `picked`; `fenced` is it inside its fence.
+async fn run_command(
+    picked: &HostPick,
+    command: &str,
+    fenced: Option<&str>,
+    one_by_one: bool,
+    tools: &dyn Tools,
+    timeout: Duration,
+    why: Option<&str>,
+) -> Finished {
+    let run_on = |host: &HostRef| {
+        let host = host.clone();
+        async move {
+            match fenced {
+                Some(fenced) => tools.run_fenced_on_host(&host, command, fenced, timeout).await,
+                None => tools.run_on_host(&host, command, timeout).await,
+            }
+        }
+    };
     let hosts = match tools.hosts().await {
         Ok(hosts) => pick(&hosts, picked),
         Err(err) => return Finished::failed(err),
@@ -536,7 +670,7 @@ async fn run_command(picked: &HostPick, command: &str, one_by_one: bool, tools: 
         return Finished::failed(err);
     }
     if let [host] = hosts.as_slice() {
-        return match tools.run_on_host(host, command, timeout).await {
+        return match run_on(host).await {
             Ok(output) => from_output(output, Some(host)),
             Err(err) => Finished { result: json!({ "error": err, "host": host.name }), ..Finished::failed(err) },
         };
@@ -544,7 +678,7 @@ async fn run_command(picked: &HostPick, command: &str, one_by_one: bool, tools: 
     let mut results = Vec::new();
     if one_by_one {
         for host in &hosts {
-            let result = tools.run_on_host(host, command, timeout).await;
+            let result = run_on(host).await;
             let failed = !result.as_ref().is_ok_and(Output::ok);
             results.push((host, result));
             if failed {
@@ -552,7 +686,7 @@ async fn run_command(picked: &HostPick, command: &str, one_by_one: bool, tools: 
             }
         }
     } else {
-        let runs = hosts.iter().map(|host| tools.run_on_host(host, command, timeout));
+        let runs = hosts.iter().map(run_on);
         results = hosts.iter().zip(futures::future::join_all(runs).await).collect();
     }
     let mut output = String::new();
@@ -767,18 +901,18 @@ mod tests {
             command: "printf '%s|' {{input.v}} \"in {{input.v}}\" 'in {{input.v}}'\ncat <<EOF\n{{input.v}}\nEOF".into(),
             dir: Some(dir.path().display().to_string()),
         };
-        let done = run(&step, &context, &Here, Duration::from_secs(10), false, &|_| {}).await;
+        let done = run(&step, &context, &Here, Duration::from_secs(10), false, &|_| {}, None).await;
         assert_eq!(done.result["stdout"], json!(format!("{bad}|in {bad}|in {bad}|{bad}\n")), "{done:?}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "a value ran as code");
         // A `~` at the start of a value is still the home folder.
         let home = json!({ "input": { "d": "~/somme-tilde-check" } });
         let step = NodeKind::Local { command: "printf %s {{input.d}}".into(), dir: None };
-        let done = run(&step, &home, &Here, Duration::from_secs(10), false, &|_| {}).await;
+        let done = run(&step, &home, &Here, Duration::from_secs(10), false, &|_| {}, None).await;
         assert_eq!(done.result["stdout"], json!(format!("{}/somme-tilde-check", std::env::var("HOME").unwrap())), "{done:?}");
         // A second shell would read it as code again, so it waits for an OK
         // that no one here can give.
         let step = NodeKind::Local { command: "sh -c 'echo {{input.v}}'".into(), dir: Some(dir.path().display().to_string()) };
-        let done = run(&step, &context, &Here, Duration::from_secs(10), false, &|_| {}).await;
+        let done = run(&step, &context, &Here, Duration::from_secs(10), false, &|_| {}, None).await;
         assert!(done.is_failure() && done.error.as_deref().is_some_and(|error| error.contains("another shell")), "{done:?}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "a value ran as code");
     }

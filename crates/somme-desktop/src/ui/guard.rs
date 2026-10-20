@@ -16,7 +16,7 @@ use crate::ai::{self, Feature, GuardAsk};
 use crate::runtime;
 use crate::settings::Settings;
 use crate::store::Store;
-use crate::ui::common::{APP_NAME, Lucide};
+use crate::ui::common::{APP_NAME, Lucide, ok_color};
 use crate::ui::native;
 use crate::ui::settings_page::{SettingsPage, choice};
 
@@ -255,7 +255,7 @@ impl Render for GuardSetup {
             .then(|| hint("Guard checks are off in Settings › AI, so only the quick check runs."));
         let verdict = self.verdict.as_ref().map(|verdict| {
             let (icon, word, color) = match verdict.decision {
-                Decision::Run => (Lucide::CircleCheck, "Would run.", theme.success),
+                Decision::Run => (Lucide::CircleCheck, "Would run.", ok_color(cx)),
                 Decision::Ask => (Lucide::CircleQuestionMark, "Would ask you first.", theme.warning),
                 Decision::Block => (Lucide::ShieldX, "Would be blocked.", theme.danger),
             };

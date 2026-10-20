@@ -2,7 +2,11 @@
 //! runs as they happen. The engine and the run log live in
 //! `somme-automation`; `runner` starts runs here and in the background worker.
 
+pub mod assistant;
 pub mod builder;
+pub mod eval;
+pub mod memory;
+pub mod skills;
 pub mod runner;
 pub mod scheduler;
 pub mod tools;

@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::fence::Fence;
 use crate::nodes::{self, Finished, HIDDEN, Tools};
-use crate::schema::{Automation, FAILED, problems, runs_ai_text, vault_names};
+use crate::schema::{Automation, FAILED, NodeKind, problems, runs_ai_text, vault_names};
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
@@ -128,9 +129,9 @@ pub async fn run(
                         steps[ix] = Step::Running;
                         let node = nodes[ix].clone();
                         let ai_text = runs_ai_text(automation, &node);
-                        let (tools, context, cancel) = (tools.clone(), context.clone(), cancel.clone());
+                        let (tools, context, cancel, scope) = (tools.clone(), context.clone(), cancel.clone(), automation.scope.clone());
                         running.push(async move {
-                            let finished = run_node(&node, &context, tools.as_ref(), on_event, &cancel, ai_text).await;
+                            let finished = run_node(&node, &context, tools.as_ref(), on_event, &cancel, ai_text, &scope).await;
                             (ix, finished)
                         });
                     } else {
@@ -223,6 +224,74 @@ impl Hider {
     }
 }
 
+/// A report-only step's preview, run in its command's place. It must only
+/// look; otherwise nothing runs, and the step says what it would have run.
+fn report_kind(node: &crate::schema::Node) -> Result<crate::schema::NodeKind, String> {
+    let command = node.kind.command().unwrap_or_default().trim();
+    let preview = node.preview.trim();
+    if preview.is_empty() {
+        return Err(format!("Report only: it changed nothing. It would run:\n{command}"));
+    }
+    if let Err(why) = crate::readonly::check(preview) {
+        return Err(format!("Report only: it changed nothing. Its preview was not run ({why}). It would run:\n{command}"));
+    }
+    Ok(with_command(&node.kind, preview))
+}
+
+/// `kind` running `text` in place of its command, where it would run, and
+/// without sudo.
+fn with_command(kind: &NodeKind, text: &str) -> NodeKind {
+    let mut kind = kind.clone();
+    match &mut kind {
+        NodeKind::Command { command, sudo, .. } => {
+            *command = text.to_owned();
+            *sudo = false;
+        }
+        NodeKind::Local { command, .. } => *command = text.to_owned(),
+        _ => {}
+    }
+    kind
+}
+
+/// How long a step's check may take.
+const CHECK_LIMIT: Duration = Duration::from_secs(60);
+
+/// Runs `node`'s check after it did its work. A failed check fails the
+/// step: it ran, but didn't do its job.
+async fn check_after(
+    node: &crate::schema::Node,
+    finished: Finished,
+    context: &Value,
+    tools: &dyn Tools,
+    ai_text: bool,
+    note: &(dyn Fn(String) + Send + Sync),
+) -> Finished {
+    let check = node.check.trim();
+    if check.is_empty() || finished.is_failure() || node.kind.command().is_none() {
+        return finished;
+    }
+    // A check the AI wrote must only look; it is never fenced.
+    if node.by_ai
+        && let Err(why) = crate::readonly::check(check)
+    {
+        note(format!("Its check was not run: it doesn't only look ({why})."));
+        return finished;
+    }
+    let checked = nodes::run(&with_command(&node.kind, check), context, tools, CHECK_LIMIT, ai_text, note, None).await;
+    let mut finished = finished;
+    finished.result["check"] = serde_json::json!({ "command": check, "passed": !checked.is_failure(), "output": checked.result["output"] });
+    if checked.is_failure() {
+        let why = checked.error.unwrap_or_else(|| "it failed".into());
+        let error = format!("It ran, but its check `{check}` failed: {why}");
+        finished.result["error"] = serde_json::json!(error);
+        finished.port = FAILED.into();
+        finished.error = Some(error);
+    } else {
+        note(format!("Its check passed: {check}"));
+    }
+    finished
+}
+
 /// One step, with its tries and its time limit.
 async fn run_node(
     node: &crate::schema::Node,
@@ -231,16 +300,49 @@ async fn run_node(
     on_event: &(dyn Fn(Event) + Send + Sync),
     cancel: &CancellationToken,
     ai_text: bool,
+    scope: &crate::schema::Scope,
 ) -> Finished {
     let limit = Duration::from_secs(node.timeout_seconds.unwrap_or_else(|| node.kind.default_timeout()).max(1));
+    // A step that only reports runs its preview in place of its command, or
+    // nothing at all.
+    let reporting = node.mode == crate::schema::Mode::Report && node.kind.command().is_some();
+    let kind = if reporting {
+        match report_kind(node) {
+            Ok(kind) => kind,
+            Err(said) => {
+                on_event(Event::NodeStarted { node: node.id.clone(), at: now_ms(), attempt: 1 });
+                return Finished::ok(serde_json::json!({ "output": said, "report": true }));
+            }
+        }
+    } else {
+        node.kind.clone()
+    };
+    // A step the AI wrote stays in the scope the user approved.
+    let fence = if reporting { None } else { Fence::for_step(node, scope) };
+    let sandboxed = fence.is_some() && matches!(node.kind, NodeKind::Local { .. }) && crate::fence::can_sandbox();
     let mut attempt = 0;
     loop {
         attempt += 1;
         on_event(Event::NodeStarted { node: node.id.clone(), at: now_ms(), attempt });
         let note = |text: String| on_event(Event::NodeNote { node: node.id.clone(), at: now_ms(), text });
         // The step gets the limit itself, and a little more before it is cut off.
-        let tried = tokio::time::timeout(limit + Duration::from_secs(5), nodes::run(&node.kind, context, tools, limit, ai_text, &note)).await;
-        let finished = tried.unwrap_or_else(|_| Finished::failed(format!("Ran out of time ({} s).", limit.as_secs())));
+        let tried = tokio::time::timeout(limit + Duration::from_secs(5), nodes::run(&kind, context, tools, limit, ai_text, &note, fence.as_ref())).await;
+        let mut finished = tried.unwrap_or_else(|_| Finished::failed(format!("Ran out of time ({} s).", limit.as_secs())));
+        if fence.is_some()
+            && finished.is_failure()
+            && let Some(why) = crate::fence::stopped(finished.result["output"].as_str().unwrap_or_default(), sandboxed)
+        {
+            finished.result["error"] = serde_json::json!(why);
+            finished.error = Some(why);
+        }
+        if !reporting {
+            finished = check_after(node, finished, context, tools, ai_text, &note).await;
+        }
+        if reporting {
+            let shown = finished.result["output"].as_str().unwrap_or_default().to_owned();
+            finished.result["output"] = serde_json::json!(format!("Report only: it changed nothing. Its preview shows what it would touch:\n{shown}"));
+            finished.result["report"] = serde_json::json!(true);
+        }
         if !finished.is_failure() || attempt > node.retries || cancel.is_cancelled() {
             return finished;
         }
@@ -285,6 +387,11 @@ mod tests {
         stopped: std::sync::atomic::AtomicBool,
         /// What the guard was asked about.
         checked: Mutex<Vec<String>>,
+        /// What the user answers when an agent wants to change something,
+        /// in turn; when none are left, `ask` answers.
+        approvals: Mutex<Vec<crate::nodes::Approved>>,
+        /// No one is there to OK anything.
+        nobody: bool,
     }
 
     #[async_trait]
@@ -309,6 +416,21 @@ mod tests {
             Ok(Output { exit_code: Some(i32::from(fails)), stdout: format!("{} said {command}\n", host.name), ..Output::default() })
         }
 
+        async fn run_fenced_on_host(&self, host: &HostRef, shown: &str, fenced: &str, timeout: Duration) -> Result<Output, String> {
+            // A look runs as it is, with git kept from running programs.
+            if fenced.contains("GIT_CONFIG_COUNT") {
+                assert!(fenced.starts_with("/bin/sh -c ") && fenced.contains(shown.split_whitespace().next().unwrap_or_default()), "{fenced}");
+                return self.run_on_host(host, shown, timeout).await;
+            }
+            assert!(fenced.starts_with("/bin/sh -c ") && fenced.contains("somme-fence-paths") && fenced.contains(shown), "{fenced}");
+            // The fence stops what is outside its scope: here, anything in Documents.
+            if shown.contains("Documents") && !fenced.contains("/\\*\\*") && !fenced.contains("'/*'") {
+                self.ran.lock().unwrap().push(format!("{}: stopped {shown}", host.name));
+                return Ok(Output { exit_code: Some(126), stderr: format!("Somme stopped `{shown}`: /home/u/Documents/x is outside what this automation may change (its scope).\n"), ..Output::default() });
+            }
+            self.run_on_host(host, &format!("fenced {shown}"), timeout).await
+        }
+
         async fn notify(&self, title: &str, body: &str) {
             self.notes.lock().unwrap().push(format!("{title}: {body}"));
         }
@@ -328,6 +450,26 @@ mod tests {
         async fn ask(&self, title: &str, message: &str, _: Duration) -> Result<bool, String> {
             self.notes.lock().unwrap().push(format!("asked {title}: {message}"));
             Ok(self.answer)
+        }
+
+        async fn approve(&self, approval: &crate::nodes::Approval, timeout: Duration) -> Result<crate::nodes::Approved, String> {
+            let next = {
+                let mut approvals = self.approvals.lock().unwrap();
+                (!approvals.is_empty()).then(|| approvals.remove(0))
+            };
+            if self.nobody {
+                return Err("Somme was closed.".into());
+            }
+            match next {
+                Some(answer) => {
+                    self.notes.lock().unwrap().push(format!("approve {}: {}", approval.detail, approval.why));
+                    Ok(answer)
+                }
+                None => {
+                    let message = if approval.place.is_empty() { approval.detail.clone() } else { format!("On {}:\n{}", approval.place, approval.detail) };
+                    self.ask(&approval.title, &message, timeout).await.map(|yes| if yes { crate::nodes::Approved::Once } else { crate::nodes::Approved::No })
+                }
+            }
         }
 
         async fn vault(&self, names: &[String]) -> Result<BTreeMap<String, String>, String> {
@@ -378,6 +520,7 @@ mod tests {
                 .map(|(ix, (name, args))| somme_ai::llm::ToolCall { id: format!("call{ix}"), name: (*name).into(), arguments: args.to_string() })
                 .collect(),
             usage: somme_ai::llm::Usage { input_tokens: 100, output_tokens: 10 },
+            ..somme_ai::llm::ChatReply::default()
         }
     }
 
@@ -569,6 +712,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_looks_at_once_asks_before_changes_and_keeps_its_talk() {
+        use crate::agent::{self, Job, Session};
+        use crate::nodes::Approved;
+        let fake = Arc::new(Fake {
+            turns: Mutex::new(vec![
+                turn("Looking.", &[("exec_command", json!({ "cmd": "df -h /" })), ("exec_command", json!({ "cmd": "du -sh /var/log" }))]),
+                turn("Cleaning the old logs.", &[("exec_command", json!({ "cmd": "rm -rf /var/log/old" })), ("exec_command", json!({ "cmd": "rm -rf /var/log/older" }))]),
+                turn("Freed 2 GB.", &[]),
+                turn("", &[("exec_command", json!({ "cmd": "rm -rf /var/log/today" }))]),
+                turn("I left today's logs.", &[]),
+            ]),
+            approvals: Mutex::new(vec![Approved::Rest, Approved::No]),
+            ..Fake::default()
+        });
+        let hosts = fake.hosts().await.unwrap()[..1].to_vec();
+        let job = Job { hosts, ask_first: true, max_steps: 20, max_tokens: 100_000, timeout: Duration::from_secs(60), fence: Some(crate::fence::Fence::keep("chat", true)), ..Job::default() };
+        let events = Mutex::new(Vec::new());
+        let note = |event: agent::Event| events.lock().unwrap().push(event);
+        let mut session = Session { messages: vec![somme_ai::llm::Message::system("rules"), somme_ai::llm::Message::user("free some space")], allow_all: false };
+        let done = agent::resume(&job, &mut session, fake.as_ref(), &note).await;
+        assert_eq!(done.result["answer"], "Freed 2 GB.");
+        let mut ran = fake.ran.lock().unwrap().clone();
+        ran[..2].sort();
+        // Looks run as they are; changes run in the fence, and "the rest" lets the second one through.
+        assert_eq!(ran, ["web-1: df -h /", "web-1: du -sh /var/log", "web-1: fenced rm -rf /var/log/old", "web-1: fenced rm -rf /var/log/older"]);
+        assert_eq!(*fake.notes.lock().unwrap(), ["approve rm -rf /var/log/old: Cleaning the old logs."]);
+        let events = events.lock().unwrap().clone();
+        assert!(matches!(&events[..3], [agent::Event::Said(_), agent::Event::Doing { .. }, agent::Event::Doing { .. }]), "{events:?}");
+        // The next message carries on the same talk, and asks again.
+        session.messages.push(somme_ai::llm::Message::user("and today's too"));
+        let done = agent::resume(&job, &mut session, fake.as_ref(), &note).await;
+        assert_eq!(done.result["answer"], "I left today's logs.");
+        assert_eq!(fake.ran.lock().unwrap().len(), 4);
+        assert_eq!(fake.notes.lock().unwrap().len(), 2);
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!((sent.last().unwrap().messages.len(), session.messages.len()), (12, 13));
+        assert!(sent.iter().all(|request| request.cache && request.messages[0].plain_text() == "rules"));
+    }
+
+    #[tokio::test]
     async fn an_agent_asks_first_and_stops_at_its_limits() {
         let fake = Arc::new(Fake {
             turns: Mutex::new(vec![turn(
@@ -587,6 +770,125 @@ mod tests {
         assert!(notes[1].starts_with("Not done: the user said no."), "{notes:?}");
         assert_eq!(notes[2..], ["Runs: uptime", "Not done: say which host: web-1, local."]);
         assert!(matches!(events.last(), Some(Event::Finished { error: Some(error), .. }) if error.contains("Used all its 2 tool calls")), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_report_only_step_runs_its_preview_and_changes_nothing() {
+        let fake = Arc::new(Fake::default());
+        let mut clean = command("clean", "rm -rf /srv/cache/*");
+        clean.mode = crate::schema::Mode::Report;
+        clean.preview = "du -sh /srv/cache/*".into();
+        let mut risky = command("risky", "rm -rf /srv/old");
+        risky.mode = crate::schema::Mode::Report;
+        risky.preview = "rm -rf /srv/old".into();
+        let (status, events) = go(&flow(vec![clean, risky], vec![Edge::new("clean", "risky")]), fake.clone()).await;
+        assert_eq!(status, RunStatus::Ok);
+        // Only the preview ran; a preview that changes things doesn't run.
+        assert_eq!(*fake.ran.lock().unwrap(), ["web-1: du -sh /srv/cache/*"]);
+        assert!(format!("{events:?}").contains("Its preview was not run"), "{events:?}");
+    }
+
+    fn scoped(nodes: Vec<Node>, scope: crate::schema::Scope) -> Automation {
+        let mut automation = flow(nodes, vec![]);
+        automation.scope = scope;
+        automation.scope_ok = automation.scope.key();
+        automation
+    }
+
+    #[tokio::test]
+    async fn an_agent_works_inside_its_scope_and_keeps_what_it_wanted_past_it() {
+        let fake = Arc::new(Fake {
+            turns: Mutex::new(vec![
+                turn("", &[
+                    ("exec_command", json!({ "cmd": "rm -rf ~/Projects/a/node_modules", "host": "web-1" })),
+                    ("exec_command", json!({ "cmd": "rm -rf ~/Documents/x", "host": "web-1" })),
+                ]),
+                turn("Removed one; the other needs your OK.", &[]),
+            ]),
+            nobody: true,
+            ..Fake::default()
+        });
+        let automation = scoped(vec![agent("Free space", false, 10)], crate::schema::Scope { paths: vec!["~/Projects/**/node_modules".into()], delete: true, ..Default::default() });
+        let (status, events) = go(&automation, fake.clone()).await;
+        assert_eq!(status, RunStatus::Ok, "{events:?}");
+        // Nothing asked inside the scope; the change past it was kept for later.
+        assert_eq!(*fake.ran.lock().unwrap(), ["web-1: fenced rm -rf ~/Projects/a/node_modules", "web-1: stopped rm -rf ~/Documents/x"]);
+        let Some(Event::NodeFinished { finished, .. }) = events.iter().find(|event| matches!(event, Event::NodeFinished { node, .. } if node == "fix")) else { panic!() };
+        assert_eq!(finished.result["wanted"][0]["widen"], json!({ "kind": "path", "value": "/home/u/Documents/x" }));
+        assert_eq!(finished.result["wanted"][0]["command"], "rm -rf ~/Documents/x");
+    }
+
+    #[tokio::test]
+    async fn a_step_the_ai_wrote_runs_fenced_and_its_check_runs_after() {
+        let fake = Arc::new(Fake::default());
+        let mut clean = command("clean", "rm -rf /srv/cache/old");
+        clean.by_ai = true;
+        clean.check = "test ! -e /srv/cache/old".into();
+        let scope = crate::schema::Scope { paths: vec!["/srv/cache".into()], delete: true, ..Default::default() };
+        let (status, events) = go(&scoped(vec![clean], scope), fake.clone()).await;
+        assert_eq!(status, RunStatus::Ok, "{events:?}");
+        assert_eq!(*fake.ran.lock().unwrap(), ["web-1: fenced rm -rf /srv/cache/old", "web-1: test ! -e /srv/cache/old"]);
+        assert!(format!("{events:?}").contains("Its check passed"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_fails_the_step() {
+        let fake = Arc::new(Fake::default());
+        let mut restart = command("restart", "systemctl restart app");
+        restart.check = "curl -fsS localhost/fail".into();
+        let (status, events) = go(&flow(vec![restart], vec![]), fake.clone()).await;
+        assert_eq!(status, RunStatus::Failed);
+        assert!(format!("{events:?}").contains("It ran, but its check `curl -fsS localhost/fail` failed"), "{events:?}");
+        // A check the AI wrote that changes things is never run.
+        let fake = Arc::new(Fake::default());
+        let mut restart = command("restart", "uptime");
+        restart.by_ai = true;
+        restart.check = "rm -rf /tmp/x".into();
+        let (status, events) = go(&flow(vec![restart], vec![]), fake.clone()).await;
+        assert_eq!(status, RunStatus::Ok);
+        assert_eq!(*fake.ran.lock().unwrap(), ["web-1: uptime"]);
+        assert!(format!("{events:?}").contains("Its check was not run"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_the_ai_wrote_on_this_computer_stays_in_its_scope() {
+        // Outside the system's temporary folders, which any step may write.
+        let exe = std::env::current_exe().unwrap();
+        let dir = tempfile::Builder::new().prefix("engine-fence").tempdir_in(exe.ancestors().nth(2).unwrap()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("cache/old")).unwrap();
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::write(root.join("keep/file"), "x").unwrap();
+        let scope = crate::schema::Scope { paths: vec![root.join("cache").display().to_string()], delete: true, ..Default::default() };
+        let local = |id: &str, text: String| {
+            let mut node = Node::new(id, NodeKind::Local { command: text, dir: None });
+            node.by_ai = true;
+            // So nothing goes to the bin in the home folder.
+            node.effects.rebuildable = true;
+            node
+        };
+        let fake = Arc::new(Fake::default());
+        let (status, events) = go(&scoped(vec![local("clean", format!("rm -rf {}/cache/old", root.display()))], scope.clone()), fake.clone()).await;
+        assert_eq!(status, RunStatus::Ok, "{events:?}");
+        assert!(!root.join("cache/old").exists());
+        let (status, events) = go(&scoped(vec![local("wide", format!("rm -rf {}/keep/file", root.display()))], scope), fake).await;
+        assert_eq!(status, RunStatus::Failed);
+        assert!(format!("{events:?}").contains("is outside what this automation may change"), "{events:?}");
+        assert!(root.join("keep/file").exists());
+    }
+
+    #[tokio::test]
+    async fn an_agent_cut_off_mid_thought_is_told_to_go_on() {
+        let mut cut = turn("Wait, or what if we", &[]);
+        cut.cut_off = true;
+        let fake = Arc::new(Fake { turns: Mutex::new(vec![cut, turn("All clear.", &[])]), ..Fake::default() });
+        let (status, events) = go(&flow(vec![agent("Check the disk", false, 3)], vec![]), fake.clone()).await;
+        assert_eq!(status, RunStatus::Ok, "{events:?}");
+        let sent = fake.sent.lock().unwrap();
+        let last = sent[1].messages.last().unwrap();
+        assert_eq!(last.plain_text(), somme_ai::llm::GO_ON);
+        assert!(format!("{events:?}").contains("All clear."));
     }
 
     #[tokio::test]
