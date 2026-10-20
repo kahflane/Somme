@@ -429,7 +429,7 @@ mod tests {
 
         async fn run_fenced_on_host(&self, host: &HostRef, shown: &str, fenced: &str, timeout: Duration) -> Result<Output, String> {
             // A look runs as it is, with git kept from running programs.
-            if fenced.contains("GIT_CONFIG_COUNT") {
+            if fenced.contains("GIT_CONFIG_PARAMETERS") {
                 assert!(fenced.starts_with("/bin/sh -c ") && fenced.contains(shown.split_whitespace().next().unwrap_or_default()), "{fenced}");
                 return self.run_on_host(host, shown, timeout).await;
             }

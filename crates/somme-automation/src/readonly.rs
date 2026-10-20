@@ -41,7 +41,7 @@ pub fn check_on_server(text: &str) -> Result<(), String> {
     let script = shell::parse(text);
     for command in script.commands.iter().filter(|command| command.name() == "git") {
         let args = past_git_options(&command.args);
-        let flag = |list: &[&str]| args.iter().any(|arg| list.iter().any(|flag| arg == flag || arg.starts_with(&format!("{flag}="))));
+        let flag = |names: &[&str]| args.iter().any(|arg| names.iter().any(|name| long(arg, name)));
         // Short options together, like `-md`.
         let short = |letters: &[char]| args.iter().any(|arg| arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains(letters));
         let reads_files = match args.first().map(String::as_str) {
@@ -275,6 +275,32 @@ fn past_git_options(args: &[String]) -> &[String] {
     }
 }
 
+/// Whether `arg` is the long option `name` or the start of it, which git
+/// takes for the whole name.
+fn long(arg: &str, name: &str) -> bool {
+    let key = arg.split('=').next().unwrap_or(arg);
+    key.len() > 2 && key.starts_with("--") && name.starts_with(key)
+}
+
+/// Options of `git log` that only pick and lay out commits. None shows a
+/// change, so no program a repository names runs for them.
+const LOG_PICKS: &[&str] = &[
+    "--oneline", "--graph", "--decorate", "--no-decorate", "--all", "--branches", "--tags", "--remotes", "--reverse", "--first-parent", "--no-merges",
+    "--merges", "--name-only", "--name-status", "--abbrev-commit", "--no-abbrev-commit", "--color", "--no-color", "--follow", "--date", "--relative-date",
+    "--since", "--until", "--after", "--before", "--author", "--committer", "--grep", "--all-match", "--invert-grep", "--max-count", "-n", "--skip",
+    "--format", "--pretty", "-i", "--regexp-ignore-case", "-E", "-F", "--fixed-strings", "--parents", "--children", "--left-right", "--boundary",
+    "--topo-order", "--date-order", "--author-date-order", "--ancestry-path", "--source", "--use-mailmap", "--no-walk", "-z", "--full-history",
+    "--simplify-by-decoration", "--cherry-pick", "--cherry-mark", "--not", "--glob", "--exclude", "--min-parents", "--max-parents", "-g", "--walk-reflogs",
+];
+
+/// Whether a `git log` only picks and lays out commits, as `LOG_PICKS`.
+fn log_only_picks(args: &[String]) -> bool {
+    let number = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
+    args.iter().take_while(|arg| *arg != "--").filter(|arg| arg.starts_with('-')).all(|arg| {
+        LOG_PICKS.contains(&arg.split('=').next().unwrap_or(arg)) || number(&arg[1..]) || arg.strip_prefix("-n").is_some_and(number)
+    })
+}
+
 fn git(command: &Command) -> Result<(), &'static str> {
     // No option but those may come before the command, as `-c` and the like
     // change what git runs.
@@ -286,29 +312,51 @@ fn git(command: &Command) -> Result<(), &'static str> {
     }
     let words: Vec<&str> = command.args.iter().map(String::as_str).filter(|arg| !arg.starts_with('-')).collect();
     let flags = |list: &[&str]| command.args.iter().any(|arg| list.contains(&arg.as_str()));
-    if has(command, &["--output", "--ext-diff", "--textconv", "--open-files-in-pager", "--exec", "--upload-pack", "--receive-pack"])
-        || command.args.iter().any(|arg| arg.starts_with("-O"))
-    {
+    // git takes the start of a long option for all of it, so `--outp` is
+    // `--output`; `--text` is an option of its own.
+    let runs = ["--output", "--ext-diff", "--textconv", "--open-files-in-pager", "--exec", "--upload-pack", "--receive-pack"];
+    if command.args.iter().any(|arg| arg != "--text" && runs.iter().any(|name| long(arg, name))) || command.args.iter().any(|arg| arg.starts_with("-O")) {
         return Err("may not write files or run other programs");
+    }
+    let log = matches!(words.as_slice(), ["log" | "whatchanged" | "reflog", ..] | ["stash", "list", ..]);
+    // Diffs of a merge made again may run the repository's merge programs.
+    if (log || words.first() == Some(&"show"))
+        && command.args.iter().any(|arg| arg == "-m" || long(arg, "--diff-merges") || long(arg, "--remerge-diff"))
+    {
+        return Err("may not show a merge's changes made again");
     }
     // A repository's own settings can run a program to show a change, so
     // showing changes needs those turned off.
-    let shows_changes = match words.first().copied() {
-        Some("diff" | "show") => true,
-        Some("log" | "whatchanged") => flags(&["-p", "-u", "--patch", "--stat", "--numstat", "--shortstat", "--dirstat", "--word-diff", "-W", "--function-context"]),
-        _ => false,
-    };
+    let shows_changes = matches!(words.first(), Some(&("diff" | "show"))) || (log && !log_only_picks(&command.args));
     if shows_changes && !(flags(&["--no-ext-diff"]) && flags(&["--no-textconv"])) {
         return Err("may show changes only with --no-ext-diff --no-textconv");
     }
     if words.first() == Some(&"blame") && !flags(&["--no-textconv"]) {
         return Err("may blame only with --no-textconv");
     }
+    // Only options that list.
+    let lists = |picks: &[&str]| {
+        command.args.iter().filter(|arg| arg.starts_with('-')).all(|arg| picks.contains(&arg.split('=').next().unwrap_or(arg)) || arg.starts_with("-n"))
+    };
     match words.as_slice() {
         ["status" | "log" | "diff" | "show" | "ls-files" | "check-ignore" | "rev-parse" | "describe" | "shortlog" | "blame" | "ls-tree" | "cat-file"
-        | "count-objects" | "reflog" | "for-each-ref" | "show-ref" | "grep" | "merge-base" | "rev-list" | "whatchanged", ..] => Ok(()),
-        ["branch" | "tag", ..] if !flags(&["-d", "-D", "-m", "-M", "--delete", "--move", "-c", "-C", "-f", "--force"]) && words.len() == 1 => Ok(()),
-        ["remote"] | ["remote", "show" | "get-url", ..] => Ok(()),
+        | "count-objects" | "for-each-ref" | "show-ref" | "grep" | "merge-base" | "rev-list" | "whatchanged", ..] => Ok(()),
+        ["reflog", rest @ ..] if !matches!(rest.first(), Some(&("expire" | "delete" | "drop" | "write"))) => Ok(()),
+        // Names after them are patterns only with --list.
+        ["branch", rest @ ..]
+            if lists(&["-a", "-r", "-v", "-vv", "-l", "--list", "--all", "--remotes", "--verbose", "--show-current", "--sort", "--format", "--color", "--no-color", "--column", "--no-column", "-i", "--ignore-case"])
+                && (rest.is_empty() || flags(&["-l", "--list"])) =>
+        {
+            Ok(())
+        }
+        ["tag", rest @ ..]
+            if lists(&["-l", "--list", "--sort", "--format", "--color", "--column", "--no-column", "-i", "--ignore-case"]) && (rest.is_empty() || flags(&["-l", "--list"])) =>
+        {
+            Ok(())
+        }
+        // `show` without -n asks the remote, which can run a program.
+        ["remote"] | ["remote", "get-url", ..] => Ok(()),
+        ["remote", "show", ..] if flags(&["-n"]) => Ok(()),
         ["config", ..] if flags(&["--get", "--get-all", "-l", "--list", "--get-regexp"]) => Ok(()),
         ["stash", "list"] | ["worktree", "list"] => Ok(()),
         [] if flags(&["--version"]) => Ok(()),
@@ -443,6 +491,13 @@ mod tests {
             "date +%F",
             "date -j -f %s 1700000000 +%F",
             "git log --oneline -20",
+            "git log -n5 --author=me --format='%h %s' --since=2.weeks -- src",
+            "git log -S needle --no-ext-diff --no-textconv",
+            "git diff --text --no-ext-diff --no-textconv",
+            "git reflog -10",
+            "git branch -a",
+            "git tag -l 'v*'",
+            "git remote show -n origin",
             "git -C ~/app diff --no-ext-diff --no-textconv --stat",
             "dig +short example.com",
             "tree -L 2 ~/Projects",
@@ -496,6 +551,18 @@ mod tests {
             "git log -p",
             "git blame f",
             "git grep -O x",
+            "git show --no-ext-diff --no-textconv --outp=x",
+            "git log -p --no-ext-diff --no-textconv --ext-d",
+            "git log -S needle",
+            "git log -L1,2:f",
+            "git stash list -p",
+            "git reflog -p",
+            "git reflog expire --all",
+            "git log -p --no-ext-diff --no-textconv --remerge-diff",
+            "git show -m --no-ext-diff --no-textconv",
+            "git branch --edit-description",
+            "git branch --unset-upstream",
+            "git remote show origin",
             "cargo metadata",
             "dig $(cat notes.txt).example.com",
             "awk -f prog.awk data",
@@ -517,6 +584,9 @@ mod tests {
         for text in ["git --no-pager -C ~/app status", "git -C a -C b diff --no-ext-diff --no-textconv", "git -P -C ~/app blame --no-textconv f", "git ls-files -md", "git ls-files --modified", "git describe --dirty", "git describe --broken=x", "git cat-file --filters HEAD:f"] {
             assert!(check(text).is_ok(), "{text}");
             assert!(check_on_server(text).is_err(), "{text}");
+        }
+        for text in ["git describe --dirt", "git ls-files --mod", "git cat-file --filt HEAD:f"] {
+            assert!(check(text).is_ok() && check_on_server(text).is_err(), "{text}");
         }
         assert!(check_on_server("git -C ~/app ls-files -z").is_ok() && check_on_server("git --no-pager -C ~/app log -1").is_ok() && check_on_server("git cat-file -p HEAD").is_ok());
         assert!(secret("~/.ssh/id_ed25519") && secret("/srv/app/.env") && !secret("~/Projects/app/src/main.rs"));

@@ -1015,10 +1015,10 @@ pub fn widened(scope: &Scope, kind: &str, value: &str) -> Scope {
 }
 
 /// Put before a command that only looks: git settings in a repository
-/// that would run a program (a file watcher, hooks, a pager) are turned off.
-/// Git older than 2.31 skips the `GIT_CONFIG_*` list, so `git` itself is
-/// called with them too.
-const GIT_LOOKS: &str = "export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0= GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null GIT_PAGER=cat PAGER=cat GIT_TERMINAL_PROMPT=0\ngit() { command git -c core.fsmonitor= -c core.hooksPath=/dev/null \"$@\"; }\n";
+/// that would run a program (a file watcher, hooks, a signature check, an
+/// editor, a pager) are turned off. Every git reads `GIT_CONFIG_PARAMETERS`,
+/// however it is started and however old.
+const GIT_LOOKS: &str = "export GIT_CONFIG_PARAMETERS=\"'core.fsmonitor=' 'core.hooksPath=/dev/null' 'log.showSignature=false' 'gpg.program=false' 'gpg.ssh.program=false' 'gpg.x509.program=false'\" GIT_EDITOR=: GIT_SEQUENCE_EDITOR=: GIT_PAGER=cat PAGER=cat GIT_TERMINAL_PROMPT=0\n";
 
 /// A command that only looks, as `/bin/sh` runs it on a server: git can't
 /// run programs from a repository's settings.
@@ -1247,8 +1247,39 @@ mod tests {
         assert!(plain.exists(), "git ran no file watcher here, so this test shows nothing");
         let looked = ran("looked");
         let status = format!("git -C {} status", quote(&repo.display().to_string()));
-        std::process::Command::new("/bin/sh").arg("-c").arg(look_script(&status)).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap();
+        let look = |script: &str| {
+            std::process::Command::new("/bin/sh").arg("-c").arg(look_script(script)).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap()
+        };
+        look(&status);
+        look(&format!("command {status}"));
         assert!(!looked.exists());
+        // Nor a signature check the repository names.
+        let checked = dir.path().join("checked");
+        let gpg = dir.path().join("gpg.sh");
+        std::fs::write(&gpg, format!("#!/bin/sh\ntouch {}\n", quote(&checked.display().to_string()))).unwrap();
+        std::fs::set_permissions(&gpg, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        git(&["config", "--unset", "core.fsmonitor"]);
+        git(&["config", "log.showSignature", "true"]);
+        git(&["config", "gpg.program", &gpg.display().to_string()]);
+        let tree = String::from_utf8(git(&["write-tree"]).stdout).unwrap();
+        let signed = format!(
+            "tree {}\nauthor t <t@example.invalid> 0 +0000\ncommitter t <t@example.invalid> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n x\n -----END PGP SIGNATURE-----\n\nsigned\n",
+            tree.trim()
+        );
+        let mut hash = std::process::Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut hash.stdin.take().unwrap(), signed.as_bytes()).unwrap();
+        let commit = String::from_utf8(hash.wait_with_output().unwrap().stdout).unwrap();
+        let log = format!("git -C {} log -1 {}", quote(&repo.display().to_string()), commit.trim());
+        look(&log);
+        assert!(!checked.exists());
+        std::process::Command::new("/bin/sh").arg("-c").arg(&log).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap();
+        assert!(checked.exists(), "git ran no signature check here, so this test shows nothing");
         // On this Mac, the sandbox stops a write the checks missed.
         if let Some(walled) = look_command(&format!("touch {}", quote(&dir.path().join("wrote").display().to_string()))) {
             std::process::Command::new("/bin/sh").arg("-c").arg(walled).output().unwrap();
