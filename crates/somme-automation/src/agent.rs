@@ -165,8 +165,8 @@ fn rules(job: &Job) -> String {
         places.push(format!("- {LOCAL}: this computer ({})", std::env::consts::OS));
     }
     let asks = match (job.ask_first, job.computer) {
-        (true, false) => "The user OKs each command and change before it runs, so say in one line why you need it before you call the tool.",
-        (true, true) => "The user OKs each command, change and click before it runs, so say in one line why you need it before you call the tool.",
+        (true, false) => "The user OKs each command, change and web request before it runs, so say in one line why you need it before you call the tool.",
+        (true, true) => "The user OKs each command, change, web request and click before it runs, so say in one line why you need it before you call the tool.",
         (false, _) => "Use ask_user before anything risky, and before anything the goal did not ask for.",
     };
     let mut text = String::from("You are the Agent step of an automation in Somme, an SSH app. The user's goal comes next.\n");
@@ -422,9 +422,10 @@ async fn call_tool(call: &ToolCall, job: &Job<'_>, tools: &dyn Tools, left: Dura
             if let Err(err) = tools.check("http", &format!("{method} {url}"), None).await {
                 return format!("Not done: {err}");
             }
+            // A GET can carry what it read out in its address, so every
+            // request is asked.
             if job.ask_first
-                && !matches!(method.as_str(), "GET" | "HEAD")
-                && let Some(no) = ok_from_user(tools, "Let the agent send this?", &format!("{method} {url}"), left).await
+                && let Some(no) = ok_from_user(tools, "Let the agent send this?", format!("{method} {url}\n{headers}\n\n{}", text("body")).trim_end(), left).await
             {
                 return no;
             }

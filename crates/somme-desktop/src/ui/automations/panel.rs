@@ -858,11 +858,11 @@ impl FlowEditor {
                 .child(div().flex_1().min_w_0().child(text))
         };
         let ai_off_box = ai_off.then(|| warning("AI or this kind of step is off, so it will fail. Turn it on in Settings \u{2192} AI."));
-        let ai_wrote_box = (node.ai_wrote && node.kind.command().is_some()).then(|| {
+        let ai_wrote_box = (node.ai_wrote && node.kind.acts()).then(|| {
             let step = id.clone();
             v_flex()
                 .gap_2()
-                .child(warning("An AI wrote this command. Read it before it runs."))
+                .child(warning("An AI set up this step. Read it before it runs."))
                 .child(
                     Button::new("step-looks-right")
                         .small()

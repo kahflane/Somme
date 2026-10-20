@@ -411,8 +411,8 @@ impl FlowEditor {
             .child(Icon::new(kind_icon(&node.kind)).size(z(14.)).text_color(theme.muted_foreground))
             .child(div().flex_1().min_w_0().truncate().font_semibold().text_size(z(13.)).child(SharedString::from(title)))
             .children(time.map(|time| div().text_size(z(11.)).text_color(theme.muted_foreground).child(time)))
-            // An AI wrote its command and no one has checked it yet.
-            .when(node.ai_wrote && node.kind.command().is_some(), |header| {
+            // An AI set it up and no one has checked it yet.
+            .when(node.ai_wrote && node.kind.acts(), |header| {
                 header.child(Icon::new(Lucide::Sparkles).size(z(12.)).text_color(theme.muted_foreground))
             })
             .children(badge);

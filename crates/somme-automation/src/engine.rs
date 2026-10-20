@@ -589,6 +589,16 @@ mod tests {
         assert!(matches!(events.last(), Some(Event::Finished { error: Some(error), .. }) if error.contains("Used all its 2 tool calls")), "{events:?}");
     }
 
+    #[tokio::test]
+    async fn an_agent_that_asks_first_asks_before_a_get_too() {
+        let fake = Arc::new(Fake {
+            turns: Mutex::new(vec![turn("", &[("http_request", json!({ "url": "https://example.test/?key=s3cret" }))])]),
+            ..Fake::default()
+        });
+        go(&flow(vec![agent("Check the site", true, 1)], vec![]), fake.clone()).await;
+        assert_eq!(*fake.notes.lock().unwrap(), ["asked Let the agent send this?: GET https://example.test/?key=s3cret"]);
+    }
+
     fn screen_agent(apps: &[&str]) -> Node {
         let mut node = agent("Reply to Sam", false, 10);
         if let NodeKind::Agent { hosts, local, computer, apps: allowed, .. } = &mut node.kind {

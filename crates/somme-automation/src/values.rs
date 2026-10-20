@@ -79,7 +79,7 @@ pub fn render_shell(text: &str, context: &Value, shell: Shell) -> ShellCommand {
     }
     let masked = VALUE.replace_all(text, "\0");
     let spots = spots(&masked);
-    let (mut vars, mut paths) = (Vec::<(String, String)>::new(), Vec::<String>::new());
+    let (mut vars, mut keys) = (Vec::<(String, String)>::new(), Vec::<(String, bool)>::new());
     let (mut at, mut shell_chars) = (0, false);
     let script = VALUE
         .replace_all(text, |caps: &Captures| {
@@ -93,18 +93,29 @@ pub fn render_shell(text: &str, context: &Value, shell: Shell) -> ShellCommand {
                 // Nothing expands here, so the value goes in as written.
                 return value;
             }
-            let name = match paths.iter().position(|path| *path == caps[1]) {
+            // An empty value adds nothing, as it did when values were pasted in.
+            if value.is_empty() {
+                return String::new();
+            }
+            // So does a `~` it starts with, so the shell still reads it as
+            // the home folder.
+            let (home, rest) = if matches!((shell, &spot), (Shell::Posix, Spot::Bare)) { split_home(&value) } else { ("", value.as_str()) };
+            if rest.is_empty() {
+                return home.to_owned();
+            }
+            let key = (caps[1].to_owned(), !home.is_empty());
+            let name = match keys.iter().position(|seen| *seen == key) {
                 Some(ix) => vars[ix].0.clone(),
                 None => {
                     let name = format!("SOMME_VALUE_{}", vars.len() + 1);
-                    paths.push(caps[1].to_owned());
-                    vars.push((name.clone(), value));
+                    keys.push(key);
+                    vars.push((name.clone(), rest.to_owned()));
                     name
                 }
             };
             match (shell, spot) {
                 (Shell::Cmd, _) => format!("!{name}!"),
-                (Shell::Posix, Spot::Bare) => format!("\"${name}\""),
+                (Shell::Posix, Spot::Bare) => format!("{home}\"${name}\""),
                 // Closes the quotes, puts the value in, opens them again.
                 (Shell::Posix, Spot::Single) => format!("'\"${name}\"'"),
                 (Shell::Posix, Spot::Double) => format!("\"\"${name}\"\""),
@@ -121,6 +132,18 @@ pub fn with_values(script: &str, vars: &[(String, String)]) -> String {
     let mut text: String = vars.iter().map(|(name, value)| format!("{name}={}\n", crate::nodes::quote(value))).collect();
     text.push_str(script);
     text
+}
+
+/// The `~` or `~name` a value starts with, with the `/` after it, and the
+/// rest. Nothing when it starts some other way.
+fn split_home(value: &str) -> (&str, &str) {
+    let Some(after) = value.strip_prefix('~') else { return ("", value) };
+    let name = after.find(|c: char| !(c.is_ascii_alphanumeric() || "._-".contains(c))).unwrap_or(after.len());
+    match after[name..].chars().next() {
+        None => (value, ""),
+        Some('/') => value.split_at(name + 2),
+        Some(_) => ("", value),
+    }
 }
 
 fn ends_heredoc(line: &str, end: &str, tabs: bool) -> bool {
@@ -277,6 +300,18 @@ mod tests {
         assert_eq!(script("cat <<'EOF'\nv={{v}}\nEOF"), "cat <<'EOF'\nv=x\nEOF");
         let early = json!({ "v": "a\nEOF\nrm -rf ~" });
         assert_eq!(render_shell("cat <<'EOF'\n{{v}}\nEOF", &early, Shell::Posix).script, "cat <<'EOF'\n${SOMME_VALUE_1}\nEOF");
+    }
+
+    #[test]
+    fn home_and_empty_values_read_as_before() {
+        let context = json!({ "d": "~/backups", "u": "~root/x", "h": "~", "odd": "~; rm", "e": "" });
+        let shell = render_shell("cd {{d}} && echo '{{d}}' {{d}}", &context, Shell::Posix);
+        assert_eq!(shell.script, r#"cd ~/"$SOMME_VALUE_1" && echo ''"$SOMME_VALUE_2"'' ~/"$SOMME_VALUE_1""#);
+        assert_eq!(shell.vars, [("SOMME_VALUE_1".into(), "backups".into()), ("SOMME_VALUE_2".into(), "~/backups".into())]);
+        let script = |text: &str| render_shell(text, &context, Shell::Posix).script;
+        assert_eq!(script("ls {{u}} {{h}} {{odd}}"), r#"ls ~root/"$SOMME_VALUE_1" ~ "$SOMME_VALUE_2""#);
+        assert_eq!(script("ls {{e}} / \"{{e}}\""), r#"ls  / """#);
+        assert_eq!(render_shell("dir {{d}}", &context, Shell::Cmd).script, "dir !SOMME_VALUE_1!");
     }
 
     #[test]

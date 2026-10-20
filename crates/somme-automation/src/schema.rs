@@ -360,6 +360,31 @@ impl NodeKind {
         matches!(self, Self::Write { .. } | Self::Agent { .. })
     }
 
+    /// Whether it runs, changes or sends something, so a version an AI set
+    /// up must be read before it runs. A lookup counts: its name can carry
+    /// a value out.
+    pub fn acts(&self) -> bool {
+        matches!(
+            self,
+            Self::Command { .. } | Self::Local { .. } | Self::Copy { .. } | Self::Http { .. } | Self::Tls { .. } | Self::Dns { .. } | Self::Agent { .. }
+        )
+    }
+
+    /// The fields where text an AI wrote in a run could do harm: what runs,
+    /// where files go, and where requests and lookups are sent.
+    pub fn sink_texts(&self) -> Vec<&str> {
+        match self {
+            Self::Command { command, .. } => vec![command],
+            Self::Local { command, dir } => [Some(command.as_str()), dir.as_deref()].into_iter().flatten().collect(),
+            Self::Copy { local, remote, .. } => vec![local, remote],
+            Self::Http { url, headers, body, .. } => vec![url, headers, body],
+            Self::Tls { host, .. } => vec![host],
+            Self::Dns { name, .. } => vec![name],
+            Self::Agent { goal, ask_first: false, .. } => vec![goal],
+            _ => Vec::new(),
+        }
+    }
+
     /// The command it runs, for steps that run one.
     pub fn command(&self) -> Option<&str> {
         match self {
@@ -580,8 +605,8 @@ pub fn problems(automation: &Automation) -> Vec<String> {
             }
             _ => {}
         }
-        if node.ai_wrote && node.kind.command().is_some() {
-            found.push(format!("An AI wrote \u{201c}{}\u{201d}. Read its command, then press Looks right.", node.title()));
+        if node.ai_wrote && node.kind.acts() {
+            found.push(format!("An AI set up \u{201c}{}\u{201d}. Read it, then press Looks right.", node.title()));
         }
     }
     for edge in &automation.edges {
@@ -655,16 +680,13 @@ pub fn blank(kind: &str) -> Option<NodeKind> {
     })
 }
 
-/// Whether `node` runs text an AI wrote in this run, like
+/// Whether `node` acts on text an AI wrote in this run, like
 /// `{{nodes.summary.text}}` from a Write step, with no Ask me step between
 /// that the user answered first.
 pub fn runs_ai_text(automation: &Automation, node: &Node) -> bool {
-    let Some(command) = node.kind.command() else { return false };
-    let dir = match &node.kind {
-        NodeKind::Local { dir: Some(dir), .. } => dir.as_str(),
-        _ => "",
-    };
-    let writers: BTreeSet<&str> = [command, dir]
+    let writers: BTreeSet<&str> = node
+        .kind
+        .sink_texts()
         .iter()
         .flat_map(|text| crate::values::paths(text))
         .filter_map(|path| {
@@ -827,6 +849,20 @@ mod tests {
         // A second way in that skips the question.
         automation.edges.push(Edge::new("say", "fix"));
         assert!(runs_ai_text(&automation, &automation.nodes[2]));
+    }
+
+    #[test]
+    fn ai_text_sent_or_copied_needs_an_ok_too() {
+        let text = r#"{ "schema": 1, "name": "Send", "nodes": [
+            { "id": "say", "type": "write", "prompt": "a place" },
+            { "id": "get", "type": "http", "url": "https://example.test/?q={{nodes.say.text}}" },
+            { "id": "up", "type": "copy", "host": { "names": ["web"] }, "direction": "upload", "local": "~/a", "remote": "{{nodes.say.text}}" },
+            { "id": "mx", "type": "dns", "name": "{{nodes.say.text}}.example.test" },
+            { "id": "tell", "type": "notify", "title": "{{nodes.say.text}}" }
+        ], "edges": [ { "from": "say", "to": "get" }, { "from": "say", "to": "up" }, { "from": "say", "to": "mx" }, { "from": "say", "to": "tell" } ] }"#;
+        let automation = Automation::from_json(text).unwrap();
+        let gated: Vec<bool> = automation.nodes.iter().map(|node| runs_ai_text(&automation, node)).collect();
+        assert_eq!(gated, [false, true, true, true, false]);
     }
 
     #[test]

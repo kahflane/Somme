@@ -328,6 +328,13 @@ pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: D
                 Err(err) => return Finished::failed(err),
             };
             let Some(host) = host else { return Finished::failed("No saved server matches this step's server.") };
+            let shown = match direction {
+                Direction::Upload => format!("Copy {local} to {}:{remote}", host.name),
+                Direction::Download => format!("Copy {}:{remote} to {local}", host.name),
+            };
+            if let Err(stop) = allow_ai_text(tools, ai_text, &shown, Some(&host)).await {
+                return stop;
+            }
             match tools.copy(&host, *direction, &local, &remote, timeout).await {
                 Ok(bytes) => {
                     let output = match direction {
@@ -352,6 +359,9 @@ pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: D
         }
         NodeKind::Http { method, url, headers, body } => {
             let (url, headers, body) = (render(url, context), render(headers, context), render(body, context));
+            if let Err(stop) = allow_ai_text(tools, ai_text, &format!("{method} {}\n{headers}\n\n{body}", url.trim()), None).await {
+                return stop;
+            }
             match tools.http(method, url.trim(), &headers, &body, timeout).await {
                 Ok(reply) => from_reply(reply),
                 Err(err) => Finished::failed(err),
@@ -360,6 +370,9 @@ pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: D
         NodeKind::Tls { host, port } => {
             let host = render(host, context);
             let host = host.trim();
+            if let Err(stop) = allow_ai_text(tools, ai_text, &format!("Check the certificate of {host}:{port}"), None).await {
+                return stop;
+            }
             match tools.tls(host, *port, timeout).await {
                 Ok(certificate) => {
                     let now = crate::engine::now_ms() / 1000;
@@ -376,6 +389,9 @@ pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: D
         }
         NodeKind::Dns { name, record } => {
             let name = render(name, context);
+            if let Err(stop) = allow_ai_text(tools, ai_text, &format!("Look up {record} {}", name.trim()), None).await {
+                return stop;
+            }
             match tools.dns(name.trim(), &record.trim().to_uppercase(), timeout).await {
                 Ok(records) => Finished::ok(json!({ "records": records, "output": records.join("\n") })),
                 Err(err) => Finished::failed(err),
@@ -384,6 +400,10 @@ pub async fn run(kind: &NodeKind, context: &Value, tools: &dyn Tools, timeout: D
         NodeKind::Agent { goal, hosts, local, ask_first, max_steps, max_tokens, computer, apps } => {
             // AI never sees vault values.
             let goal = render(goal, &without_vault(context));
+            // Asked here only when it won't ask before each change.
+            if let Err(stop) = allow_ai_text(tools, ai_text && !ask_first, &goal, None).await {
+                return stop;
+            }
             let hosts = if hosts.is_empty() {
                 Vec::new()
             } else {
@@ -479,10 +499,21 @@ pub fn pick(hosts: &[HostRef], picked: &HostPick) -> Vec<HostRef> {
         .collect()
 }
 
+const AI_WROTE: &str = "An AI wrote part of this step during this run.";
+
+/// Holds a step that acts on text an AI wrote in this run until the user
+/// allows it; `shown` says what it would do.
+async fn allow_ai_text(tools: &dyn Tools, ai_text: bool, shown: &str, host: Option<&HostRef>) -> Result<(), Finished> {
+    if !ai_text {
+        return Ok(());
+    }
+    tools.allow_command(shown, host, AI_WROTE).await.map_err(Finished::failed)
+}
+
 /// Why a command needs the user's OK before it runs, if it does.
 fn needs_ok(ai_text: bool, shell: &ShellCommand) -> Option<&'static str> {
     if ai_text {
-        Some("An AI wrote part of this command during this run.")
+        Some(AI_WROTE)
     } else if shell.read_as_code {
         Some("A value in this command has characters a shell acts on, and the command hands it to another shell or program (like ssh, sh -c or eval) that could run it.")
     } else {
@@ -739,6 +770,11 @@ mod tests {
         let done = run(&step, &context, &Here, Duration::from_secs(10), false, &|_| {}).await;
         assert_eq!(done.result["stdout"], json!(format!("{bad}|in {bad}|in {bad}|{bad}\n")), "{done:?}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "a value ran as code");
+        // A `~` at the start of a value is still the home folder.
+        let home = json!({ "input": { "d": "~/somme-tilde-check" } });
+        let step = NodeKind::Local { command: "printf %s {{input.d}}".into(), dir: None };
+        let done = run(&step, &home, &Here, Duration::from_secs(10), false, &|_| {}).await;
+        assert_eq!(done.result["stdout"], json!(format!("{}/somme-tilde-check", std::env::var("HOME").unwrap())), "{done:?}");
         // A second shell would read it as code again, so it waits for an OK
         // that no one here can give.
         let step = NodeKind::Local { command: "sh -c 'echo {{input.v}}'".into(), dir: Some(dir.path().display().to_string()) };

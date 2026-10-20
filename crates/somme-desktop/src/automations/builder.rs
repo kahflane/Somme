@@ -295,9 +295,9 @@ fn named(node: &Node) -> String {
     format!("{} \u{201c}{name}\u{201d}", node.kind.name())
 }
 
-/// Marks a step whose command the AI set.
+/// Marks a step the AI set up that runs, changes or sends something.
 fn mark(node: &mut Node) {
-    node.ai_wrote = node.kind.command().is_some_and(|command| !command.trim().is_empty());
+    node.ai_wrote = node.kind.acts() && node.kind.command().is_none_or(|command| !command.trim().is_empty());
 }
 
 fn add_node(automation: &mut Automation, args: &Value, facts: &Facts) -> Result<Applied, String> {
@@ -345,7 +345,7 @@ fn update_node(automation: &mut Automation, args: &Value, facts: &Facts) -> Resu
     }
     let mut node: Node = serde_json::from_value(value).map_err(|err| format!("Those changes don't fit this step: {err}"))?;
     may_add(&node.kind, facts)?;
-    if node.kind.command() != old.kind.command() {
+    if node.kind != old.kind {
         mark(&mut node);
     } else {
         node.ai_wrote = old.ai_wrote;
@@ -499,7 +499,7 @@ pub fn read_flow(text: &str, current: &Automation, facts: &Facts) -> Result<Auto
     flow.start.agents = current.start.agents;
     for node in &mut flow.nodes {
         may_add(&node.kind, facts)?;
-        let same = current.node(&node.id).is_some_and(|old| old.kind.command() == node.kind.command() && !old.ai_wrote);
+        let same = current.node(&node.id).is_some_and(|old| old.kind == node.kind && !old.ai_wrote);
         if !same {
             mark(node);
         }
@@ -543,6 +543,14 @@ mod tests {
         assert!(flow.nodes[1].at[1] > flow.nodes[0].at[1], "placed below the step it follows");
         // A missing field falls back to the blank step's.
         assert!(matches!(&flow.nodes[1].kind, NodeKind::Notify { body, .. } if body.is_empty()));
+        assert!(!flow.nodes[1].ai_wrote, "a notification sends nothing out");
+        apply(&mut flow, &call("add_node", json!({ "node": { "id": "send", "type": "http", "url": "https://example.test" } })), &facts);
+        assert!(flow.nodes[2].ai_wrote, "requests the AI set up are marked");
+        flow.nodes[2].ai_wrote = false;
+        apply(&mut flow, &call("update_node", json!({ "id": "send", "changes": { "url": "https://other.example.test" } })), &facts);
+        assert!(flow.nodes[2].ai_wrote, "and marked again when the AI changes them");
+        apply(&mut flow, &call("add_node", json!({ "node": { "id": "mx", "type": "dns", "name": "example.test" } })), &facts);
+        assert!(flow.nodes[3].ai_wrote, "a lookup's name can carry a value out");
     }
 
     #[test]
