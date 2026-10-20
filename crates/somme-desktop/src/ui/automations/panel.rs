@@ -1033,9 +1033,9 @@ impl FlowEditor {
             })
             .when(!reporting && node.by_ai && !only_looks, |el| {
                 let kept = if effects.rebuildable {
-                    "Copies of files it changes stay in the Somme bin (~/.somme/bin) for 7 days."
+                    "Copies of files it changes stay in the Somme bin for 7 days (on a server, in ~/.somme/bin there)."
                 } else {
-                    "What it deletes, and copies of files it changes, stay in the Somme bin (~/.somme/bin) for 7 days."
+                    "What it deletes, and copies of files it changes, stay in the Somme bin for 7 days (on a server, in ~/.somme/bin there)."
                 };
                 el.child(note(format!("Somme stops any change it makes outside what this automation may change. {kept}"), cx))
             })

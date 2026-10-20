@@ -126,7 +126,7 @@ impl Link {
                         },
                         "may_change": {
                             "type": "object",
-                            "description": "What runs may change without asking: what you changed here, as rules no wider than that.",
+                            "description": "What runs may change without asking: what you changed here, as rules no wider than that. Leave it out when the job changes nothing; then every change waits for the user.",
                             "properties": {
                                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Globs, like ~/Projects/**/node_modules." },
                                 "delete": { "type": "boolean" },
@@ -135,7 +135,8 @@ impl Link {
                                 "sudo": { "type": "boolean" }
                             }
                         },
-                        "tell": { "type": "string", "enum": ["always", "failures"], "description": "When the user hears: after every run, or only when it fails. Default always." }
+                        "tell": { "type": "string", "enum": ["always", "failures"], "description": "When the user hears: after every run, or only when it fails. Default always." },
+                        "log": { "type": "string", "description": "A file each run adds what it did to, when the user wants one, like ~/Desktop/disk-cleanup.log. It goes into what it may change." }
                     },
                     "required": ["name", "task", "on"]
                 }),
@@ -198,7 +199,7 @@ pub fn is_local(on: &str) -> bool {
 
 /// What the assistant is told first. It stays the same all chat long, so
 /// the server can keep it between turns.
-pub fn rules(facts: &Facts, skills: &[Skill], memory: &[String], draft: &Automation) -> String {
+pub fn rules(facts: &Facts, skills: &[Skill], memory: &[String], guard: &[String], draft: &Automation) -> String {
     let servers = if facts.hosts.is_empty() {
         "none saved".to_owned()
     } else {
@@ -228,6 +229,7 @@ How you work:\n\
     if !memory.is_empty() {
         text.push_str(&format!("\n\nWhat you remember about this user:\n- {}", memory.join("\n- ")));
     }
+    text.push_str(&agent::guard_text(guard));
     if !draft.nodes.is_empty() {
         let steps: Vec<String> = draft.nodes.iter().map(|node| format!("- {} ({}): {}", node.id, node.kind.name(), node.title())).collect();
         text.push_str(&format!("\n\nThe automation open now, \u{201c}{}\u{201d}, has these steps:\n{}", draft.name, steps.join("\n")));
@@ -300,9 +302,31 @@ fn make_automatic(draft: &Automation, args: &Value, facts: &Facts) -> Result<Aut
         call("add_node", json!({ "node": { "id": "tell", "type": "notify", "title": name, "body": "{{nodes.work.answer}}" }, "after": "work" }))?;
     }
     call("add_node", json!({ "node": { "id": "tell_failed", "type": "notify", "title": format!("{name} failed"), "body": "{{nodes.work.error}}" }, "after": "work", "port": "failed" }))?;
-    let may = &args["may_change"];
-    if may.is_object() {
-        call("set_scope", may.clone())?;
+    let mut may = if args["may_change"].is_object() { args["may_change"].clone() } else { json!({}) };
+    // A log after every run, done or not: Somme writes it, not the agent.
+    if let Some(log) = text(&args["log"]) {
+        let file = log.trim();
+        if !(file.starts_with('/') || file.starts_with("~/")) || file.ends_with('/') || file.contains(['*', '?', '[', '$', '`']) {
+            return Err(format!("the log must be one file named in full, like ~/Desktop/{}.log", "job"));
+        }
+        let target = match file.strip_prefix("~/") {
+            Some(rest) => format!("\"$HOME\"/{}", somme_automation::nodes::quote(rest)),
+            None => somme_automation::nodes::quote(file),
+        };
+        let command = format!("printf '%s\\n%s%s\\n\\n' \"$(date '+%F %T')\" {{{{nodes.work.answer}}}} {{{{nodes.work.error}}}} >> {target}");
+        call("add_node", json!({ "node": { "id": "log", "type": "local", "label": "Write the log", "command": command }, "after": "work" }))?;
+        call("connect", json!({ "from": "work", "to": "log", "port": "failed" }))?;
+        let paths = may.as_object_mut().map(|fields| fields.entry("paths").or_insert_with(|| json!([])));
+        if let Some(Value::Array(paths)) = paths {
+            paths.push(json!(file));
+        }
+    }
+    if may.as_object().is_some_and(|fields| !fields.is_empty()) {
+        call("set_scope", may)?;
+    }
+    if let Some(step) = flow.nodes.iter_mut().find(|node| node.id == "log") {
+        // Its command is Somme's own, so it writes rather than only reporting.
+        step.mode = somme_automation::schema::Mode::Do;
     }
     layout::tidy(&mut flow);
     Ok(flow)
@@ -345,6 +369,14 @@ mod tests {
         // A check that changes things, or an unknown server, is refused.
         let bad = json!({ "name": "x", "task": "y", "on": ["local"], "when": { "command": "rm -rf ~/x", "test": "empty" } });
         assert!(make_automatic(&Automation::new("New"), &bad, &facts()).unwrap_err().contains("only look"));
+        let logged = json!({ "name": "Free space", "task": "Clean.", "on": ["local"], "log": "~/Desktop/clean.log", "may_change": { "paths": ["~/p/**/node_modules"], "delete": true } });
+        let flow = make_automatic(&Automation::new("New"), &logged, &facts()).unwrap();
+        let log = flow.node("log").unwrap();
+        assert_eq!(log.mode, somme_automation::schema::Mode::Do);
+        assert!(log.kind.command().unwrap().ends_with(">> \"$HOME\"/'Desktop/clean.log'"), "{:?}", log.kind.command());
+        assert!(flow.scope.paths.contains(&"~/Desktop/clean.log".to_owned()));
+        assert_eq!(flow.edges.iter().filter(|edge| edge.to == "log").count(), 2);
+        assert!(make_automatic(&Automation::new("New"), &json!({ "name": "x", "task": "y", "on": ["local"], "log": "~/logs/*.log" }), &facts()).is_err());
         let nowhere = json!({ "name": "x", "task": "y", "on": ["db-9"] });
         assert!(make_automatic(&Automation::new("New"), &nowhere, &facts()).unwrap_err().contains("db-9"));
     }
@@ -353,7 +385,8 @@ mod tests {
     fn the_rules_name_the_places_skills_and_memory() {
         let mut draft = Automation::new("Disk");
         draft.nodes.push(somme_automation::Node::new("df", NodeKind::Local { command: "df -h".into(), dir: None }));
-        let text = rules(&facts(), &skills::built_in(), &["Projects live in ~/Code".into()], &draft);
+        let text = rules(&facts(), &skills::built_in(), &["Projects live in ~/Code".into()], &["Block all drop, delete or truncate".into()], &draft);
+        assert!(text.contains("- Block all drop, delete or truncate"));
         assert!(text.contains("Saved servers: web-1 (tags: web)."));
         assert!(text.contains("- backups: "));
         assert!(text.contains("- Projects live in ~/Code"));

@@ -328,7 +328,9 @@ async fn run_node(
         // The step gets the limit itself, and a little more before it is cut off.
         let tried = tokio::time::timeout(limit + Duration::from_secs(5), nodes::run(&kind, context, tools, limit, ai_text, &note, fence.as_ref())).await;
         let mut finished = tried.unwrap_or_else(|_| Finished::failed(format!("Ran out of time ({} s).", limit.as_secs())));
+        // An agent says itself what the fence stopped; its answer isn't read for it.
         if fence.is_some()
+            && node.kind.command().is_some()
             && finished.is_failure()
             && let Some(why) = crate::fence::stopped(finished.result["output"].as_str().unwrap_or_default(), sandboxed)
         {
@@ -394,8 +396,17 @@ mod tests {
         nobody: bool,
     }
 
+    /// The bin the tests' fences use, never the real one.
+    fn test_bin() -> String {
+        std::env::temp_dir().join(format!("somme-engine-test-bin-{}", std::process::id())).display().to_string()
+    }
+
     #[async_trait]
     impl Tools for Fake {
+        fn bin_root(&self) -> Option<String> {
+            Some(test_bin())
+        }
+
         async fn hosts(&self) -> Result<Vec<HostRef>, String> {
             Ok(vec![
                 HostRef { id: "1".into(), name: "web-1".into(), address: String::new(), tags: vec!["web".into()] },
@@ -691,7 +702,10 @@ mod tests {
             ]),
             ..Fake::default()
         });
-        let automation = flow(vec![agent("Make {{input.who}} faster", false, 10), notify("tell", "{{nodes.fix.answer}}")], vec![Edge::new("fix", "tell")]);
+        // On its own, it changes only what its scope covers without asking.
+        let mut automation = flow(vec![agent("Make {{input.who}} faster", false, 10), notify("tell", "{{nodes.fix.answer}}")], vec![Edge::new("fix", "tell")]);
+        automation.scope = crate::schema::Scope { paths: vec![format!("{}/**", dir.path().display())], ..Default::default() };
+        automation.scope_ok = automation.scope.key();
         let (status, events) = go(&automation, fake.clone()).await;
         assert_eq!(status, RunStatus::Ok, "{events:?}");
         assert_eq!(*fake.ran.lock().unwrap(), ["web-1: uptime"]);
@@ -704,7 +718,14 @@ mod tests {
         assert_eq!(second, ["Exit code: 0\nweb-1 said uptime\n", "     1\tworkers 1\n     2\tport 80\n"]);
         assert_eq!(results(&fake).last().unwrap(), &format!("Success. Updated the following files:\nM {path}"));
         let notes: Vec<&str> = events.iter().filter_map(|event| match event { Event::NodeNote { text, .. } => Some(text.as_str()), _ => None }).collect();
-        assert_eq!(notes, ["Looking first.", "Runs on web-1: uptime", &format!("Reads on this computer: {path}"), &format!("Changes on this computer: {path}")]);
+        // The file was copied to the bin before it changed.
+        assert_eq!(notes, [
+            "Looking first.",
+            "Runs on web-1: uptime",
+            &format!("Reads on this computer: {path}"),
+            &format!("Changes on this computer: {path}"),
+            "What it deleted or changed is kept in the Somme bin for 7 days.",
+        ]);
         let Some(Event::NodeFinished { finished, .. }) = events.iter().find(|event| matches!(event, Event::NodeFinished { node, .. } if node == "fix")) else { panic!() };
         assert_eq!(finished.result["steps"], 3);
         assert_eq!(finished.result["tokens"], 330);
@@ -749,6 +770,24 @@ mod tests {
         let sent = fake.sent.lock().unwrap().clone();
         assert_eq!((sent.last().unwrap().messages.len(), session.messages.len()), (12, 13));
         assert!(sent.iter().all(|request| request.cache && request.messages[0].plain_text() == "rules"));
+    }
+
+    #[tokio::test]
+    async fn an_agent_out_of_tool_calls_still_says_what_it_did() {
+        let fake = Arc::new(Fake {
+            turns: Mutex::new(vec![
+                turn("", &[("exec_command", json!({ "cmd": "df -h", "host": "web-1" })), ("exec_command", json!({ "cmd": "uptime", "host": "web-1" }))]),
+                turn("The disk is 91% full; I found nothing safe to remove yet.", &[]),
+            ]),
+            ..Fake::default()
+        });
+        let (status, events) = go(&flow(vec![agent("Free space", true, 2)], vec![]), fake.clone()).await;
+        assert_eq!(status, RunStatus::Failed);
+        let Some(Event::NodeFinished { finished, .. }) = events.iter().find(|event| matches!(event, Event::NodeFinished { node, .. } if node == "fix")) else { panic!() };
+        assert_eq!(finished.result["answer"], "The disk is 91% full; I found nothing safe to remove yet.");
+        assert!(finished.error.as_deref().unwrap().contains("Used all its 2 tool calls"));
+        // Its last turn had no tools to call.
+        assert!(fake.sent.lock().unwrap().last().unwrap().tools.is_empty());
     }
 
     #[tokio::test]

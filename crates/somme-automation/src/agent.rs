@@ -82,9 +82,10 @@ pub enum Event {
     Doing { id: String, name: String, line: String },
     /// What the call gave back.
     Done { id: String, result: String },
-    /// What a change deleted or changed is in the Somme bin, in `folder`,
-    /// on `host` (None: this computer).
-    Kept { host: Option<String>, folder: String, said: String },
+    /// What a change deleted or changed is in the Somme bin: in folder
+    /// `name` under `root` (None: `~/.somme/bin` there), on `host` (None:
+    /// this computer).
+    Kept { host: Option<String>, root: Option<String>, name: String },
 }
 
 /// Where the agent tells what it does.
@@ -106,6 +107,7 @@ pub async fn run(job: Job<'_>, tools: &dyn Tools, note: Note<'_>) -> Finished {
     if !notes.is_empty() {
         rules.push_str(&format!("\n\nWhat earlier runs noted:\n- {}", notes.join("\n- ")));
     }
+    rules.push_str(&guard_text(&tools.guard_rules()));
     let mut session = Session { messages: vec![Message::system(rules), Message::user(job.goal.trim())], allow_all: false };
     if !job.computer {
         return work(&job, &mut session, tools, note).await;
@@ -116,6 +118,18 @@ pub async fn run(job: Job<'_>, tools: &dyn Tools, note: Note<'_>) -> Finished {
     let finished = work(&job, &mut session, tools, note).await;
     tools.computer_end().await;
     finished
+}
+
+/// The user's guard rules, for an agent's rules: what they stop fails, so
+/// it plans around them rather than into them.
+pub fn guard_text(rules: &[String]) -> String {
+    if rules.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nThe user's guard rules, which Somme checks every command against. What they block fails: don't try it another way, and tell the user when the job needs it.\n- {}",
+        rules.join("\n- ")
+    )
 }
 
 /// Carries on `session` from the user's newest message until the agent
@@ -155,6 +169,30 @@ async fn work(job: &Job<'_>, session: &mut Session, tools: &dyn Tools, note: Not
             return end(Some("Ran out of time before it was done.".into()), &said, steps, tokens, &tally);
         }
         leave_out_old_shots(&mut session.messages);
+        // Out of calls, tool calls or tokens: one last reply, with no tools,
+        // says what it found and did, so the run tells the user something.
+        let out_of = if tools.ai_calls_left() == Some(1) {
+            Some("This run used all the AI calls it may make. Change the limit in Settings \u{2192} AI.".to_owned())
+        } else if steps >= job.max_steps {
+            Some(format!("Used all its {} tool calls before it was done.", job.max_steps))
+        } else if tokens >= job.max_tokens {
+            Some(format!("Used all its {} tokens before it was done.", job.max_tokens))
+        } else {
+            None
+        };
+        if let Some(error) = out_of {
+            session.messages.push(Message::user(
+                "You have no tool calls left. Without calling a tool, say in a few short lines what you found, what you changed, and what is left to do.",
+            ));
+            let request = ChatRequest { messages: session.messages.clone(), temperature: Some(0.2), effort: job.effort, cache: true, ..ChatRequest::default() };
+            if let Ok(reply) = tools.agent_turn(&request).await {
+                session.messages.push(Message::from_reply(&reply));
+                if !reply.text.trim().is_empty() {
+                    said = reply.text.trim().to_owned();
+                }
+            }
+            return end(Some(error), &said, steps, tokens, &tally);
+        }
         // No length limit: a thinking model can use a small one up before it
         // calls a tool. The job's own token budget still holds.
         let request = ChatRequest {
@@ -196,7 +234,7 @@ async fn work(job: &Job<'_>, session: &mut Session, tools: &dyn Tools, note: Not
             .tool_calls
             .iter()
             .enumerate()
-            .filter(|(_, call)| only_looks(call))
+            .filter(|(_, call)| only_looks(call, job))
             .map(|(ix, _)| ix)
             .take(job.max_steps.saturating_sub(steps) as usize)
             .collect();
@@ -242,12 +280,6 @@ async fn work(job: &Job<'_>, session: &mut Session, tools: &dyn Tools, note: Not
         }
         if tools.computer_stopped() {
             return end(Some(computer::STOPPED.into()), &said, steps, tokens, &tally);
-        }
-        if steps >= job.max_steps {
-            return end(Some(format!("Used all its {} tool calls before it was done.", job.max_steps)), &said, steps, tokens, &tally);
-        }
-        if tokens >= job.max_tokens {
-            return end(Some(format!("Used all its {} tokens before it was done.", job.max_tokens)), &said, steps, tokens, &tally);
         }
     }
 }
@@ -442,8 +474,25 @@ fn describe(call: &ToolCall) -> String {
 }
 
 /// Whether a call is a command that only looks: it runs at once, with others.
-fn only_looks(call: &ToolCall) -> bool {
-    call.name == "exec_command" && call.args().get("cmd").and_then(Value::as_str).is_some_and(|cmd| !cmd.trim().is_empty() && readonly::check(cmd).is_ok())
+fn only_looks(call: &ToolCall, job: &Job) -> bool {
+    let args = call.args();
+    let Some(cmd) = args.get("cmd").and_then(Value::as_str).filter(|cmd| !cmd.trim().is_empty()) else { return false };
+    call.name == "exec_command" && where_to(job, args.get("host").and_then(Value::as_str)).is_ok_and(|host| looks_where(cmd, host))
+}
+
+/// Whether `cmd` only looks, where it runs: a server has no sandbox.
+fn looks_where(cmd: &str, host: Option<&HostRef>) -> bool {
+    match host {
+        Some(_) => readonly::check_on_server(cmd).is_ok(),
+        None => readonly::check(cmd).is_ok(),
+    }
+}
+
+/// A new name for a fenced command's folder in the bin.
+fn bin_name(step: &str) -> String {
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis());
+    format!("{at}-{}-{step}", COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Runs a command that only looks.
@@ -511,10 +560,14 @@ async fn run_command(tools: &dyn Tools, host: Option<&HostRef>, cmd: &str, workd
     }
 }
 
-/// Tells of the bin folders a fenced command's output names.
-fn kept(output: &Output, host: Option<&HostRef>, note: Note<'_>) {
-    for (said, folder) in fence::bin_folders(&output.stderr) {
-        note(Event::Kept { host: host.map(|host| host.name.clone()), folder, said });
+/// Tells that a fenced command left something in its bin folder. Which
+/// folder is the one Somme named; the output only says whether.
+fn kept(output: &Output, host: Option<&HostRef>, fence: &Fence, note: Note<'_>) {
+    if let Some(name) = &fence.name
+        && output.stderr.lines().any(|line| line.starts_with("Somme bin: "))
+    {
+        let root = if host.is_some() { None } else { fence.bin_root.clone() };
+        note(Event::Kept { host: host.map(|host| host.name.clone()), root, name: name.clone() });
     }
 }
 
@@ -574,21 +627,23 @@ async fn call_tool(
                 return "Not done: cmd is empty.".into();
             }
             let timeout = command_time(&args, left);
-            if readonly::check(&cmd).is_ok() {
+            if looks_where(&cmd, host) {
                 return match run_look(tools, host, &cmd, &text("workdir"), timeout).await {
                     Ok(output) => command_text(&output),
                     Err(err) => format!("Not done: {err}"),
                 };
             }
             let for_good = args.get("rebuildable").and_then(Value::as_bool).unwrap_or(false);
-            let fence = job.fence.as_ref().map(|fence| Fence { bin: fence.bin && !for_good, ..fence.clone() });
+            let fence = job.fence.as_ref().map(|fence| Fence { bin: fence.bin && !for_good, name: Some(bin_name(&fence.step)), ..fence.clone() });
             if fence.is_some()
                 && let Err(why) = fence::can_fence(&cmd)
             {
                 return format!("Not done: Somme can't keep what this changes, because {why}. Write it another way.");
             }
+            // The app's tools check every command with the guard as it runs;
+            // when the user will be asked, the guard goes first, so they
+            // aren't asked about what it stops.
             if job.ask_first && !session.allow_all {
-                // The guard first, so the user isn't asked about what it stops.
                 if let Err(err) = tools.check("command", &cmd, host).await {
                     return format!("Not done: {err}");
                 }
@@ -599,28 +654,45 @@ async fn call_tool(
             match run_command(tools, host, &cmd, &text("workdir"), timeout, fence.as_ref()).await {
                 Ok(output) => {
                     if let Some(fence) = &fence {
-                        kept(&output, host, note);
+                        kept(&output, host, fence, note);
                         if let Some(stop) = fence::stopped(&format!("{}\n{}", output.stdout, output.stderr), fence.sandbox && host.is_none()) {
                             if !job.ask_outside {
                                 return format!("Not done: {stop}\n{}", command_text(&output));
                             }
-                            // Past the fence only with the user's OK, and then in a fence that keeps what it deletes.
-                            let wanted = |why: &str| json!({ "command": cmd, "host": at, "widen": fence::widen(&stop).map(|(kind, value)| json!({ "kind": kind, "value": value })), "why": why });
-                            let past = Approval { title: "Let the agent go past what it may change?".into(), place: at.clone(), detail: format!("{cmd}\n\n{stop}"), why: why.trim().to_owned(), for_good: false };
+                            // Past the fence only with the user's OK, for the one thing it needs and no more.
+                            let widen = fence::widen(&stop);
+                            let wanted = json!({ "command": cmd, "host": at, "widen": widen.as_ref().map(|(kind, value)| json!({ "kind": kind, "value": value })), "why": stop });
+                            let Some((kind, value)) = widen else {
+                                tally.wanted.push(wanted);
+                                return format!("Not done: {stop}\nSomme can't tell what it needed, so the user sees it in this run. Carry on with the rest.");
+                            };
+                            let needs = match kind {
+                                "path" => format!("change {value}"),
+                                "send" => format!("send to {value}"),
+                                "service" => format!("act on the service {value}"),
+                                _ => "delete things".to_owned(),
+                            };
+                            let past = Approval {
+                                title: "Let the agent go past what it may change?".into(),
+                                place: at.clone(),
+                                detail: format!("{cmd}\n\nIt needs to {needs}, which this automation may not."),
+                                why: why.trim().to_owned(),
+                                for_good: false,
+                            };
                             return match tools.approve(&past, left).await {
                                 Ok(Approved::No) => format!("Not done: {stop}\nThe user said no to going past it. Do not try it another way; carry on without it."),
                                 Ok(_) => {
-                                    let keep = Fence { scope: Fence::keep(&fence.step, fence.bin).scope, sandbox: false, ..fence.clone() };
-                                    match run_command(tools, host, &cmd, &text("workdir"), timeout, Some(&keep)).await {
+                                    let wider = Fence { scope: fence::widened(&fence.scope, kind, &value), name: Some(bin_name(&fence.step)), ..fence.clone() };
+                                    match run_command(tools, host, &cmd, &text("workdir"), timeout, Some(&wider)).await {
                                         Ok(output) => {
-                                            kept(&output, host, note);
+                                            kept(&output, host, &wider, note);
                                             command_text(&output)
                                         }
                                         Err(err) => format!("Not done: {err}"),
                                     }
                                 }
                                 Err(err) => {
-                                    tally.wanted.push(wanted(&stop));
+                                    tally.wanted.push(wanted);
                                     format!("Not done: {stop}\nNo one could let it past ({err}), so the user sees it in this run to allow later. Carry on with the rest.")
                                 }
                             };
@@ -633,6 +705,9 @@ async fn call_tool(
         }
         "read_file" => {
             let path = text("path");
+            if readonly::secret(&path) {
+                return "Not done: that file may hold secrets, so agents don't read it.".into();
+            }
             if let Err(err) = tools.check("read file", &path, host).await {
                 return format!("Not done: {err}");
             }
@@ -689,9 +764,9 @@ async fn call_tool(
             // Copies of the files first, so they can be put back.
             if let Some(fence) = &job.fence {
                 let backups = paths.clone();
-                let keeper = Fence { backups, sandbox: false, ..fence.clone() };
+                let keeper = Fence { backups, sandbox: false, name: Some(bin_name(&fence.step)), ..fence.clone() };
                 if let Ok(output) = run_command(tools, host, "true", "", Duration::from_secs(30).min(left), Some(&keeper)).await {
-                    kept(&output, host, note);
+                    kept(&output, host, &keeper, note);
                 }
             }
             let name = |path: &str| match host {

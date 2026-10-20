@@ -162,6 +162,22 @@ pub trait Tools: Send + Sync {
         self.ask(question, details, timeout).await.map(|yes| if yes { "yes" } else { "no" }.to_owned())
     }
 
+    /// Where this computer's Somme bin is, as a full path. None: the
+    /// fence's own, `~/.somme/bin`.
+    fn bin_root(&self) -> Option<String> {
+        None
+    }
+
+    /// AI calls this run may still make, when it has a limit.
+    fn ai_calls_left(&self) -> Option<u32> {
+        None
+    }
+
+    /// The user's guard rules, in their words, for an agent to plan around.
+    fn guard_rules(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// What earlier runs of this automation's agent noted for later ones.
     fn notes(&self) -> Vec<String> {
         Vec::new()
@@ -363,7 +379,7 @@ pub async fn run(
                     if let Err(why) = fence::can_fence(&shell.script) {
                         return Finished::failed(unfenced(&why));
                     }
-                    let fenced = fence::command(&shell.script, &Fence { sandbox: fence::can_sandbox(), ..fence.clone() });
+                    let fenced = fence::command(&shell.script, &Fence { sandbox: fence::can_sandbox(), bin_root: fence.bin_root.clone().or_else(|| tools.bin_root()), ..fence.clone() });
                     tools.run_fenced_local(&shown, &fenced, &shell.vars, dir.as_deref(), timeout).await
                 }
                 _ => tools.run_local(&shell.script, &shell.vars, dir.as_deref(), timeout).await,
@@ -522,7 +538,7 @@ pub async fn run(
                 timeout,
                 effort: Some(somme_ai::llm::Effort::Low),
                 // Inside the automation's scope it works on its own; past it, it asks.
-                fence: fence.cloned(),
+                fence: fence.map(|fence| Fence { bin_root: fence.bin_root.clone().or_else(|| tools.bin_root()), ..fence.clone() }),
                 ask_outside: fence.is_some(),
                 ..Job::default()
             };
@@ -536,7 +552,7 @@ pub async fn run(
                         note(first.to_owned());
                     }
                 }
-                agent::Event::Kept { said, .. } => note(said),
+                agent::Event::Kept { .. } => note("What it deleted or changed is kept in the Somme bin for 7 days.".into()),
             };
             agent::run(job, tools, &lines).await
         }

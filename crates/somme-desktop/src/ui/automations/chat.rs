@@ -80,9 +80,9 @@ struct Turn {
     /// The talk before this turn: on Stop or Retry, it goes back to this.
     talk: Session,
     undone: bool,
-    /// Bin folders its changes filled: the server (None: this computer)
-    /// and the folder.
-    kept: Vec<(Option<String>, String)>,
+    /// Bin folders its changes filled: the server (None: this computer),
+    /// the bin's folder there (None: `~/.somme/bin`), and the folder's name.
+    kept: Vec<(Option<String>, Option<String>, String)>,
     put_back: PutBack,
 }
 
@@ -343,9 +343,10 @@ impl FlowEditor {
                             *slot = Some(result);
                         }
                     }
-                    Event::Kept { host, folder, said } => {
-                        turn.kept.push((host, folder));
-                        turn.items.push(Item::Line { icon: Lucide::Archive, text: said });
+                    Event::Kept { host, root, name } => {
+                        let place = host.as_deref().map_or_else(|| "this computer".to_owned(), str::to_owned);
+                        turn.kept.push((host, root, name));
+                        turn.items.push(Item::Line { icon: Lucide::Archive, text: format!("What it deleted or changed on {place} is kept in the Somme bin for 7 days.") });
                     }
                 }
             }
@@ -423,8 +424,8 @@ impl FlowEditor {
             let said = runtime::io(async move {
                 let mut said = Vec::new();
                 // Newest first, so older copies win.
-                for (host, folder) in kept.iter().rev() {
-                    let script = fence::put_back_script(folder);
+                for (host, root, name) in kept.iter().rev() {
+                    let script = fence::put_back_script(root.as_deref(), name);
                     let out = match host {
                         None => nodes::run_local(&script, &[], None, Duration::from_secs(120)).await.map(|out| format!("{}{}", out.stdout, out.stderr)),
                         Some(name) => match hosts.iter().find(|(label, _)| label == name) {
@@ -915,7 +916,8 @@ async fn converse(editor: &WeakEntity<FlowEditor>, ask: Ask, cx: &mut AsyncWindo
         let skills = skills::all(&data_dir);
         if talk.messages.is_empty() {
             let remembered = memory::newest(&data_dir);
-            talk.messages.push(Message::system(cleaner.clean(&assistant::rules(&facts, &skills, &remembered, &draft))));
+            let guard: Vec<String> = settings.guard_rules.iter().map(|rule| rule.text.clone()).collect();
+            talk.messages.push(Message::system(cleaner.clean(&assistant::rules(&facts, &skills, &remembered, &guard, &draft))));
         }
         talk.messages.push(Message::user(said));
         let link = Arc::new(Link { events: events.clone(), llm, cleaner, data_dir, skills, facts, draft: parking_lot::Mutex::new(draft) });

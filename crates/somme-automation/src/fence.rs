@@ -46,21 +46,25 @@ pub struct Fence {
     pub sandbox: bool,
     /// The bin's folder; `~/.somme/bin` when not set.
     pub bin_root: Option<String>,
+    /// The name of this run's folder in the bin, set by who runs it so it
+    /// knows where to put things back from; one made from the time when
+    /// not set.
+    pub name: Option<String>,
 }
 
 impl Fence {
     /// The fence for `node`, when it needs one: the AI wrote its command, it
     /// does its work rather than only report, and it does more than look.
     pub fn for_step(node: &Node, scope: &Scope) -> Option<Self> {
-        // An agent's changes stay in the automation's scope, when it has one.
-        if let NodeKind::Agent { .. } = node.kind {
-            return (!scope.paths.is_empty() || !scope.services.is_empty() || !scope.sends.is_empty()).then(|| Self {
-                scope: scope.clone(),
-                step: node.id.clone(),
-                bin: true,
-                backups: Vec::new(),
-                sandbox: can_sandbox(),
-                bin_root: None,
+        // An agent always works in a fence. One the user OKs change by change
+        // may go anywhere, and keeps what it deletes; one on its own stays in
+        // the automation's scope, and an empty scope lets it change nothing
+        // without asking.
+        if let NodeKind::Agent { ask_first, .. } = node.kind {
+            return Some(if ask_first {
+                Self::keep(&node.id, true)
+            } else {
+                Self { scope: scope.clone(), step: node.id.clone(), bin: true, sandbox: can_sandbox(), ..Self::default() }
             });
         }
         let command = node.kind.command()?;
@@ -74,6 +78,7 @@ impl Fence {
             backups: node.effects.writes.iter().filter(|path| !path.contains(['*', '?', '['])).cloned().collect(),
             sandbox: false,
             bin_root: None,
+            name: None,
         })
     }
 
@@ -94,6 +99,7 @@ impl Fence {
             backups: Vec::new(),
             sandbox: false,
             bin_root: None,
+            name: None,
         }
     }
 }
@@ -642,6 +648,11 @@ pub fn wrap(script: &str, fence: &Fence) -> String {
         None => "\"$HOME/.somme/bin\"".to_owned(),
     };
     let step: String = fence.step.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+    // Letters, digits, - and _ only, so it is safe inside the quotes below.
+    let folder = match &fence.name {
+        Some(name) => safe_name(name),
+        None => format!("$(date +%Y-%m-%d-%H%M%S)-{step}"),
+    };
     // Files it writes with `>`: checked, and kept, before anything runs.
     let read = shell::parse(script);
     let written: Vec<String> = read.writes.iter().filter_map(|write| literal_path(&write.target)).collect();
@@ -666,7 +677,7 @@ __somme_root={bin_root}
 # when something goes in.
 [ -d "$__somme_root" ] && find "$__somme_root" -mindepth 1 -maxdepth 1 -mtime +{BIN_DAYS} -exec rm -rf {{}} + 2>/dev/null
 __somme_root=$(cd "$__somme_root" 2>/dev/null && pwd -P || printf '%s' "$__somme_root")
-printf '%s' "$__somme_root/$(date +%Y-%m-%d-%H%M%S)-{step}" > "$__somme_f/bin"
+printf '%s' "$__somme_root/{folder}" > "$__somme_f/bin"
 {flags} > "$__somme_f/flags"
 {sends} | tr 'A-Z' 'a-z' > "$__somme_f/sends"
 {services} > "$__somme_f/services"
@@ -870,34 +881,31 @@ const BINNED: &str = ".somme-binned";
 /// The list of files copied before they changed, in its bin folder.
 const KEPT: &str = ".somme-kept";
 
-/// The bin folders a fenced command's output names, each with its line.
-pub fn bin_folders(output: &str) -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = Vec::new();
-    for line in output.lines().map(str::trim) {
-        let Some(rest) = line.strip_prefix("Somme bin: ") else { continue };
-        let Some(rest) = rest.strip_suffix(&format!(" for {BIN_DAYS} days.")) else { continue };
-        let folder = [" are kept in ", " are in "].iter().find_map(|mark| rest.split_once(mark).map(|(_, folder)| folder.to_owned()));
-        if let Some(folder) = folder.filter(|folder| !folder.is_empty())
-            && !found.iter().any(|(_, seen)| *seen == folder)
-        {
-            found.push((line.to_owned(), folder));
-        }
-    }
-    found
+/// A bin folder's name, with nothing in it that leaves the bin.
+fn safe_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
 }
 
-/// A script that puts back what a fenced command left in bin `folder`:
-/// what it deleted goes back where it was, unless something new is there,
-/// and the files it changed get their copies back.
-pub fn put_back_script(folder: &str) -> String {
+/// A script that puts back what a fenced command left in the bin folder
+/// `name`, under `root` (None: `~/.somme/bin` where it runs). What it
+/// deleted goes back where it was, unless something new is there, and the
+/// files it changed get their copies back. Only what is in that folder is
+/// used.
+pub fn put_back_script(root: Option<&str>, name: &str) -> String {
+    let root = match root {
+        Some(root) => quote(root),
+        None => "\"$HOME/.somme/bin\"".to_owned(),
+    };
     format!(
-        r#"b={folder}
+        r#"b={root}/{name}
 [ -d "$b" ] || {{ echo "The Somme bin no longer holds these; it keeps things {BIN_DAYS} days." >&2; exit 1; }}
 n=0
 left=0
 if [ -f "$b/{BINNED}" ]; then
-  while IFS="$(printf '	')" read -r p d; do
+  while IFS="$(printf '\t')" read -r p d; do
     [ -n "$p" ] && [ -n "$d" ] || continue
+    case "$d" in "$b"/*) ;; *) continue ;; esac
+    case "$p" in /*) ;; *) continue ;; esac
     [ -e "$d" ] || [ -L "$d" ] || continue
     if [ -e "$p" ] || [ -L "$p" ]; then
       left=$((left + 1))
@@ -909,14 +917,15 @@ if [ -f "$b/{BINNED}" ]; then
 fi
 if [ -f "$b/{KEPT}" ]; then
   while IFS= read -r p; do
-    [ -n "$p" ] && [ -f "$b$p" ] || continue
+    case "$p" in /*) ;; *) continue ;; esac
+    [ -f "$b$p" ] || continue
     mkdir -p "${{p%/*}}" && cp -p "$b$p" "$p" && n=$((n + 1))
   done < "$b/{KEPT}"
 fi
 echo "Put back $n item(s)."
 [ "$left" = 0 ]
 "#,
-        folder = quote(folder)
+        name = safe_name(name)
     )
 }
 
@@ -972,7 +981,30 @@ pub fn widen(stop: &str) -> Option<(&'static str, String)> {
     if let Some(service) = named("it would act on ") {
         return Some(("service", service));
     }
-    stop.contains("scope doesn't let it delete anything").then(|| ("delete", String::new()))
+    if stop.contains("scope doesn't let it delete anything") {
+        return Some(("delete", String::new()));
+    }
+    // macOS's sandbox names the path in its program's own words: the last
+    // full path in the line.
+    if stop.starts_with("macOS's sandbox stopped") {
+        let path = stop.split_whitespace().rev().map(|word| word.trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | ':' | ',' | '.' | '(' | ')'))).find(|word| word.starts_with('/'));
+        return path.map(|path| ("path", path.to_owned()));
+    }
+    None
+}
+
+/// `scope` with the one thing `widen` named added.
+pub fn widened(scope: &Scope, kind: &str, value: &str) -> Scope {
+    let mut scope = scope.clone();
+    let value = value.trim().to_owned();
+    match kind {
+        "path" if !value.is_empty() => scope.paths.push(value),
+        "send" if !value.is_empty() => scope.sends.push(value),
+        "service" if !value.is_empty() => scope.services.push(value),
+        "delete" => scope.delete = true,
+        _ => {}
+    }
+    scope
 }
 
 /// Put before a command that only looks: git settings in a repository
@@ -1056,6 +1088,11 @@ mod tests {
         assert_eq!(widen("Somme stopped `rm -rf /a b`: /a b is outside what this automation may change (its scope)."), Some(("path", "/a b".to_owned())));
         assert_eq!(widen("Somme stopped `curl x`: it would send to evil.test, which this automation's scope doesn't list."), Some(("send", "evil.test".to_owned())));
         assert_eq!(widen("Somme stopped `rm x`: this automation's scope doesn't let it delete anything."), Some(("delete", String::new())));
+        assert_eq!(
+            widen("macOS's sandbox stopped a write outside what this automation may change (its scope): Error: Operation not permitted @ rb_sysopen - /opt/homebrew/var/homebrew/locks/go.formula.lock"),
+            Some(("path", "/opt/homebrew/var/homebrew/locks/go.formula.lock".to_owned()))
+        );
+        assert_eq!(widened(&Scope::default(), "send", "api.test").sends, ["api.test"]);
         let scope = Scope { paths: vec!["~/Projects/**/node_modules".into()], ..Scope::default() };
         assert!(inside(&scope, "Projects/a/node_modules/x/index.js", "/h") && inside(&scope, "/h/Projects/node_modules", "/h"));
         assert!(!inside(&scope, "~/Projects/a/src/main.js", "/h") && !inside(&scope, "/etc/hosts", "/h"));
@@ -1135,21 +1172,26 @@ mod tests {
     fn what_a_change_by_hand_deleted_or_changed_can_be_put_back() {
         let dir = test_root();
         let home = home(dir.path());
-        let fence = Fence { bin_root: Some(dir.path().join("bin").display().to_string()), ..Fence::keep("chat", true) };
+        let root = dir.path().join("bin").display().to_string();
+        let fence = Fence { bin_root: Some(root.clone()), name: Some("t1-chat".into()), ..Fence::keep("chat", true) };
         let (code, said) = shell(dir.path(), &wrap("rm -rf ~/Documents/notes.txt && sed -i.bak 's/keep/kept/' ~/Projects/a/src/main.js", &fence));
         assert_eq!(code, 0, "{said}");
-        assert!(!home.join("Documents/notes.txt").exists());
+        assert!(!home.join("Documents/notes.txt").exists() && dir.path().join("bin/t1-chat").is_dir());
         assert_eq!(std::fs::read_to_string(home.join("Projects/a/src/main.js")).unwrap(), "kept me");
-        let folders = bin_folders(&said);
-        assert_eq!(folders.len(), 1, "{said}");
-        let (code, said) = shell(dir.path(), &put_back_script(&folders[0].1));
+        let (code, said) = shell(dir.path(), &put_back_script(Some(&root), "t1-chat"));
         assert_eq!((code, said.trim()), (0, "Put back 2 item(s)."));
         assert_eq!(std::fs::read_to_string(home.join("Documents/notes.txt")).unwrap(), "keep me");
         assert_eq!(std::fs::read_to_string(home.join("Projects/a/src/main.js")).unwrap(), "keep me");
         // Deletes for good leave nothing to put back.
-        let gone = Fence { bin_root: Some(dir.path().join("bin").display().to_string()), ..Fence::keep("chat", false) };
+        let gone = Fence { bin_root: Some(root.clone()), name: Some("t2-chat".into()), ..Fence::keep("chat", false) };
         let (code, said) = shell(dir.path(), &wrap("rm -rf ~/Projects/a/node_modules", &gone));
-        assert!(code == 0 && bin_folders(&said).is_empty() && !home.join("Projects/a/node_modules").exists(), "{said}");
+        assert!(code == 0 && !said.contains("Somme bin") && !home.join("Projects/a/node_modules").exists(), "{said}");
+        // A list that points outside its folder is not followed.
+        let fake = dir.path().join("bin/t3");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(fake.join(".somme-binned"), format!("{}\t/etc/hosts\n", home.join("planted").display())).unwrap();
+        let (_, said) = shell(dir.path(), &put_back_script(Some(&root), "t3"));
+        assert!(said.contains("Put back 0 item(s).") && !home.join("planted").exists(), "{said}");
     }
 
     #[cfg(unix)]

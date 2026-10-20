@@ -379,6 +379,23 @@ impl Tools for AppTools {
         }
     }
 
+    fn ai_calls_left(&self) -> Option<u32> {
+        // The chat has no limit per run; a run does.
+        if self.chat.is_some() {
+            return None;
+        }
+        let cap = Settings::load(&self.services.data_dir).ai.run_ai_calls;
+        Some(cap.saturating_sub(self.ai_calls.load(Ordering::Relaxed)))
+    }
+
+    fn guard_rules(&self) -> Vec<String> {
+        Settings::load(&self.services.data_dir).guard_rules.iter().map(|rule| rule.text.clone()).collect()
+    }
+
+    fn bin_root(&self) -> Option<String> {
+        std::path::absolute(self.services.data_dir.join("bin")).ok().map(|root| root.display().to_string())
+    }
+
     fn notes(&self) -> Vec<String> {
         self.automation.as_deref().map(|id| super::memory::notes(&self.services.data_dir, id)).unwrap_or_default()
     }

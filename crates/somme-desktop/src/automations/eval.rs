@@ -502,7 +502,7 @@ pub async fn run_case(case: &Case, llm: &Arc<Llm>, cleaner: &Arc<Cleaner>, decid
     // Somme's own skills only, so runs compare.
     let skills = skills::built_in();
     let draft = Automation::new("New automation");
-    let rules = assistant::rules(&facts, &skills, &[], &draft);
+    let rules = assistant::rules(&facts, &skills, &[], &[], &draft);
     let (events, _shown) = futures::channel::mpsc::unbounded();
     let link = Link { events, llm: llm.clone(), cleaner: cleaner.clone(), data_dir: machine.root.join("data"), skills, facts, draft: Mutex::new(draft) };
     let tools = EvalTools {
@@ -532,8 +532,8 @@ pub async fn run_case(case: &Case, llm: &Arc<Llm>, cleaner: &Arc<Cleaner>, decid
     };
     let mut session = Session { messages: vec![Message::system(cleaner.clean(&rules)), Message::user(case.ask.clone())], allow_all: false };
     let note = |event: Event| {
-        if let Event::Kept { said, .. } = event {
-            tools.note(format!("  {said}"));
+        if let Event::Kept { name, .. } = event {
+            tools.note(format!("  kept in the Somme bin: {name}"));
         }
     };
     let worked = tokio::time::timeout(CASE_TIME, async {

