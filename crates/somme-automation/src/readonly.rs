@@ -40,10 +40,18 @@ pub fn check_on_server(text: &str) -> Result<(), String> {
     check(text)?;
     let script = shell::parse(text);
     for command in script.commands.iter().filter(|command| command.name() == "git") {
-        let words: Vec<&str> = command.args.iter().map(String::as_str).filter(|arg| !arg.starts_with('-')).collect();
-        // Past `-C dir`.
-        let first = if command.args.first().is_some_and(|arg| arg == "-C") { words.get(1) } else { words.first() };
-        if first.is_some_and(|word| matches!(*word, "status" | "diff" | "blame" | "grep")) {
+        let args = past_git_options(&command.args);
+        let flag = |list: &[&str]| args.iter().any(|arg| list.iter().any(|flag| arg == flag || arg.starts_with(&format!("{flag}="))));
+        // Short options together, like `-md`.
+        let short = |letters: &[char]| args.iter().any(|arg| arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains(letters));
+        let reads_files = match args.first().map(String::as_str) {
+            Some("status" | "diff" | "blame" | "grep") => true,
+            Some("describe") => flag(&["--dirty", "--broken"]),
+            Some("ls-files") => flag(&["--modified", "--deleted"]) || short(&['m', 'd']),
+            Some("cat-file") => flag(&["--filters"]),
+            _ => false,
+        };
+        if reads_files {
             return Err("`git` may not read the working files on a server without your OK".into());
         }
     }
@@ -257,12 +265,21 @@ fn looks(command: &Command) -> Result<(), &'static str> {
     }
 }
 
+/// git's words past the options that only name the folder or turn off the
+/// pager, which may come before its command.
+fn past_git_options(args: &[String]) -> &[String] {
+    match args.first().map(String::as_str) {
+        Some("-C") => past_git_options(args.get(2..).unwrap_or_default()),
+        Some("--no-pager" | "-P") => past_git_options(&args[1..]),
+        _ => args,
+    }
+}
+
 fn git(command: &Command) -> Result<(), &'static str> {
-    // `-C dir` names the folder first; no other option may come before the
-    // command, as `-c` and the like change what git runs.
+    // No option but those may come before the command, as `-c` and the like
+    // change what git runs.
+    let command = &Command { args: past_git_options(&command.args).to_vec(), ..command.clone() };
     match command.args.first().map(String::as_str) {
-        Some("-C") => return git(&Command { args: command.args.get(2..).unwrap_or_default().to_vec(), ..command.clone() }),
-        Some("--no-pager" | "-P") => return git(&Command { args: command.args.get(1..).unwrap_or_default().to_vec(), ..command.clone() }),
         Some("--version") if command.args.len() == 1 => return Ok(()),
         Some(first) if first.starts_with('-') => return Err("may not take options before its command here"),
         _ => {}
@@ -497,6 +514,11 @@ mod tests {
         assert_eq!(check("ls > out.txt"), Err("it writes to out.txt with >".into()));
         // On a server, git doesn't look at working files without an OK.
         assert!(check_on_server("git -C ~/app status").is_err() && check_on_server("git log --oneline").is_ok() && check("git status").is_ok());
+        for text in ["git --no-pager -C ~/app status", "git -C a -C b diff --no-ext-diff --no-textconv", "git -P -C ~/app blame --no-textconv f", "git ls-files -md", "git ls-files --modified", "git describe --dirty", "git describe --broken=x", "git cat-file --filters HEAD:f"] {
+            assert!(check(text).is_ok(), "{text}");
+            assert!(check_on_server(text).is_err(), "{text}");
+        }
+        assert!(check_on_server("git -C ~/app ls-files -z").is_ok() && check_on_server("git --no-pager -C ~/app log -1").is_ok() && check_on_server("git cat-file -p HEAD").is_ok());
         assert!(secret("~/.ssh/id_ed25519") && secret("/srv/app/.env") && !secret("~/Projects/app/src/main.rs"));
     }
 }

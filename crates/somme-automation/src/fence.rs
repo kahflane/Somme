@@ -899,13 +899,19 @@ pub fn put_back_script(root: Option<&str>, name: &str) -> String {
     format!(
         r#"b={root}/{name}
 [ -d "$b" ] || {{ echo "The Somme bin no longer holds these; it keeps things {BIN_DAYS} days." >&2; exit 1; }}
+rb=$(cd -P "$b" && pwd) || exit 1
 n=0
 left=0
+# Whether a path names its folders plainly, with no . or .. in it.
+plain() {{ case "/$1/" in */./*|*/../*) return 1 ;; esac; }}
+# Whether $1 is in the bin, with links on the way followed.
+in_bin() {{ bd=$(cd -P "${{1%/*}}" 2>/dev/null && pwd) && case "$bd/" in "$rb"/*) ;; *) false ;; esac; }}
 if [ -f "$b/{BINNED}" ]; then
   while IFS="$(printf '\t')" read -r p d; do
     [ -n "$p" ] && [ -n "$d" ] || continue
     case "$d" in "$b"/*) ;; *) continue ;; esac
     case "$p" in /*) ;; *) continue ;; esac
+    plain "$p" && plain "${{d#"$b"}}" && in_bin "$d" || continue
     [ -e "$d" ] || [ -L "$d" ] || continue
     if [ -e "$p" ] || [ -L "$p" ]; then
       left=$((left + 1))
@@ -918,7 +924,8 @@ fi
 if [ -f "$b/{KEPT}" ]; then
   while IFS= read -r p; do
     case "$p" in /*) ;; *) continue ;; esac
-    [ -f "$b$p" ] || continue
+    plain "$p" && in_bin "$b$p" || continue
+    [ -f "$b$p" ] && [ ! -L "$b$p" ] || continue
     mkdir -p "${{p%/*}}" && cp -p "$b$p" "$p" && n=$((n + 1))
   done < "$b/{KEPT}"
 fi
@@ -1009,7 +1016,9 @@ pub fn widened(scope: &Scope, kind: &str, value: &str) -> Scope {
 
 /// Put before a command that only looks: git settings in a repository
 /// that would run a program (a file watcher, hooks, a pager) are turned off.
-const GIT_LOOKS: &str = "export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null GIT_PAGER=cat PAGER=cat GIT_TERMINAL_PROMPT=0\n";
+/// Git older than 2.31 skips the `GIT_CONFIG_*` list, so `git` itself is
+/// called with them too.
+const GIT_LOOKS: &str = "export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0= GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null GIT_PAGER=cat PAGER=cat GIT_TERMINAL_PROMPT=0\ngit() { command git -c core.fsmonitor= -c core.hooksPath=/dev/null \"$@\"; }\n";
 
 /// A command that only looks, as `/bin/sh` runs it on a server: git can't
 /// run programs from a repository's settings.
@@ -1192,6 +1201,26 @@ mod tests {
         std::fs::write(fake.join(".somme-binned"), format!("{}\t/etc/hosts\n", home.join("planted").display())).unwrap();
         let (_, said) = shell(dir.path(), &put_back_script(Some(&root), "t3"));
         assert!(said.contains("Put back 0 item(s).") && !home.join("planted").exists(), "{said}");
+        // Nor one that climbs out with `..` or a link.
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "mine").unwrap();
+        std::os::unix::fs::symlink(dir.path(), fake.join("up")).unwrap();
+        std::fs::write(
+            fake.join(".somme-binned"),
+            format!("{}\t{}/t3/../../outside.txt\n{}\t{}/t3/up/outside.txt\n", home.join("planted").display(), root, home.join("planted2").display(), root),
+        )
+        .unwrap();
+        // A kept copy whose folder in the bin is a link to elsewhere.
+        let copied = home.join("Documents/copied.txt");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("copied.txt"), "not from the bin").unwrap();
+        let in_bin = fake.join(copied.parent().unwrap().strip_prefix("/").unwrap());
+        std::fs::create_dir_all(in_bin.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &in_bin).unwrap();
+        std::fs::write(fake.join(".somme-kept"), format!("{}\n", copied.display())).unwrap();
+        let (_, said) = shell(dir.path(), &put_back_script(Some(&root), "t3"));
+        assert!(said.contains("Put back 0 item(s).") && outside.exists() && !home.join("planted").exists() && !home.join("planted2").exists() && !copied.exists(), "{said}");
     }
 
     #[cfg(unix)]
